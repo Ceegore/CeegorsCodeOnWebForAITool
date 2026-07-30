@@ -433,7 +433,9 @@ function Get-CurlStatus {
         return Get-CurlStatusViaCloudflareDns -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head
     }
 
-    if ($curlExit -ne 0 -and -not $result) {
+    # curl schreibt bei DNS-/Verbindungsfehlern trotz Fehlercode häufig "000".
+    # Entscheidend ist der Exitcode; "000" darf den DNS-Fallback nicht verhindern.
+    if ($curlExit -ne 0) {
         return Get-CurlStatusViaCloudflareDns -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head
     }
 
@@ -474,7 +476,7 @@ function Get-CurlStatusViaCloudflareDns {
         $arguments += $Url
 
         $result = & $CurlPath @arguments 2>$null
-        if ($LASTEXITCODE -ne 0 -and -not $result) { return 0 }
+        if ($LASTEXITCODE -ne 0) { return 0 }
         $status = 0
         [void][int]::TryParse((($result | Select-Object -Last 1) | Out-String).Trim(), [ref]$status)
         return $status
