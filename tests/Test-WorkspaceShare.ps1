@@ -205,6 +205,11 @@ try {
 
     Assert-True ($shareText -match "MINISERVE_ROUTE_PREFIX") 'Capability-Token wird über Environment gesetzt'
     Assert-True ($shareText -match "'--interfaces', '127.0.0.1'") 'Loopback-Bindung ist statisch konfiguriert'
+    Assert-True ($shareText -match "'--stderr', 'NUL'") 'curl-Fehler werden als Exitcode behandelt'
+    Assert-True ($shareText -match 'DnsOverrideCache') 'Öffentliche DNS-Antwort wird für Folgetests stabil gecacht'
+    foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
+        Assert-True ($shareText -match [regex]::Escape("'$resolver'")) ("DNS-Fallback enthält Resolver: $resolver")
+    }
 
     $token = New-Token
     Assert-True ($token.Length -eq 43) '256-Bit-Token hat Base64url-Länge 43'

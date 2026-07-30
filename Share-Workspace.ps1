@@ -75,6 +75,7 @@ $script:SleepPreventionEnabled = $false
 $script:NormalExitMarker = $null
 $script:ClipboardUrl = $null
 $script:KeepArchiveMarker = $null
+$script:DnsOverrideCache = @{}
 
 $BinDirectory = Join-Path $ToolRoot 'bin'
 $ConfigDirectory = Join-Path $ToolRoot 'config'
@@ -413,6 +414,7 @@ function Get-CurlStatus {
     $arguments = @(
         '--silent',
         '--show-error',
+        '--stderr', 'NUL',
         '--output', 'NUL',
         '--write-out', '%{http_code}',
         '--max-time', [string]$TimeoutSeconds
@@ -422,10 +424,11 @@ function Get-CurlStatus {
         $arguments += '--head'
     }
 
+    $arguments += Get-CloudflareDnsOverrideArguments -Url $Url
     $arguments += $Url
 
     try {
-        $result = & $CurlPath @arguments 2>$null
+        $result = & $CurlPath @arguments
         $curlExit = $LASTEXITCODE
     }
     catch {
@@ -456,26 +459,20 @@ function Get-CurlStatusViaCloudflareDns {
     )
 
     # Ein neuer Quick-Tunnel-Hostname kann beim lokalen Resolver kurz nach
-    # der Ausgabe noch unbekannt sein. Für das eigene Gate fragen wir einmal
-    # Cloudflares öffentlichen Resolver; der normale Link bleibt unverändert.
+    # der Ausgabe noch unbekannt sein. Für das eigene Gate verwenden wir den
+    # gecachten öffentlichen DNS-Override; der normale Link bleibt unverändert.
     try {
-        $uri = [Uri]$Url
-        if ($uri.Scheme -ne 'https') { return 0 }
-
-        $address = Resolve-DnsName -Name $uri.DnsSafeHost -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
-            Where-Object { $_.IPAddress } |
-            Select-Object -First 1 -ExpandProperty IPAddress
-        if (-not $address) { return 0 }
-
         $arguments = @(
-            '--silent', '--show-error', '--output', 'NUL',
-            '--write-out', '%{http_code}', '--max-time', [string]$TimeoutSeconds,
-            '--resolve', ("{0}:443:{1}" -f $uri.DnsSafeHost, $address)
+            '--silent', '--show-error', '--stderr', 'NUL', '--output', 'NUL',
+            '--write-out', '%{http_code}', '--max-time', [string]$TimeoutSeconds
         )
+        $dnsOverride = @(Get-CloudflareDnsOverrideArguments -Url $Url)
+        if ($dnsOverride.Count -eq 0) { return 0 }
+        $arguments += $dnsOverride
         if ($Head) { $arguments += '--head' }
         $arguments += $Url
 
-        $result = & $CurlPath @arguments 2>$null
+        $result = & $CurlPath @arguments
         if ($LASTEXITCODE -ne 0) { return 0 }
         $status = 0
         [void][int]::TryParse((($result | Select-Object -Last 1) | Out-String).Trim(), [ref]$status)
@@ -492,10 +489,26 @@ function Get-CloudflareDnsOverrideArguments {
     try {
         $uri = [Uri]$Url
         if ($uri.Scheme -ne 'https') { return @() }
-        $address = Resolve-DnsName -Name $uri.DnsSafeHost -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
-            Where-Object { $_.IPAddress } |
-            Select-Object -First 1 -ExpandProperty IPAddress
-        if ($address) { return @('--resolve', ("{0}:443:{1}" -f $uri.DnsSafeHost, $address)) }
+        $hostName = $uri.DnsSafeHost.ToLowerInvariant()
+
+        if ($script:DnsOverrideCache.ContainsKey($hostName)) {
+            return @('--resolve', ("{0}:443:{1}" -f $hostName, $script:DnsOverrideCache[$hostName]))
+        }
+
+        foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
+            try {
+                $address = Resolve-DnsName -Name $hostName -Type A -Server $resolver -DnsOnly -ErrorAction Stop |
+                    Where-Object { $_.IPAddress } |
+                    Select-Object -First 1 -ExpandProperty IPAddress
+                if ($address) {
+                    $script:DnsOverrideCache[$hostName] = $address
+                    return @('--resolve', ("{0}:443:{1}" -f $hostName, $address))
+                }
+            }
+            catch {
+                # Der nächste öffentliche Resolver wird versucht.
+            }
+        }
     }
     catch {}
     return @()
@@ -561,6 +574,7 @@ function Test-RangeRequest {
         $arguments = @(
             '--silent',
             '--show-error',
+            '--stderr', 'NUL',
             '--max-time', '30',
             '--header', 'Range: bytes=0-1023',
             '--dump-header', $headerPath,
@@ -569,7 +583,7 @@ function Test-RangeRequest {
         )
         $arguments += Get-CloudflareDnsOverrideArguments -Url $Url
         $arguments += $Url
-        $result = & $CurlPath @arguments 2>$null
+        $result = & $CurlPath @arguments
 
         if ($LASTEXITCODE -ne 0) {
             return $false
@@ -599,6 +613,7 @@ function Get-HeaderDump {
     $arguments = @(
         '--silent',
         '--show-error',
+        '--stderr', 'NUL',
         '--max-time', '20',
         '--head',
         '--dump-header', $OutputPath,
@@ -606,7 +621,7 @@ function Get-HeaderDump {
     )
     $arguments += Get-CloudflareDnsOverrideArguments -Url $Url
     $arguments += $Url
-    & $CurlPath @arguments 2>$null | Out-Null
+    & $CurlPath @arguments | Out-Null
 
     return $LASTEXITCODE
 }
@@ -1525,13 +1540,14 @@ try {
         & $CurlPath @(
             '--silent',
             '--show-error',
+            '--stderr', 'NUL',
             '--max-time', '10',
             '--request', $method,
             '--header', 'Destination: /d/forbidden-target',
             '--data-binary', 'WorkspaceShare mutation probe',
             '--output', 'NUL',
             $localUrl
-        ) 2>$null | Out-Null
+        ) | Out-Null
     }
 
     $hashAfterMethodTests = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
