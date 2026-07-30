@@ -1,4 +1,8 @@
 @echo off
-setlocal
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Dependencies.ps1" %*
-exit /b %ERRORLEVEL%
+echo Bitte keinen Batch-Launcher verwenden.
+echo Oeffne PowerShell im Projektordner und fuehre aus:
+echo   .\Install-Dependencies.ps1
+echo.
+echo Falls die Dateien aus einem ZIP stammen:
+echo   Get-ChildItem -File -Recurse -Filter *.ps1 ^| Unblock-File
+exit /b 1

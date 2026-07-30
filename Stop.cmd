@@ -1,4 +1,4 @@
 @echo off
-setlocal
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Stop-WorkspaceShare.ps1" %*
-exit /b %ERRORLEVEL%
+echo Bitte PowerShell direkt im Projektordner verwenden:
+echo   .\Stop-WorkspaceShare.ps1
+exit /b 1

@@ -30,18 +30,43 @@ Der vollständige Link ist ein Bearer-Secret. Jeder Besitzer kann die Datei heru
 
 Keine Domain, kein Cloudflare-Konto, keine Portweiterleitung und keine eingehende Firewallregel sind erforderlich.
 
-## Erstinstallation
+## Schnellstart im vorhandenen Ordner
+
+Das Tool wird **direkt aus dem Ordner verwendet, in dem diese Dateien bereits
+liegen**. Es muss weder nach `C:\Tools` kopiert noch erneut aus GitHub geladen
+werden.
+
+Öffne PowerShell in diesem Ordner, zum Beispiel:
 
 ```powershell
-Set-Location "C:\Tools\WorkspaceShare"
+Set-Location "C:\Projects\AITunnelTool\WorkspaceShare_FINAL"
+```
+
+Falls die Dateien aus einem ZIP-Archiv stammen und Windows sie blockiert hat,
+hebe die Markierung einmalig auf:
+
+```powershell
+Get-ChildItem -File -Recurse -Filter *.ps1 | Unblock-File
+```
+
+Wenn PowerShell anschließend eine Meldung über „nicht digital signiert“ zeigt,
+gilt auf dem Rechner eine restriktive Ausführungsrichtlinie. Erlaube die Skripte
+nur für das **aktuell geöffnete PowerShell-Fenster**; diese Einstellung geht beim
+Schließen des Fensters automatisch verloren und ändert keine Systemrichtlinie:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+```
+
+Danach die geprüften Laufzeitabhängigkeiten einrichten:
+
+```powershell
 .\Install-Dependencies.ps1
 ```
 
-Oder:
-
-```bat
-Install.cmd
-```
+`Install.cmd` ist nicht erforderlich und wird nicht empfohlen. Der direkte
+PowerShell-Aufruf liefert verständliche Fehler und vermeidet Warnungen durch
+Batch-zu-PowerShell-Launcher.
 
 Das Installationsskript:
 
@@ -70,6 +95,8 @@ Test.cmd
 
 ## Workspace freigeben
 
+Bleibe im selben Tool-Ordner und führe aus:
+
 ```powershell
 .\Share-Workspace.ps1 -Path "D:\Projekte\Roswell" -Hours 4
 ```
@@ -78,12 +105,6 @@ Kurzer Test:
 
 ```powershell
 .\Share-Workspace.ps1 -Path "D:\Projekte\Roswell" -Minutes 15
-```
-
-CMD-Wrapper:
-
-```bat
-WorkspaceShare.cmd "D:\Projekte\Roswell" -Hours 4
 ```
 
 Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopiert. Am Sitzungsende wird die Zwischenablage nur dann geleert, wenn sie noch exakt diesen Link enthält.
