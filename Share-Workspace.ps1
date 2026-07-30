@@ -430,12 +430,11 @@ function Get-CurlStatus {
     }
     catch {
         # DNS-Propagation eines neuen Quick Tunnels kann kurzzeitig fehlschlagen.
-        # Das ist kein Launcherfehler; der Aufrufer wiederholt die Prüfung.
-        return 0
+        return Get-CurlStatusViaCloudflareDns -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head
     }
 
     if ($curlExit -ne 0 -and -not $result) {
-        return 0
+        return Get-CurlStatusViaCloudflareDns -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head
     }
 
     $statusText = (($result | Select-Object -Last 1) | Out-String).Trim()
@@ -445,6 +444,59 @@ function Get-CurlStatus {
     }
 
     return 0
+}
+
+function Get-CurlStatusViaCloudflareDns {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSeconds = 10,
+        [switch]$Head
+    )
+
+    # Ein neuer Quick-Tunnel-Hostname kann beim lokalen Resolver kurz nach
+    # der Ausgabe noch unbekannt sein. Für das eigene Gate fragen wir einmal
+    # Cloudflares öffentlichen Resolver; der normale Link bleibt unverändert.
+    try {
+        $uri = [Uri]$Url
+        if ($uri.Scheme -ne 'https') { return 0 }
+
+        $address = Resolve-DnsName -Name $uri.DnsSafeHost -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
+            Where-Object { $_.IPAddress } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        if (-not $address) { return 0 }
+
+        $arguments = @(
+            '--silent', '--show-error', '--output', 'NUL',
+            '--write-out', '%{http_code}', '--max-time', [string]$TimeoutSeconds,
+            '--resolve', ("{0}:443:{1}" -f $uri.DnsSafeHost, $address)
+        )
+        if ($Head) { $arguments += '--head' }
+        $arguments += $Url
+
+        $result = & $CurlPath @arguments 2>$null
+        if ($LASTEXITCODE -ne 0 -and -not $result) { return 0 }
+        $status = 0
+        [void][int]::TryParse((($result | Select-Object -Last 1) | Out-String).Trim(), [ref]$status)
+        return $status
+    }
+    catch {
+        return 0
+    }
+}
+
+function Get-CloudflareDnsOverrideArguments {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    try {
+        $uri = [Uri]$Url
+        if ($uri.Scheme -ne 'https') { return @() }
+        $address = Resolve-DnsName -Name $uri.DnsSafeHost -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
+            Where-Object { $_.IPAddress } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        if ($address) { return @('--resolve', ("{0}:443:{1}" -f $uri.DnsSafeHost, $address)) }
+    }
+    catch {}
+    return @()
 }
 
 function Wait-ForHttpStatus {
@@ -477,16 +529,18 @@ function Test-RangeRequest {
     $headerPath = Join-Path $TemporaryDirectory ('headers-' + [Guid]::NewGuid().ToString('N') + '.txt')
 
     try {
-        $result = & $CurlPath @(
+        $arguments = @(
             '--silent',
             '--show-error',
             '--max-time', '30',
             '--header', 'Range: bytes=0-1023',
             '--dump-header', $headerPath,
             '--output', $bodyPath,
-            '--write-out', '%{http_code}',
-            $Url
-        ) 2>$null
+            '--write-out', '%{http_code}'
+        )
+        $arguments += Get-CloudflareDnsOverrideArguments -Url $Url
+        $arguments += $Url
+        $result = & $CurlPath @arguments 2>$null
 
         if ($LASTEXITCODE -ne 0) {
             return $false
@@ -513,15 +567,17 @@ function Get-HeaderDump {
         [Parameter(Mandatory = $true)][string]$OutputPath
     )
 
-    & $CurlPath @(
+    $arguments = @(
         '--silent',
         '--show-error',
         '--max-time', '20',
         '--head',
         '--dump-header', $OutputPath,
-        '--output', 'NUL',
-        $Url
-    ) 2>$null | Out-Null
+        '--output', 'NUL'
+    )
+    $arguments += Get-CloudflareDnsOverrideArguments -Url $Url
+    $arguments += $Url
+    & $CurlPath @arguments 2>$null | Out-Null
 
     return $LASTEXITCODE
 }
