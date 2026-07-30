@@ -1079,7 +1079,9 @@ function Clear-SensitiveClipboard {
         if ($getClipboard -and $setClipboard) {
             $current = Get-Clipboard -Raw -ErrorAction Stop
             if ($current.TrimEnd([char[]]"`r`n") -eq $script:ClipboardUrl) {
-                '' | Set-Clipboard
+                # Set-Clipboard akzeptiert in Windows PowerShell keinen leeren Wert.
+                # Ein einzelnes Leerzeichen entfernt den geheimen Link zuverlässig.
+                Set-Clipboard -Value ' '
             }
         }
     }
