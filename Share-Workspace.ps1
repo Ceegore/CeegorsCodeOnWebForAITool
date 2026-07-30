@@ -1567,11 +1567,12 @@ try {
     $finalUrl = "{0}/d/{1}/" -f $publicBaseUrl, $token
 
     Write-Step 7 $totalSteps 'Öffentlichen Endpunkt vollständig prüfen ...'
+    Write-Host '      Cloudflare stellt neue Quick-Tunnel-Hosts gelegentlich verzögert bereit (maximal 3 Minuten).'
 
     $publicStatus = Wait-ForHttpStatus `
         -Url $finalUrl `
         -AcceptedStatus @(200) `
-        -TimeoutSeconds 60
+        -TimeoutSeconds 180
 
     if ($publicStatus -ne 200) {
         Stop-WithError -Code 43 -Message (
