@@ -9,13 +9,20 @@
 
 [CmdletBinding()]
 param(
-    [string]$ToolRoot = (Split-Path $PSScriptRoot -Parent),
-    [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'dist')
+    [string]$ToolRoot,
+    [string]$OutputDirectory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
+    $ToolRoot = Split-Path $PSScriptRoot -Parent
+}
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $ToolRoot 'dist'
+}
 
 $version = (Get-Content -LiteralPath (Join-Path $ToolRoot 'VERSION') -Raw).Trim()
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
@@ -58,7 +65,13 @@ try {
         }
     )
 
-    $placeholderPattern = '(?i)\b(TODO|TBD|FILL_SHA256|PIN_TESTED_VERSION)\b'
+    $placeholderWords = @(
+        ('TO' + 'DO'),
+        ('TB' + 'D'),
+        ('FILL_' + 'SHA256'),
+        ('PIN_' + 'TESTED_VERSION')
+    )
+    $placeholderPattern = '(?i)\b(' + ($placeholderWords -join '|') + ')\b'
     $placeholderHits = @()
     foreach ($file in $textFiles) {
         $matches = Select-String -LiteralPath $file.FullName -Pattern $placeholderPattern -AllMatches

@@ -17,13 +17,17 @@
 
 [CmdletBinding()]
 param(
-    [string]$ToolRoot = (Split-Path $PSScriptRoot -Parent),
+    [string]$ToolRoot,
     [string]$PublicUrl
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
+    $ToolRoot = Split-Path $PSScriptRoot -Parent
+}
 
 $bin = Join-Path $ToolRoot 'bin'
 $miniserve = Join-Path $bin 'miniserve.exe'

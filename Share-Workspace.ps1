@@ -50,12 +50,16 @@ param(
     [switch]$KeepClipboard,
     [switch]$NoClipboard,
 
-    [string]$ToolRoot = $PSScriptRoot
+    [string]$ToolRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
+    $ToolRoot = $PSScriptRoot
+}
 
 # ---------------------------------------------------------------------------
 # Konstanten
@@ -730,7 +734,7 @@ function Invoke-SevenZipSnapshot {
         [Parameter(Mandatory = $true)][string]$LogPath
     )
 
-    $parent = Split-Path -LiteralPath $SourceRoot -Parent
+    $parent = Split-Path -Path $SourceRoot -Parent
     $leaf = Split-Path -LiteralPath $SourceRoot -Leaf
 
     if (-not $parent -or -not $leaf) {
@@ -1202,7 +1206,7 @@ try {
     Remove-StaleSessions
 
     $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\')
-    $rootParent = Split-Path -LiteralPath $resolvedRoot -Parent
+    $rootParent = Split-Path -Path $resolvedRoot -Parent
     $rootLeaf = Split-Path -LiteralPath $resolvedRoot -Leaf
 
     if (-not $rootParent -or -not $rootLeaf) {

@@ -21,12 +21,16 @@
 [CmdletBinding()]
 param(
     [switch]$Force,
-    [string]$ToolRoot = $PSScriptRoot
+    [string]$ToolRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
+    $ToolRoot = $PSScriptRoot
+}
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -117,7 +121,7 @@ function Download-File {
         [string]$Destination
     )
 
-    $directory = Split-Path -LiteralPath $Destination -Parent
+    $directory = Split-Path -Path $Destination -Parent
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 
     $client = New-Object System.Net.WebClient
