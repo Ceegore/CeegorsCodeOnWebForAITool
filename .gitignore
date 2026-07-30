@@ -1,0 +1,18 @@
+# Verified runtime dependencies are installed locally and deliberately never committed.
+bin/*.exe
+bin/licenses/
+
+# Generated dependency state and release artifacts.
+dist/
+*.zip
+*.zip.sha256.txt
+
+# PowerShell/editor transient files.
+*.log
+*.tmp
+*.bak
+.vs/
+.vscode/
+
+# Local test fixtures can contain intentionally unsafe samples.
+tests/fixtures/

@@ -1,0 +1,15 @@
+# 7-Zip-Wildcardmuster; eine Regel pro Zeile.
+# Keine gitignore-Syntax, keine Negation, kein automatisches Re-Include.
+
+.git
+.git\*
+.svn
+.svn\*
+.hg
+.hg\*
+
+# Das Tool selbst darf nicht rekursiv in einen Workspace aufgenommen werden.
+.workspace-share
+.workspace-share\*
+WorkspaceShare\sessions
+WorkspaceShare\sessions\*

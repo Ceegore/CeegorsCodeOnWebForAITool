@@ -1,0 +1,9 @@
+# WorkspaceShare 3.1 – Gitleaks-Konfiguration
+# Vollständige eingebaute Regeln, bewusst ohne Pfad-Allowlist.
+# Der Scan ist konservativer als der spätere ZIP-Ausschluss und darf dadurch
+# eher einen False Positive erzeugen als ein enthaltenes Secret übersehen.
+
+title = "WorkspaceShare strict directory scan"
+
+[extend]
+useDefault = true

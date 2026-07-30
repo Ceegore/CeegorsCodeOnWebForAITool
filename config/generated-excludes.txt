@@ -1,0 +1,32 @@
+# Große, rekonstruierbare oder lokale Inhalte.
+# Mit -IncludeGenerated werden diese Regeln nicht angewendet.
+
+node_modules
+node_modules\*
+Library
+Library\*
+Temp
+Temp\*
+obj
+obj\*
+dist
+dist\*
+build
+build\*
+out
+out\*
+coverage
+coverage\*
+.cache
+.cache\*
+.gradle
+.gradle\*
+DerivedData
+DerivedData\*
+.vs
+.vs\*
+Logs
+Logs\*
+*.log
+Thumbs.db
+.DS_Store
