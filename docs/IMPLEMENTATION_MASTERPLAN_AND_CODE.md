@@ -252,10 +252,14 @@ Kein ausführbares Fremdprogramm darf unversioniert, aus einem Downloadportal od
 
 | Komponente | Version | Installiertes Ziel |
 |---|---:|---|
-| cloudflared | 2026.7.3 | `bin\cloudflared.exe` |
+| cloudflared | 2026.7.2 | `bin\cloudflared.exe` |
 | miniserve | 0.35.0 | `bin\miniserve.exe` |
 | Gitleaks | 8.30.1 | `bin\gitleaks.exe` |
 | 7-Zip | 26.02 | `bin\7za.exe` |
+
+`cloudflared` 2026.7.2 ist bewusst gepinnt. Version 2026.7.3 verlor im
+Langzeittest den öffentlichen `trycloudflare.com`-DNS-Eintrag, obwohl der
+Connector-Prozess weiterlief.
 
 Die im Installer hinterlegten Hashes beziehen sich zunächst auf offizielle Release-Assets. Nach Installation wird zusätzlich der Hash jeder tatsächlich verwendeten EXE in `dependencies.lock.json` geschrieben.
 
@@ -3347,16 +3351,18 @@ $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Dependencies-' + [
 $stage = Join-Path $temp 'stage'
 
 $assets = @(
+    # 2026.7.2 ist bewusst gepinnt: 2026.7.3 verlor im Langzeittest den
+    # trycloudflare.com-DNS-Eintrag, obwohl der Connector weiterlief.
     [ordered]@{
         name = 'cloudflared'
-        version = '2026.7.3'
-        url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-windows-amd64.exe'
-        sha256 = '8635DA433B6DF8194746E88ED9D2589566C20E38BFC2A80E431A348B7C765841'
+        version = '2026.7.2'
+        url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.7.2/cloudflared-windows-amd64.exe'
+        sha256 = 'CDB5D4432F6AE1595654A692A51308B69D2BF7AF961F5578D9391837CF072DF9'
         type = 'exe'
         output = 'cloudflared.exe'
         license = 'Apache-2.0'
-        licenseUrl = 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.7.3/LICENSE'
-        source = 'https://github.com/cloudflare/cloudflared/releases/tag/2026.7.3'
+        licenseUrl = 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.7.2/LICENSE'
+        source = 'https://github.com/cloudflare/cloudflared/releases/tag/2026.7.2'
     },
     [ordered]@{
         name = 'miniserve'
@@ -3594,7 +3600,7 @@ try {
     Write-Phase 3 5 'Versionen der ausführbaren Dateien prüfen ...'
 
     $versionChecks = @(
-        @{ File = 'cloudflared.exe'; Args = @('--version'); Expected = '2026.7.3' },
+        @{ File = 'cloudflared.exe'; Args = @('--version'); Expected = '2026.7.2' },
         @{ File = 'miniserve.exe'; Args = @('--version'); Expected = '0.35.0' },
         @{ File = 'gitleaks.exe'; Args = @('version'); Expected = '8.30.1' },
         @{ File = '7za.exe'; Args = @('i'); Expected = '26.02' }
