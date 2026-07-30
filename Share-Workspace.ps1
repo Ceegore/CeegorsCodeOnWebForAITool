@@ -501,6 +501,33 @@ function Get-CloudflareDnsOverrideArguments {
     return @()
 }
 
+function Get-LinkDnsState {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $hostName = ([Uri]$Url).DnsSafeHost
+    $systemResolved = $false
+    $publicResolved = $false
+
+    try {
+        $systemResolved = [bool](Resolve-DnsName -Name $hostName -Type A -DnsOnly -ErrorAction Stop |
+            Where-Object { $_.IPAddress } |
+            Select-Object -First 1)
+    }
+    catch {}
+
+    try {
+        $publicResolved = [bool](Resolve-DnsName -Name $hostName -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
+            Where-Object { $_.IPAddress } |
+            Select-Object -First 1)
+    }
+    catch {}
+
+    return [pscustomobject]@{
+        SystemResolved = $systemResolved
+        PublicResolved = $publicResolved
+    }
+}
+
 function Wait-ForHttpStatus {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -1614,6 +1641,15 @@ try {
     Write-Step 8 $totalSteps 'Freigabe aktivieren und Ablauf überwachen ...'
 
     Enable-SystemAwake
+
+    $dnsState = Get-LinkDnsState -Url $finalUrl
+    if (-not $dnsState.SystemResolved -and $dnsState.PublicResolved) {
+        Write-Warning (
+            "Der Tunnel ist öffentlich erreichbar, aber der lokale DNS-Server kann den Link nicht auflösen. " +
+            "Wenn der Browser 'Seite nicht erreichbar' meldet, dort Secure DNS (z. B. Cloudflare 1.1.1.1) " +
+            "aktivieren oder Windows auf einen öffentlichen DNS-Resolver umstellen."
+        )
+    }
 
     $linkCopied = Copy-LinkToClipboard -Url $finalUrl
 
