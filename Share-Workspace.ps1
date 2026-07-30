@@ -799,16 +799,6 @@ function Invoke-SevenZipSnapshot {
         [Parameter(Mandatory = $true)][string]$LogPath
     )
 
-    $parentInfo = [IO.Directory]::GetParent($SourceRoot)
-    $parent = if ($parentInfo) { $parentInfo.FullName } else { $null }
-    $leaf = [IO.Path]::GetFileName($SourceRoot)
-
-    if (-not $parent -or -not $leaf) {
-        Stop-WithError -Code 23 -Message (
-            "Ein Laufwerksstamm kann im MVP nicht direkt freigegeben werden: $SourceRoot"
-        )
-    }
-
     $compressionArgument = if ($Compression -eq 'Store') { '-mx=0' } else { '-mx=1' }
 
     $arguments = @(
@@ -821,14 +811,16 @@ function Invoke-SevenZipSnapshot {
         '-bd',
         '-bb1',
         $DestinationArchive,
-        $leaf
+        '*'
     )
 
     foreach ($pattern in $ExclusionPatterns) {
         $arguments += ("-xr!{0}" -f $pattern)
     }
 
-    Push-Location $parent
+    # Der Workspace selbst ist nur das Arbeitsverzeichnis. Dadurch enthält das
+    # ZIP direkt dessen Inhalt statt einer zusätzlichen Root-Ordner-Ebene.
+    Push-Location $SourceRoot
     try {
         & $SevenZipPath @arguments 2>&1 |
             Tee-Object -FilePath $LogPath |
