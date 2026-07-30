@@ -1047,18 +1047,25 @@ function Copy-LinkToClipboard {
     param([Parameter(Mandatory = $true)][string]$Url)
 
     if ($NoClipboard) {
-        return
+        return $false
     }
 
-    $setClipboard = Get-Command 'Set-Clipboard' -ErrorAction SilentlyContinue
-    if ($setClipboard) {
-        $Url | Set-Clipboard
+    try {
+        $setClipboard = Get-Command 'Set-Clipboard' -ErrorAction SilentlyContinue
+        if ($setClipboard) {
+            Set-Clipboard -Value $Url -ErrorAction Stop
+        }
+        else {
+            $Url | & "$env:SystemRoot\System32\clip.exe"
+            if ($LASTEXITCODE -ne 0) { return $false }
+        }
+
         $script:ClipboardUrl = $Url
-        return
+        return $true
     }
-
-    $Url | & "$env:SystemRoot\System32\clip.exe"
-    $script:ClipboardUrl = $Url
+    catch {
+        return $false
+    }
 }
 
 function Clear-SensitiveClipboard {
@@ -1606,7 +1613,7 @@ try {
 
     Enable-SystemAwake
 
-    Copy-LinkToClipboard -Url $finalUrl
+    $linkCopied = Copy-LinkToClipboard -Url $finalUrl
 
     Write-Host ''
     Write-Host 'FREIGABE BEREIT'
@@ -1615,8 +1622,11 @@ try {
     Write-Host 'Direktlink:'
     Write-Host $finalUrl
     Write-Host ''
-    if (-not $NoClipboard) {
-        Write-Host 'Der Link wurde in die Zwischenablage kopiert.'
+    if ($linkCopied) {
+        Write-Host '✓ Link ist bereits kopiert. Einfach im Chat oder in einer E-Mail Strg+V drücken.' -ForegroundColor Green
+    }
+    elseif (-not $NoClipboard) {
+        Write-Warning 'Link konnte nicht automatisch kopiert werden. Bitte einmal markieren und kopieren.'
     }
     Write-Host ("Aktiv bis: {0}" -f $expiresUtc.ToLocalTime().ToString('dd.MM.yyyy HH:mm:ss'))
     Write-Host ("Archiv: {0:N2} GB" -f ($archiveSize / 1GB))
