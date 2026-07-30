@@ -1858,8 +1858,15 @@ function Get-CurlStatus {
 
     $arguments += $Url
 
-    $result = & $CurlPath @arguments 2>$null
-    $curlExit = $LASTEXITCODE
+    try {
+        $result = & $CurlPath @arguments 2>$null
+        $curlExit = $LASTEXITCODE
+    }
+    catch {
+        # DNS-Propagation eines neuen Quick Tunnels kann kurzzeitig fehlschlagen.
+        # Das ist kein Launcherfehler; der Aufrufer wiederholt die Prüfung.
+        return 0
+    }
 
     if ($curlExit -ne 0 -and -not $result) {
         return 0
@@ -2168,8 +2175,9 @@ function Invoke-SevenZipSnapshot {
         [Parameter(Mandatory = $true)][string]$LogPath
     )
 
-    $parent = Split-Path -LiteralPath $SourceRoot -Parent
-    $leaf = Split-Path -LiteralPath $SourceRoot -Leaf
+    $parentInfo = [IO.Directory]::GetParent($SourceRoot)
+    $parent = if ($parentInfo) { $parentInfo.FullName } else { $null }
+    $leaf = [IO.Path]::GetFileName($SourceRoot)
 
     if (-not $parent -or -not $leaf) {
         Stop-WithError -Code 23 -Message (
@@ -2640,8 +2648,9 @@ try {
     Remove-StaleSessions
 
     $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\')
-    $rootParent = Split-Path -LiteralPath $resolvedRoot -Parent
-    $rootLeaf = Split-Path -LiteralPath $resolvedRoot -Leaf
+    $rootParentInfo = [IO.Directory]::GetParent($resolvedRoot)
+    $rootParent = if ($rootParentInfo) { $rootParentInfo.FullName } else { $null }
+    $rootLeaf = [IO.Path]::GetFileName($resolvedRoot)
 
     if (-not $rootParent -or -not $rootLeaf) {
         Stop-WithError -Code 10 -Message "Ein Laufwerksstamm kann nicht freigegeben werden."
@@ -3418,7 +3427,7 @@ function Download-File {
         [string]$Destination
     )
 
-    $directory = Split-Path -LiteralPath $Destination -Parent
+    $directory = Split-Path -Path $Destination -Parent
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 
     $client = New-Object System.Net.WebClient
@@ -4933,4 +4942,3 @@ Führe im Projektroot aus:
 
 Das Skript lädt die fest gepinnten offiziellen Release-Assets, prüft deren SHA-256-Werte und Versionen und erzeugt anschließend `dependencies.lock.json` aus den tatsächlich installierten EXE-Dateien. Ein Share-Vorgang ist ohne gültigen Lock nicht möglich.
 ````
-

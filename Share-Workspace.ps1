@@ -424,8 +424,15 @@ function Get-CurlStatus {
 
     $arguments += $Url
 
-    $result = & $CurlPath @arguments 2>$null
-    $curlExit = $LASTEXITCODE
+    try {
+        $result = & $CurlPath @arguments 2>$null
+        $curlExit = $LASTEXITCODE
+    }
+    catch {
+        # DNS-Propagation eines neuen Quick Tunnels kann kurzzeitig fehlschlagen.
+        # Das ist kein Launcherfehler; der Aufrufer wiederholt die Prüfung.
+        return 0
+    }
 
     if ($curlExit -ne 0 -and -not $result) {
         return 0
@@ -734,8 +741,9 @@ function Invoke-SevenZipSnapshot {
         [Parameter(Mandatory = $true)][string]$LogPath
     )
 
-    $parent = Split-Path -Path $SourceRoot -Parent
-    $leaf = Split-Path -LiteralPath $SourceRoot -Leaf
+    $parentInfo = [IO.Directory]::GetParent($SourceRoot)
+    $parent = if ($parentInfo) { $parentInfo.FullName } else { $null }
+    $leaf = [IO.Path]::GetFileName($SourceRoot)
 
     if (-not $parent -or -not $leaf) {
         Stop-WithError -Code 23 -Message (
@@ -1206,8 +1214,9 @@ try {
     Remove-StaleSessions
 
     $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\')
-    $rootParent = Split-Path -Path $resolvedRoot -Parent
-    $rootLeaf = Split-Path -LiteralPath $resolvedRoot -Leaf
+    $rootParentInfo = [IO.Directory]::GetParent($resolvedRoot)
+    $rootParent = if ($rootParentInfo) { $rootParentInfo.FullName } else { $null }
+    $rootLeaf = [IO.Path]::GetFileName($resolvedRoot)
 
     if (-not $rootParent -or -not $rootLeaf) {
         Stop-WithError -Code 10 -Message "Ein Laufwerksstamm kann nicht freigegeben werden."
