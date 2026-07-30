@@ -932,7 +932,12 @@ function Start-CloudflaredQuickTunnel {
 
     return Start-Process `
         -FilePath $CloudflaredPath `
-        -ArgumentList @('tunnel', '--url', $OriginUrl, '--loglevel', 'info') `
+        -ArgumentList @(
+            'tunnel', '--url', $OriginUrl,
+            '--edge-ip-version', '4',
+            '--protocol', 'http2',
+            '--loglevel', 'info'
+        ) `
         -RedirectStandardOutput $StdOutPath `
         -RedirectStandardError $StdErrPath `
         -WindowStyle Hidden `
