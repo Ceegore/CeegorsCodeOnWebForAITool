@@ -172,6 +172,13 @@ try {
     Assert-True (Test-Path -LiteralPath $shareScript -PathType Leaf) 'Share-Workspace.ps1 vorhanden'
     Assert-True ([bool]$curl) 'curl.exe vorhanden'
 
+    foreach ($powerShellFile in Get-ChildItem -LiteralPath $ToolRoot -Filter '*.ps1' -File -Recurse) {
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($powerShellFile.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+        Assert-True (@($parseErrors).Count -eq 0) ("PowerShell-Syntax gültig: " + $powerShellFile.FullName.Substring($ToolRoot.Length))
+    }
+
     $lock = $null
     try {
         $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
@@ -209,15 +216,42 @@ try {
     Assert-True ($shareText -match '''--protocol'',\s*\$Protocol') 'Tunnel-Protokoll ist konfigurierbar'
     Assert-True ($shareText -match '''--edge-ip-version'',\s*\$EdgeIpVersion') 'Edge-IP-Modus ist konfigurierbar'
     Assert-True ($shareText -match "'--metrics'") 'cloudflared-Metrics-Endpunkt wird explizit konfiguriert'
+    Assert-True ($shareText -match "'--no-autoupdate'") 'cloudflared Auto-Update ist für überwachte Binärdateien deaktiviert'
     Assert-True ($shareText -match '/ready') 'Laufzeit prüft cloudflared-Readiness'
     Assert-True ($shareText -match '/quicktunnel') 'Laufzeit prüft Quick-Tunnel-Hostname'
-    Assert-True ($shareText -match 'HealthFailureThreshold') 'Laufzeit besitzt ein Fehlerbudget'
+    Assert-True ($shareText -match 'Get-AllowedOutageSeconds') 'Laufzeit besitzt ein zeitbasiertes Ausfallbudget'
+    Assert-True ($shareText -match 'BodySha256') 'Health-Probes vergleichen Byte-Samples per SHA-256'
+    Assert-True ($shareText -match 'Protect-DiagnosticText') 'Diagnosetext wird zentral bereinigt'
     Assert-True ($shareText -match 'KeepDiagnosticsOnError') 'Sichere Fehlerdiagnosen können erhalten werden'
     Assert-True ($shareText -match 'https://<redacted>\.trycloudflare\.com') 'Diagnoselogs schwärzen die Tunnel-URL'
     Assert-True ($shareText -notmatch 'DnsOverrideCache') 'Permanenter DNS-IP-Cache wurde entfernt'
     Assert-True ($shareText -match 'Get-LiveDnsOverrideArguments') 'DNS-Override existiert nur als frische Diagnosehilfe'
+    Assert-True ($shareText -notmatch 'Get-CurlStatusViaCloudflareDns') 'Veralteter DNS-Fallback wurde entfernt'
+    Assert-True ($shareText -notmatch 'Get-CloudflareDnsOverrideArguments') 'Veraltete DNS-Override-Hilfe wurde entfernt'
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         Assert-True ($shareText -match [regex]::Escape("'$resolver'")) ("DNS-Fallback enthält Resolver: $resolver")
+    }
+
+    $sourceTokens = $null
+    $sourceErrors = $null
+    $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($shareScript, [ref]$sourceTokens, [ref]$sourceErrors)
+    $allowedOutageAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-AllowedOutageSeconds' }, $true) | Select-Object -First 1
+    $sanitizerAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Protect-DiagnosticText' }, $true) | Select-Object -First 1
+    Assert-True ($null -ne $allowedOutageAst) 'Zeitbasierte Ausfallfunktion ist vorhanden'
+    Assert-True ($null -ne $sanitizerAst) 'Zentraler Diagnosesanitizer ist vorhanden'
+    if ($allowedOutageAst -and $sanitizerAst) {
+        Invoke-Expression $allowedOutageAst.Extent.Text
+        Invoke-Expression $sanitizerAst.Extent.Text
+        Assert-True ((Get-AllowedOutageSeconds -Classification 'EdgeDisconnected') -eq 150) 'Edge-Ausfallbudget ist zeitbasiert'
+        Assert-True ((Get-AllowedOutageSeconds -Classification 'RateLimited' -RetryAfterSeconds 0) -eq 300) 'Persistentes Rate-Limit hat ein endliches Budget'
+        Assert-True ((Get-AllowedOutageSeconds -Classification 'RateLimited' -RetryAfterSeconds 600) -eq 660) 'Retry-After erweitert das Rate-Limit-Budget endlich'
+        $diagnosticToken = New-Token
+        $diagnosticUrl = "https://unit-test.trycloudflare.com/d/$diagnosticToken/"
+        $sanitized = Protect-DiagnosticText -Text ("curl failed: $diagnosticUrl Location: /d/$diagnosticToken/") -KnownSecretUrls @($diagnosticUrl)
+        Assert-True ($sanitized -notmatch [regex]::Escape($diagnosticToken)) 'Diagnosesanitizer entfernt Capability-Token'
+        Assert-True ($sanitized -notmatch 'unit-test\.trycloudflare\.com') 'Diagnosesanitizer entfernt Tunnel-Hostname'
+        $hostnameOnlySanitized = Protect-DiagnosticText -Text 'Raw hostname: unit-test.trycloudflare.com'
+        Assert-True ($hostnameOnlySanitized -notmatch 'unit-test\.trycloudflare\.com') 'Diagnosesanitizer entfernt auch hostname-only Felder'
     }
 
     $token = New-Token

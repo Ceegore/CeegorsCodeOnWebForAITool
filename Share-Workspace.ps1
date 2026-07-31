@@ -96,6 +96,9 @@ $script:CloudflaredMetricsPort = 0
 $script:HealthLogPath = $null
 $script:DiagnosticsPath = $null
 $script:FailureDiagnosticsSaved = $false
+$script:LastHealthLogWarningUtc = [DateTime]::MinValue
+$script:SecretUrls = @()
+$script:RetiredWatchdogProcesses = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
 
 $BinDirectory = Join-Path $ToolRoot 'bin'
 $ConfigDirectory = Join-Path $ToolRoot 'config'
@@ -466,13 +469,42 @@ function Get-CurlStatus {
     return (Invoke-CurlProbe -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head).HttpStatus
 }
 
+function Assert-DeniedRoute {
+    param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string]$Description, [int]$Code = 43)
+    $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 10 -Head -MaximumBytes 65536
+    if ($probe.CurlExit -ne 0) { Stop-WithError -Code $Code -Message "$Description konnte nicht geprüft werden (curl exit $($probe.CurlExit))." }
+    if ($probe.HttpStatus -notin @(401, 403, 404)) { Stop-WithError -Code $Code -Message "$Description lieferte unerwartetes HTTP $($probe.HttpStatus); erwartet wird eine explizite 4xx-Ablehnung." }
+}
+
+function Protect-DiagnosticText {
+    param(
+        [AllowNull()][string]$Text,
+        [AllowNull()][string[]]$KnownSecretUrls = @()
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $safe = $Text
+    foreach ($secretUrl in @($KnownSecretUrls)) {
+        if (-not [string]::IsNullOrWhiteSpace($secretUrl)) {
+            $safe = $safe.Replace($secretUrl, 'https://<redacted>.trycloudflare.com/d/<redacted>/')
+        }
+    }
+    $safe = $safe -replace '(?i)\b[a-z0-9-]+\.trycloudflare\.com\b', '<redacted>.trycloudflare.com'
+    $safe = $safe -replace '(?i)/d/[A-Za-z0-9_-]{43}(?=/|\s|"|''|$)', '/d/<redacted>'
+    $safe = $safe -replace '(?i)%2Fd%2F[A-Za-z0-9_-]{43}', '%2Fd%2F<redacted>'
+    return $safe
+}
+
 function Invoke-CurlProbe {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [int]$TimeoutSeconds = 10,
         [switch]$Head,
         [string]$Range,
-        [string[]]$ExtraArguments = @()
+        [string[]]$ExtraArguments = @(),
+        [int64]$ExpectedBytes = 0,
+        [int64]$MaximumBytes = 65536,
+        [switch]$AllowFullFileResponse
     )
 
     $temporaryDirectory = if ($script:SessionDirectory) { $script:SessionDirectory } else { [IO.Path]::GetTempPath() }
@@ -485,6 +517,7 @@ function Invoke-CurlProbe {
         $arguments = @('--silent', '--show-error', '--stderr', $errorPath, '--output', $bodyPath,
             '--dump-header', $headerPath, '--max-time', [string]$TimeoutSeconds,
             '--header', 'Accept: application/json', '--write-out', '%{http_code}|%{remote_ip}|%{time_total}|%{size_download}')
+        if ($MaximumBytes -gt 0) { $arguments += @('--max-filesize', [string]$MaximumBytes) }
         if ($Head) { $arguments += '--head' }
         if (-not [string]::IsNullOrWhiteSpace($Range)) { $arguments += @('--range', $Range) }
         if ($ExtraArguments) { $arguments += $ExtraArguments }
@@ -500,24 +533,37 @@ function Invoke-CurlProbe {
         if ($parts.Count -ge 3) { [void][double]::TryParse($parts[2], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$timeTotal) }
         $sizeDownload = 0.0
         if ($parts.Count -ge 4) { [void][double]::TryParse($parts[3], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sizeDownload) }
-        $body = if (Test-Path -LiteralPath $bodyPath) { Get-Content -LiteralPath $bodyPath -Raw -ErrorAction SilentlyContinue } else { '' }
-        $headers = if (Test-Path -LiteralPath $headerPath) { Get-Content -LiteralPath $headerPath -Raw -ErrorAction SilentlyContinue } else { '' }
-        $errorText = if (Test-Path -LiteralPath $errorPath) { Get-Content -LiteralPath $errorPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        $actualBodyBytes = if (Test-Path -LiteralPath $bodyPath -PathType Leaf) { [int64](Get-Item -LiteralPath $bodyPath).Length } else { [int64]0 }
+        $bodySha256 = if ($actualBodyBytes -gt 0) { (Get-FileHash -LiteralPath $bodyPath -Algorithm SHA256).Hash } else { '' }
+        $body = if (Test-Path -LiteralPath $bodyPath) { [string](Get-Content -LiteralPath $bodyPath -Raw -ErrorAction SilentlyContinue) } else { '' }
+        $headers = if (Test-Path -LiteralPath $headerPath) { [string](Get-Content -LiteralPath $headerPath -Raw -ErrorAction SilentlyContinue) } else { '' }
+        $errorText = if (Test-Path -LiteralPath $errorPath) { [string](Get-Content -LiteralPath $errorPath -Raw -ErrorAction SilentlyContinue) } else { '' }
         $retryAfter = 0
         $retryMatch = [regex]::Match($headers, '(?im)^Retry-After:\s*(\d+)\s*$')
         if ($retryMatch.Success) { [void][int]::TryParse($retryMatch.Groups[1].Value, [ref]$retryAfter) }
         $cfRay = ''
         $rayMatch = [regex]::Match($headers, '(?im)^CF-Ray:\s*([^\r\n]+)')
         if ($rayMatch.Success) { $cfRay = $rayMatch.Groups[1].Value.Trim() }
+        $contentRange = ''
+        $contentRangeMatch = [regex]::Match($headers, '(?im)^Content-Range:\s*([^\r\n]+)')
+        if ($contentRangeMatch.Success) { $contentRange = $contentRangeMatch.Groups[1].Value.Trim() }
         $cloudflareError = 0
         foreach ($pattern in @('(?i)"code"\s*:\s*(10\d{2})', '(?i)\berror\s+(10\d{2})\b', '(?i)\b(1033)\b')) {
             $match = [regex]::Match($body, $pattern)
             if ($match.Success) { [void][int]::TryParse($match.Groups[1].Value, [ref]$cloudflareError); break }
         }
-        return [pscustomobject]@{ CurlExit = $curlExit; HttpStatus = $httpStatus; CloudflareError = $cloudflareError; RetryAfterSeconds = $retryAfter; RemoteIp = $remoteIp; TimeSeconds = $timeTotal; SizeDownloaded = [int64]$sizeDownload; CfRay = $cfRay; ErrorText = ($errorText | Out-String).Trim(); Body = $body; Headers = $headers; Success = ($curlExit -eq 0 -and $httpStatus -in @(200, 206)) }
+        $sampleValid = if ($ExpectedBytes -gt 0) {
+            $validStatus = ($httpStatus -eq 206 -and $contentRange -match '^bytes\s+0-')
+            if ($AllowFullFileResponse) { $validStatus = $validStatus -or ($httpStatus -eq 200) }
+            ($curlExit -eq 0 -and $validStatus -and $actualBodyBytes -eq $ExpectedBytes)
+        } else { ($curlExit -eq 0 -and $httpStatus -in @(200, 206)) }
+        $safeErrorText = Protect-DiagnosticText -Text (($errorText | Out-String).Trim()) -KnownSecretUrls $script:SecretUrls
+        $safeHeaders = Protect-DiagnosticText -Text $headers -KnownSecretUrls $script:SecretUrls
+        $safeBody = Protect-DiagnosticText -Text $body -KnownSecretUrls $script:SecretUrls
+        return [pscustomobject]@{ CurlExit = $curlExit; HttpStatus = $httpStatus; CloudflareError = $cloudflareError; RetryAfterSeconds = $retryAfter; RemoteIp = $remoteIp; TimeSeconds = $timeTotal; SizeDownloaded = [int64]$sizeDownload; ActualBodyBytes = $actualBodyBytes; BodySha256 = $bodySha256; ContentRange = $contentRange; CfRay = $cfRay; ErrorText = $safeErrorText; Body = $safeBody; Headers = $safeHeaders; SampleValid = $sampleValid; Success = $sampleValid }
     }
     catch {
-        return [pscustomobject]@{ CurlExit = -1; HttpStatus = 0; CloudflareError = 0; RetryAfterSeconds = 0; RemoteIp = ''; TimeSeconds = 0.0; SizeDownloaded = 0; CfRay = ''; ErrorText = $_.Exception.Message; Body = ''; Headers = ''; Success = $false }
+        return [pscustomobject]@{ CurlExit = -1; HttpStatus = 0; CloudflareError = 0; RetryAfterSeconds = 0; RemoteIp = ''; TimeSeconds = 0.0; SizeDownloaded = 0; ActualBodyBytes = 0; BodySha256 = ''; ContentRange = ''; CfRay = ''; ErrorText = (Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls); Body = ''; Headers = ''; SampleValid = $false; Success = $false }
     }
     finally {
         Remove-Item -LiteralPath $bodyPath -Force -ErrorAction SilentlyContinue
@@ -540,99 +586,20 @@ function Get-LiveDnsOverrideArguments {
 function Get-DnsObservation {
     param([Parameter(Mandatory = $true)][string]$HostName)
     $systemAddresses = @()
-    try { $systemAddresses = @(Resolve-DnsName -Name $HostName -Type A -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch {}
+    foreach ($type in @('A', 'AAAA')) {
+        try { $systemAddresses += @(Resolve-DnsName -Name $HostName -Type $type -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch {}
+    }
+    $systemAddresses = @($systemAddresses | Select-Object -Unique)
     $publicResults = @()
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         $addresses = @(); $errorText = ''
-        try { $addresses = @(Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch { $errorText = $_.Exception.Message }
+        foreach ($type in @('A', 'AAAA')) {
+            try { $addresses += @(Resolve-DnsName -Name $HostName -Type $type -Server $resolver -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch { $errorText = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls }
+        }
+        $addresses = @($addresses | Select-Object -Unique)
         $publicResults += [pscustomobject]@{ Resolver = $resolver; Addresses = $addresses; Success = ($addresses.Count -gt 0); Error = $errorText }
     }
     return [pscustomobject]@{ SystemAddresses = $systemAddresses; SystemSuccess = ($systemAddresses.Count -gt 0); PublicResults = $publicResults; PublicSuccessCount = @($publicResults | Where-Object { $_.Success }).Count }
-}
-
-function Get-CurlStatusViaCloudflareDns {
-    param(
-        [Parameter(Mandatory = $true)][string]$Url,
-        [int]$TimeoutSeconds = 10,
-        [switch]$Head
-    )
-
-    # Ein neuer Quick-Tunnel-Hostname kann beim lokalen Resolver kurz nach
-    # der Ausgabe noch unbekannt sein. Für das eigene Gate verwenden wir den
-    # gecachten öffentlichen DNS-Override; der normale Link bleibt unverändert.
-    try {
-        $arguments = @(
-            '--silent', '--show-error', '--stderr', 'NUL', '--output', 'NUL',
-            '--write-out', '%{http_code}', '--max-time', [string]$TimeoutSeconds
-        )
-        $dnsOverride = @(Get-CloudflareDnsOverrideArguments -Url $Url)
-        if ($dnsOverride.Count -eq 0) { return 0 }
-        $arguments += $dnsOverride
-        if ($Head) { $arguments += '--head' }
-        $arguments += $Url
-
-        $result = & $CurlPath @arguments
-        if ($LASTEXITCODE -ne 0) { return 0 }
-        $status = 0
-        [void][int]::TryParse((($result | Select-Object -Last 1) | Out-String).Trim(), [ref]$status)
-        return $status
-    }
-    catch {
-        return 0
-    }
-}
-
-function Get-CloudflareDnsOverrideArguments {
-    param([Parameter(Mandatory = $true)][string]$Url)
-
-    try {
-        $uri = [Uri]$Url
-        if ($uri.Scheme -ne 'https') { return @() }
-        $hostName = $uri.DnsSafeHost.ToLowerInvariant()
-
-        foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
-            try {
-                $address = Resolve-DnsName -Name $hostName -Type A -Server $resolver -DnsOnly -ErrorAction Stop |
-                    Where-Object { $_.IPAddress } |
-                    Select-Object -First 1 -ExpandProperty IPAddress
-                if ($address) {
-                    return @('--resolve', ("{0}:443:{1}" -f $hostName, $address))
-                }
-            }
-            catch {
-                # Der nächste öffentliche Resolver wird versucht.
-            }
-        }
-    }
-    catch {}
-    return @()
-}
-
-function Get-LinkDnsState {
-    param([Parameter(Mandatory = $true)][string]$Url)
-
-    $hostName = ([Uri]$Url).DnsSafeHost
-    $systemResolved = $false
-    $publicResolved = $false
-
-    try {
-        $systemResolved = [bool](Resolve-DnsName -Name $hostName -Type A -DnsOnly -ErrorAction Stop |
-            Where-Object { $_.IPAddress } |
-            Select-Object -First 1)
-    }
-    catch {}
-
-    try {
-        $publicResolved = [bool](Resolve-DnsName -Name $hostName -Type A -Server '1.1.1.1' -DnsOnly -ErrorAction Stop |
-            Where-Object { $_.IPAddress } |
-            Select-Object -First 1)
-    }
-    catch {}
-
-    return [pscustomobject]@{
-        SystemResolved = $systemResolved
-        PublicResolved = $publicResolved
-    }
 }
 
 function Wait-ForHttpStatus {
@@ -658,19 +625,12 @@ function Wait-ForHttpStatus {
 function Test-RangeRequest {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
-        [Parameter(Mandatory = $true)][string]$TemporaryDirectory,
-        [ValidateRange(1, 10485760)][int]$LengthBytes = 1024
+        [ValidateRange(1, 10485760)][int]$LengthBytes = 1024,
+        [switch]$AllowFullFileResponse
     )
 
-    $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 60 -Range ("0-{0}" -f ($LengthBytes - 1))
-    # miniserve returns 200 rather than 206 when the requested span is the
-    # entire tiny archive. For larger archives, a server that ignores Range
-    # still fails because it returns more than the requested byte count.
-    return (
-        $probe.CurlExit -eq 0 -and
-        $probe.SizeDownloaded -eq $LengthBytes -and
-        $probe.HttpStatus -in @(200, 206)
-    )
+    $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 60 -Range ("0-{0}" -f ($LengthBytes - 1)) -ExpectedBytes $LengthBytes -MaximumBytes ($LengthBytes + 1024) -AllowFullFileResponse:$AllowFullFileResponse
+    return $probe.SampleValid
 }
 
 function Get-HeaderDump {
@@ -1040,6 +1000,7 @@ function Start-CloudflaredQuickTunnel {
 
     $arguments = @(
         'tunnel', '--url', $OriginUrl,
+        '--no-autoupdate',
         '--metrics', ("127.0.0.1:{0}" -f $MetricsPort),
         '--protocol', $Protocol,
         '--edge-ip-version', $EdgeIpVersion,
@@ -1118,44 +1079,52 @@ function Get-TunnelHealthSnapshot {
     param(
         [Parameter(Mandatory = $true)][string]$PublicUrl,
         [Parameter(Mandatory = $true)][string]$LocalUrl,
-        [Parameter(Mandatory = $true)][int]$MetricsPort
+        [Parameter(Mandatory = $true)][int]$MetricsPort,
+        [Parameter(Mandatory = $true)][int]$SampleBytes,
+        [switch]$AllowFullFileResponse
     )
 
     $now = [DateTime]::UtcNow
     $expectedHost = ([Uri]$PublicUrl).DnsSafeHost.ToLowerInvariant()
-    $localProbe = Invoke-CurlProbe -Url $LocalUrl -TimeoutSeconds 5 -Range '0-0'
+    $sampleRange = "0-{0}" -f ($SampleBytes - 1)
+    $localProbe = Invoke-CurlProbe -Url $LocalUrl -TimeoutSeconds 5 -Range $sampleRange -ExpectedBytes $SampleBytes -MaximumBytes 65536 -AllowFullFileResponse:$AllowFullFileResponse
     $readiness = Get-CloudflaredReadiness -MetricsPort $MetricsPort
     $reportedHost = Get-QuickTunnelMetricsHostname -MetricsPort $MetricsPort
-    $connectionMetric = Get-CloudflaredConnectionMetric -MetricsPort $MetricsPort
-    $dns = Get-DnsObservation -HostName $expectedHost
     # This is the authoritative client check: it deliberately never uses --resolve.
-    $publicProbe = Invoke-CurlProbe -Url $PublicUrl -TimeoutSeconds 12 -Range '0-0'
+    $publicProbe = Invoke-CurlProbe -Url $PublicUrl -TimeoutSeconds 12 -Range $sampleRange -ExpectedBytes $SampleBytes -MaximumBytes 65536 -AllowFullFileResponse:$AllowFullFileResponse
+    $endToEndSampleValid = ($localProbe.SampleValid -and $publicProbe.SampleValid -and $localProbe.BodySha256 -eq $publicProbe.BodySha256)
     $overrideProbe = $null
-    if (-not $publicProbe.Success) {
+    $dns = $null
+    $connectionMetric = -1
+    if (-not $endToEndSampleValid) {
+        $connectionMetric = Get-CloudflaredConnectionMetric -MetricsPort $MetricsPort
+        $dns = Get-DnsObservation -HostName $expectedHost
         $overrideArguments = @(Get-LiveDnsOverrideArguments -HostName $expectedHost)
         if ($overrideArguments.Count -gt 0) {
-            $overrideProbe = Invoke-CurlProbe -Url $PublicUrl -TimeoutSeconds 12 -Range '0-0' -ExtraArguments $overrideArguments
+            $overrideProbe = Invoke-CurlProbe -Url $PublicUrl -TimeoutSeconds 12 -Range $sampleRange -ExpectedBytes $SampleBytes -MaximumBytes 65536 -ExtraArguments $overrideArguments -AllowFullFileResponse:$AllowFullFileResponse
         }
     }
 
     $classification = 'Healthy'
-    $message = 'Tunnel is reachable through ordinary public DNS and HTTP.'
-    if (-not $localProbe.Success) { $classification = 'LocalOriginFailure'; $message = 'miniserve process exists, but the local secret route is not serving data.' }
-    elseif (-not $readiness.Ready) { $classification = 'EdgeDisconnected'; $message = 'cloudflared is running but /ready reports no active Cloudflare edge connection.' }
+    $message = 'Exact public archive sample matches the local archive sample.'
+    $readinessDisagreement = ($endToEndSampleValid -and -not $readiness.Ready)
+    if (-not $localProbe.SampleValid) { $classification = 'LocalOriginFailure'; $message = 'miniserve process exists, but the local archive sample is invalid.' }
+    elseif ($endToEndSampleValid) { $classification = 'Healthy' }
     elseif ($reportedHost -and $reportedHost -ne $expectedHost) { $classification = 'HostnameChanged'; $message = 'cloudflared reports a different Quick Tunnel hostname than the shared URL.' }
     elseif ($publicProbe.HttpStatus -eq 429 -or $publicProbe.CloudflareError -eq 1015) { $classification = 'RateLimited'; $message = 'Cloudflare rate limiting or Quick Tunnel concurrent-request limiting was observed.' }
     elseif ($publicProbe.CloudflareError -eq 1033) { $classification = 'NoHealthyConnector'; $message = 'Cloudflare reports that no healthy cloudflared connector can receive traffic.' }
     elseif ($publicProbe.CurlExit -eq 6 -and $overrideProbe -and $overrideProbe.Success) { $classification = 'DnsResolutionFailure'; $message = 'Normal DNS failed, but a fresh direct Cloudflare-IP diagnostic request succeeded.' }
-    elseif ($dns.PublicSuccessCount -eq 0 -and -not $publicProbe.Success) { $classification = 'DnsMissing'; $message = 'No tested public resolver returned an A record for the Quick Tunnel hostname.' }
+    elseif ($dns -and $dns.PublicSuccessCount -eq 0) { $classification = 'DnsMissing'; $message = 'No tested public resolver returned an A or AAAA record for the Quick Tunnel hostname.' }
+    elseif (-not $readiness.Ready) { $classification = 'EdgeDisconnected'; $message = 'cloudflared is running but /ready reports no active Cloudflare edge connection.' }
     elseif ($publicProbe.HttpStatus -eq 502 -or ($publicProbe.HttpStatus -eq 530 -and $publicProbe.CloudflareError -ne 1033)) { $classification = 'CloudflareProxyFailure'; $message = 'Cloudflare returned an origin or routing failure.' }
-    elseif (-not $publicProbe.Success) { $classification = 'PublicTransportFailure'; $message = 'The ordinary public range request failed.' }
+    elseif (-not $publicProbe.SampleValid) { $classification = 'PublicTransportFailure'; $message = 'The ordinary public archive sample was invalid or did not match the local archive.' }
 
     return [pscustomobject]@{
         Utc = $now.ToString('o'); Classification = $classification; Message = $message; Hostname = $expectedHost
-        LocalSuccess = [bool]$localProbe.Success; LocalCurlExit = [int]$localProbe.CurlExit; LocalHttpStatus = [int]$localProbe.HttpStatus
+        LocalSuccess = [bool]$localProbe.SampleValid; LocalCurlExit = [int]$localProbe.CurlExit; LocalHttpStatus = [int]$localProbe.HttpStatus; LocalSampleSha256 = $localProbe.BodySha256
         Ready = [bool]$readiness.Ready; ReadyHttpStatus = [int]$readiness.HttpStatus; ReadyConnections = [int]$readiness.ReadyConnections; ConnectionMetric = [int]$connectionMetric
-        ReportedHostname = $reportedHost; SystemDns = [bool]$dns.SystemSuccess; PublicDnsSuccessCount = [int]$dns.PublicSuccessCount
-        PublicSuccess = [bool]$publicProbe.Success; PublicCurlExit = [int]$publicProbe.CurlExit; PublicHttpStatus = [int]$publicProbe.HttpStatus
+        ReadinessDisagreement = $readinessDisagreement; ReportedHostname = $reportedHost; SystemDns = if ($dns) { [bool]$dns.SystemSuccess } else { $false }; PublicDnsSuccessCount = if ($dns) { [int]$dns.PublicSuccessCount } else { 0 }
+        PublicSuccess = [bool]$endToEndSampleValid; PublicCurlExit = [int]$publicProbe.CurlExit; PublicHttpStatus = [int]$publicProbe.HttpStatus; PublicSampleSha256 = $publicProbe.BodySha256
         CloudflareError = [int]$publicProbe.CloudflareError; RetryAfterSeconds = [int]$publicProbe.RetryAfterSeconds; RemoteIp = [string]$publicProbe.RemoteIp
         PublicTimeSeconds = [double]$publicProbe.TimeSeconds; CfRay = [string]$publicProbe.CfRay; CurlError = [string]$publicProbe.ErrorText
         OverrideDiagnosticSuccess = if ($overrideProbe) { [bool]$overrideProbe.Success } else { $false }
@@ -1164,21 +1133,33 @@ function Get-TunnelHealthSnapshot {
 
 function Write-HealthSnapshot {
     param([Parameter(Mandatory = $true)]$Snapshot)
-    $Snapshot | ConvertTo-Json -Depth 6 -Compress | Add-Content -LiteralPath $script:HealthLogPath -Encoding UTF8
+    try {
+        $serialized = Protect-DiagnosticText -Text ($Snapshot | ConvertTo-Json -Depth 6 -Compress) -KnownSecretUrls $script:SecretUrls
+        Add-Content -LiteralPath $script:HealthLogPath -Value $serialized -Encoding UTF8 -ErrorAction Stop
+        return $true
+    }
+    catch {
+        if (([DateTime]::UtcNow - $script:LastHealthLogWarningUtc).TotalSeconds -ge 60) {
+            Write-Warning ("Health state could not be written: " + (Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls))
+            $script:LastHealthLogWarningUtc = [DateTime]::UtcNow
+        }
+        return $false
+    }
 }
 
-function Get-RequiredFailureCount {
-    param([Parameter(Mandatory = $true)]$Snapshot, [Parameter(Mandatory = $true)][int]$IntervalSeconds, [Parameter(Mandatory = $true)][int]$DefaultThreshold)
-    switch ($Snapshot.Classification) {
-        'Healthy' { return 0 }
-        'RateLimited' { return [int]::MaxValue }
-        'HostnameChanged' { return 2 }
-        'LocalOriginFailure' { return 3 }
-        'NoHealthyConnector' { $grace = [Math]::Max(120, [int]$Snapshot.RetryAfterSeconds); return [Math]::Max(3, [int][Math]::Ceiling($grace / $IntervalSeconds)) }
-        'EdgeDisconnected' { return [Math]::Max(4, [int][Math]::Ceiling(120 / $IntervalSeconds)) }
-        'DnsMissing' { return [Math]::Max(4, [int][Math]::Ceiling(60 / $IntervalSeconds)) }
-        'DnsResolutionFailure' { return [Math]::Max(4, [int][Math]::Ceiling(60 / $IntervalSeconds)) }
-        default { return $DefaultThreshold }
+function Get-AllowedOutageSeconds {
+    param([Parameter(Mandatory = $true)][string]$Classification, [int]$RetryAfterSeconds = 0)
+    switch ($Classification) {
+        'HostnameChanged' { return 30 }
+        'LocalOriginFailure' { return 45 }
+        'DnsMissing' { return 90 }
+        'DnsResolutionFailure' { return 90 }
+        'EdgeDisconnected' { return 150 }
+        'NoHealthyConnector' { return [Math]::Max(150, $RetryAfterSeconds + 30) }
+        'RateLimited' { return [Math]::Max(300, $RetryAfterSeconds + 60) }
+        'CloudflareProxyFailure' { return 120 }
+        'PublicTransportFailure' { return 120 }
+        default { return 120 }
     }
 }
 
@@ -1191,24 +1172,11 @@ function Save-FailureDiagnostics {
         $safeSessionName = if ($SessionId) { $SessionId } else { [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') }
         $script:DiagnosticsPath = Join-Path $diagnosticsBase $safeSessionName
         New-Item -ItemType Directory -Path $script:DiagnosticsPath -Force | Out-Null
-        foreach ($source in @($CloudflaredStdOut, $CloudflaredStdErr, $script:HealthLogPath, (Join-Path $script:SessionDirectory 'session.json'), (Join-Path $script:SessionDirectory 'public-headers.txt'))) {
+        foreach ($source in @($CloudflaredStdOut, $CloudflaredStdErr, $script:HealthLogPath, (Join-Path $script:SessionDirectory 'public-headers.txt'))) {
             if ($source -and (Test-Path -LiteralPath $source -PathType Leaf)) {
                 $destination = Join-Path $script:DiagnosticsPath (Split-Path $source -Leaf)
-                if ($source -in @($CloudflaredStdOut, $CloudflaredStdErr)) {
-                    # cloudflared prints the Quick Tunnel base URL. Retain its
-                    # useful state transitions without retaining a share URL.
-                    $sanitized = (Get-Content -LiteralPath $source -Raw -ErrorAction SilentlyContinue) -replace '(?i)https://[a-z0-9-]+\.trycloudflare\.com[^\s|]*', 'https://<redacted>.trycloudflare.com'
-                    Set-Content -LiteralPath $destination -Value $sanitized -Encoding UTF8
-                }
-                else {
-                    Copy-Item -LiteralPath $source -Destination $destination -Force
-                }
-            }
-        }
-        if ($MetricsPort -gt 0) {
-            foreach ($endpoint in @('healthcheck', 'ready', 'quicktunnel', 'metrics')) {
-                $outputPath = Join-Path $script:DiagnosticsPath ("cloudflared-{0}.txt" -f $endpoint)
-                & $CurlPath @('--silent', '--show-error', '--max-time', '10', '--output', $outputPath, ("http://127.0.0.1:{0}/{1}" -f $MetricsPort, $endpoint)) 2>$null
+                $sanitized = Protect-DiagnosticText -Text (Get-Content -LiteralPath $source -Raw -ErrorAction SilentlyContinue) -KnownSecretUrls $script:SecretUrls
+                Set-Content -LiteralPath $destination -Value $sanitized -Encoding UTF8
             }
         }
         $environment = [ordered]@{
@@ -1223,7 +1191,10 @@ function Save-FailureDiagnostics {
         $script:FailureDiagnosticsSaved = $true
         Write-Warning ("Sichere Diagnoseinformationen wurden gespeichert:`n" + $script:DiagnosticsPath)
     }
-    catch { Write-Warning ("Diagnoseinformationen konnten nicht vollständig gespeichert werden: " + $_.Exception.Message) }
+    catch {
+        $safeMessage = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls
+        Write-Warning ("Diagnoseinformationen konnten nicht vollständig gespeichert werden: " + $safeMessage)
+    }
 }
 
 function Wait-ForQuickTunnelUrl {
@@ -1424,6 +1395,28 @@ function Write-SessionMetadata {
         Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'session.json') -Encoding UTF8
 }
 
+function Test-SessionMetadataShape {
+    param([Parameter(Mandatory = $true)]$Session)
+    $requiredProperties = @('schema', 'miniservePid', 'miniserveStartTicks', 'miniservePath', 'cloudflaredPid', 'cloudflaredStartTicks', 'cloudflaredPath', 'watchdogPid', 'watchdogStartTicks', 'watchdogPath')
+    $present = @($Session.PSObject.Properties.Name)
+    foreach ($propertyName in $requiredProperties) { if ($present -notcontains $propertyName) { return $false } }
+    return ([int]$Session.schema -eq 2)
+}
+
+function Remove-OldDiagnostics {
+    param([int]$MaximumAgeDays = 30, [int]$MaximumDirectories = 50)
+    $diagnosticsBase = Join-Path (Split-Path $SessionBase -Parent) 'diagnostics'
+    if (-not (Test-Path -LiteralPath $diagnosticsBase -PathType Container)) { return }
+    $directories = @(Get-ChildItem -LiteralPath $diagnosticsBase -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+    $cutoff = [DateTime]::UtcNow.AddDays(-$MaximumAgeDays)
+    for ($index = 0; $index -lt $directories.Count; $index++) {
+        $directory = $directories[$index]
+        if ($directory.LastWriteTimeUtc -lt $cutoff -or $index -ge $MaximumDirectories) {
+            Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Start-Watchdog {
     param(
         [Parameter(Mandatory = $true)][datetime]$ExpiresUtc
@@ -1495,17 +1488,25 @@ function Remove-StaleSessions {
             continue
         }
 
+        if (-not (Test-SessionMetadataShape -Session $session)) {
+            Write-Warning "Alte Sitzung mit unvollständigen Metadaten bleibt bestehen: $($directory.FullName)"
+            continue
+        }
+
         $active = $false
-        foreach ($identity in @(
-            @{ Pid = [int]$session.miniservePid; Path = [string]$session.miniservePath; Ticks = [long]$session.miniserveStartTicks },
-            @{ Pid = [int]$session.cloudflaredPid; Path = [string]$session.cloudflaredPath; Ticks = [long]$session.cloudflaredStartTicks },
-            @{ Pid = [int]$session.watchdogPid; Path = [string]$session.watchdogPath; Ticks = [long]$session.watchdogStartTicks }
-        )) {
-            if (Test-ProcessIdentity -ProcessId $identity.Pid -ExpectedPath $identity.Path -ExpectedStartTicks $identity.Ticks) {
-                $active = $true
-                break
+        try {
+            foreach ($identity in @(
+                @{ Pid = [int]$session.miniservePid; Path = [string]$session.miniservePath; Ticks = [long]$session.miniserveStartTicks },
+                @{ Pid = [int]$session.cloudflaredPid; Path = [string]$session.cloudflaredPath; Ticks = [long]$session.cloudflaredStartTicks },
+                @{ Pid = [int]$session.watchdogPid; Path = [string]$session.watchdogPath; Ticks = [long]$session.watchdogStartTicks }
+            )) {
+                if (Test-ProcessIdentity -ProcessId $identity.Pid -ExpectedPath $identity.Path -ExpectedStartTicks $identity.Ticks) {
+                    $active = $true
+                    break
+                }
             }
         }
+        catch { Write-Warning "Alte Sitzung mit nicht lesbaren Prozessmetadaten bleibt bestehen: $($directory.FullName)"; continue }
 
         if (-not $active) {
             Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue
@@ -1574,6 +1575,7 @@ try {
     }
 
     Remove-StaleSessions
+    Remove-OldDiagnostics
 
     $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\')
     $rootParentInfo = [IO.Directory]::GetParent($resolvedRoot)
@@ -1710,6 +1712,7 @@ try {
 
     $archiveHash = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
     $archiveSize = (Get-Item -LiteralPath $script:ArchivePath).Length
+    $healthSampleBytes = [int][Math]::Min([int64]32, $archiveSize)
 
     Set-Content `
         -LiteralPath (Join-Path $script:SessionDirectory 'archive.sha256.txt') `
@@ -1734,6 +1737,7 @@ try {
                 -Port $port
 
             $localUrl = "http://127.0.0.1:{0}/d/{1}/" -f $port, $token
+            $script:SecretUrls = @($localUrl)
             $localStatus = Wait-ForHttpStatus `
                 -Url $localUrl `
                 -AcceptedStatus @(200) `
@@ -1759,28 +1763,12 @@ try {
         )
     }
 
-    # Negativtest: ohne Capability-Pfad darf der Root nicht erfolgreich sein.
-    $localRootStatus = Get-CurlStatus `
-        -Url ("http://127.0.0.1:{0}/" -f $port) `
-        -TimeoutSeconds 5 `
-        -Head
-
-    if ($localRootStatus -eq 200) {
-        Stop-WithError -Code 31 -Message (
-            "Der lokale Server liefert ohne Geheimtoken HTTP 200. Sicherheits-Gate fehlgeschlagen."
-        )
-    }
-
     $localWrongTokenUrl = "http://127.0.0.1:{0}/d/{1}/" -f $port, (New-CapabilityToken)
-    $localWrongTokenStatus = Get-CurlStatus -Url $localWrongTokenUrl -TimeoutSeconds 5 -Head
-    if ($localWrongTokenStatus -eq 200) {
-        Stop-WithError -Code 31 -Message (
-            "Der lokale Server liefert mit einem falschen Capability-Token HTTP 200."
-        )
-    }
+    Assert-DeniedRoute -Url ("http://127.0.0.1:{0}/" -f $port) -Description 'Lokale Tunnelwurzel ohne Geheimtoken' -Code 31
+    Assert-DeniedRoute -Url $localWrongTokenUrl -Description 'Lokale Route mit falschem Geheimtoken' -Code 31
 
     $localRangeLength = [int][Math]::Min([int64]65536, $archiveSize)
-    if (-not (Test-RangeRequest -Url $localUrl -TemporaryDirectory $script:SessionDirectory -LengthBytes $localRangeLength)) {
+    if (-not (Test-RangeRequest -Url $localUrl -LengthBytes $localRangeLength -AllowFullFileResponse:($localRangeLength -eq $archiveSize))) {
         Stop-WithError -Code 31 -Message (
             "Lokaler Range-Test (206/$localRangeLength Bytes) ist fehlgeschlagen."
         )
@@ -1829,22 +1817,26 @@ try {
 
     Write-Step 6 $totalSteps 'Kostenlosen Cloudflare Quick Tunnel starten ...'
 
-    $cloudflaredStdOut = Join-Path $script:SessionDirectory 'cloudflared.stdout.log'
-    $cloudflaredStdErr = Join-Path $script:SessionDirectory 'cloudflared.stderr.log'
+    $cloudflaredStdOut = $null
+    $cloudflaredStdErr = $null
     $originUrl = "http://127.0.0.1:{0}" -f $port
 
     $cloudflaredStarted = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $attemptStdOut = Join-Path $script:SessionDirectory ("cloudflared-attempt-{0}.stdout.log" -f $attempt)
+        $attemptStdErr = Join-Path $script:SessionDirectory ("cloudflared-attempt-{0}.stderr.log" -f $attempt)
         $script:CloudflaredMetricsPort = Get-FreeTcpPort
         $script:CloudflaredProcess = Start-CloudflaredQuickTunnel `
             -OriginUrl $originUrl `
-            -StdOutPath $cloudflaredStdOut `
-            -StdErrPath $cloudflaredStdErr `
+            -StdOutPath $attemptStdOut `
+            -StdErrPath $attemptStdErr `
             -MetricsPort $script:CloudflaredMetricsPort `
             -Protocol $TunnelProtocol `
             -EdgeIpVersion $TunnelEdgeIpVersion `
             -Retries $TunnelRetries
         if (Wait-ForCloudflaredMetrics -Process $script:CloudflaredProcess -MetricsPort $script:CloudflaredMetricsPort -TimeoutSeconds 15) {
+            $cloudflaredStdOut = $attemptStdOut
+            $cloudflaredStdErr = $attemptStdErr
             $cloudflaredStarted = $true
             break
         }
@@ -1886,6 +1878,7 @@ try {
         -TimeoutSeconds 60
 
     $finalUrl = "{0}/d/{1}/" -f $publicBaseUrl, $token
+    $script:SecretUrls = @($localUrl, $finalUrl)
 
     Write-Step 7 $totalSteps 'Öffentlichen Endpunkt vollständig prüfen ...'
     Write-Host '      Cloudflare stellt neue Quick-Tunnel-Hosts gelegentlich verzögert bereit (maximal 3 Minuten).'
@@ -1893,7 +1886,7 @@ try {
     $publicDeadline = [DateTime]::UtcNow.AddSeconds(180)
     $publicProbe = $null
     do {
-        $publicProbe = Invoke-CurlProbe -Url $finalUrl -TimeoutSeconds 10 -Range '0-1023'
+        $publicProbe = Invoke-CurlProbe -Url $finalUrl -TimeoutSeconds 10 -Range ("0-{0}" -f ($healthSampleBytes - 1)) -ExpectedBytes $healthSampleBytes -MaximumBytes 65536
         if ($publicProbe.Success) { break }
         Start-Sleep -Seconds 2
     } while ([DateTime]::UtcNow -lt $publicDeadline)
@@ -1902,12 +1895,13 @@ try {
         $initialSnapshot = Get-TunnelHealthSnapshot `
             -PublicUrl $finalUrl `
             -LocalUrl $localUrl `
-            -MetricsPort $script:CloudflaredMetricsPort
-        Write-HealthSnapshot -Snapshot $initialSnapshot
+            -MetricsPort $script:CloudflaredMetricsPort `
+            -SampleBytes $healthSampleBytes
+        [void](Write-HealthSnapshot -Snapshot $initialSnapshot)
         $hostName = ([Uri]$finalUrl).DnsSafeHost
         $diagnosticArguments = @(Get-LiveDnsOverrideArguments -HostName $hostName)
         if ($diagnosticArguments.Count -gt 0) {
-            $overrideDiagnostic = Invoke-CurlProbe -Url $finalUrl -TimeoutSeconds 10 -Range '0-1023' -ExtraArguments $diagnosticArguments
+            $overrideDiagnostic = Invoke-CurlProbe -Url $finalUrl -TimeoutSeconds 10 -Range ("0-{0}" -f ($healthSampleBytes - 1)) -ExpectedBytes $healthSampleBytes -MaximumBytes 65536 -ExtraArguments $diagnosticArguments
             if ($overrideDiagnostic.Success) {
                 Stop-WithError -Code 43 -Message 'Der Link funktioniert nur mit einem internen DNS-IP-Override, aber nicht wie ein normaler Browser oder externer Dienst.'
             }
@@ -1918,31 +1912,14 @@ try {
         )
     }
 
-    $publicRootStatus = Get-CurlStatus `
-        -Url ($publicBaseUrl + '/') `
-        -TimeoutSeconds 10 `
-        -Head
-
-    if ($publicRootStatus -eq 200) {
-        Stop-WithError -Code 43 -Message (
-            "Die öffentliche Tunnelwurzel ist ohne Geheimtoken erfolgreich erreichbar."
-        )
-    }
-
     $wrongTokenUrl = "{0}/d/{1}/" -f $publicBaseUrl, (New-CapabilityToken)
-    $wrongTokenStatus = Get-CurlStatus `
-        -Url $wrongTokenUrl `
-        -TimeoutSeconds 10 `
-        -Head
-
-    if ($wrongTokenStatus -eq 200) {
-        Stop-WithError -Code 43 -Message "Ein falsches Capability-Token lieferte HTTP 200."
-    }
+    Assert-DeniedRoute -Url ($publicBaseUrl + '/') -Description 'Öffentliche Tunnelwurzel ohne Geheimtoken'
+    Assert-DeniedRoute -Url $wrongTokenUrl -Description 'Öffentliche Route mit falschem Geheimtoken'
 
     $publicRangeLength = [int][Math]::Min([int64]1048576, $archiveSize)
-    if (-not (Test-RangeRequest -Url $finalUrl -TemporaryDirectory $script:SessionDirectory -LengthBytes $publicRangeLength)) {
+    if (-not (Test-RangeRequest -Url $finalUrl -LengthBytes $publicRangeLength -AllowFullFileResponse:($publicRangeLength -eq $archiveSize))) {
         Stop-WithError -Code 43 -Message (
-            "Der öffentliche Range-Test (206/1024 Bytes) ist fehlgeschlagen."
+            "Der öffentliche Range-Test (206/$publicRangeLength Bytes) ist fehlgeschlagen."
         )
     }
 
@@ -1952,29 +1929,43 @@ try {
     # Replace the temporary setup lease with the requested lifetime only after
     # every public gate has succeeded.
     $expiresUtc = [DateTime]::UtcNow.Add($duration)
-    Stop-ProcessSafe $script:WatchdogProcess
-    $script:WatchdogProcess = Start-Watchdog -ExpiresUtc $expiresUtc
+    $oldWatchdog = $script:WatchdogProcess
+    $newWatchdog = Start-Watchdog -ExpiresUtc $expiresUtc
+    Start-Sleep -Milliseconds 500
+    $newWatchdog.Refresh()
+    if ($newWatchdog.HasExited) {
+        Stop-WithError -Code 50 -Message 'Der Ersatz-Watchdog wurde unmittelbar beendet.'
+    }
+    # The replacement is live before retiring the temporary setup watchdog.
+    $script:WatchdogProcess = $newWatchdog
     Write-SessionMetadata `
         -ExpiresUtc $expiresUtc `
         -SourceRoot $resolvedRoot `
         -Archive $script:ArchivePath `
-        -WatchdogPid $script:WatchdogProcess.Id `
-        -WatchdogStartTicks (Get-ProcessStartTicksSafe $script:WatchdogProcess)
+        -WatchdogPid $newWatchdog.Id `
+        -WatchdogStartTicks (Get-ProcessStartTicksSafe $newWatchdog)
+    if ($oldWatchdog) {
+        $script:RetiredWatchdogProcesses.Add($oldWatchdog)
+        Stop-ProcessSafe $oldWatchdog -WaitMilliseconds 3000
+        $oldWatchdogExited = $false
+        try {
+            $oldWatchdog.Refresh()
+            $oldWatchdogExited = $oldWatchdog.HasExited
+        }
+        catch {
+            # Access failure after termination is expected.
+            $oldWatchdogExited = $true
+        }
+        if (-not $oldWatchdogExited) {
+            Stop-WithError -Code 50 -Message 'Der temporäre Setup-Watchdog konnte nicht beendet werden.'
+        }
+    }
 
     Write-Host '      Öffentliche HEAD-, Negativ-, Range- und Cache-Gates bestanden.'
 
     Write-Step 8 $totalSteps 'Freigabe aktivieren und Ablauf überwachen ...'
 
     Enable-SystemAwake
-
-    $dnsState = Get-LinkDnsState -Url $finalUrl
-    if (-not $dnsState.SystemResolved -and $dnsState.PublicResolved) {
-        Write-Warning (
-            "Der Tunnel ist öffentlich erreichbar, aber der lokale DNS-Server kann den Link nicht auflösen. " +
-            "Wenn der Browser 'Seite nicht erreichbar' meldet, dort Secure DNS (z. B. Cloudflare 1.1.1.1) " +
-            "aktivieren oder Windows auf einen öffentlichen DNS-Resolver umstellen."
-        )
-    }
 
     $linkCopied = Copy-LinkToClipboard -Url $finalUrl
 
@@ -2001,8 +1992,8 @@ try {
     $lastMinuteShown = -1
     $nextHealthCheckUtc = [DateTime]::UtcNow
     $lastLoopUtc = [DateTime]::UtcNow
+    $unhealthySinceUtc = $null
     $lastFailureClass = ''
-    $consecutiveSameFailures = 0
     $lastRateLimitWarningUtc = [DateTime]::MinValue
 
     while ([DateTime]::UtcNow -lt $expiresUtc) {
@@ -2021,24 +2012,32 @@ try {
             $nextHealthCheckUtc = [DateTime]::UtcNow
         }
         if ([DateTime]::UtcNow -ge $nextHealthCheckUtc) {
-            $snapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort
-            Write-HealthSnapshot -Snapshot $snapshot
+            $snapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort -SampleBytes $healthSampleBytes
+            [void](Write-HealthSnapshot -Snapshot $snapshot)
             if ($snapshot.Classification -eq 'Healthy') {
-                if ($consecutiveSameFailures -gt 0) { Write-Host ("      Tunnel wieder gesund nach {0} fehlgeschlagenen Prüfungen." -f $consecutiveSameFailures) -ForegroundColor Green }
-                $lastFailureClass = ''; $consecutiveSameFailures = 0
-            }
-            elseif ($snapshot.Classification -eq 'RateLimited') {
-                if (([DateTime]::UtcNow - $lastRateLimitWarningUtc).TotalSeconds -ge 60) {
-                    Write-Warning ("Quick Tunnel meldet Rate-Limiting. HTTP=$($snapshot.PublicHttpStatus), Retry-After=$($snapshot.RetryAfterSeconds)s. Ein stark parallelisierter Downloader kann die Ursache sein.")
-                    $lastRateLimitWarningUtc = [DateTime]::UtcNow
+                if ($unhealthySinceUtc) {
+                    $outageSeconds = ([DateTime]::UtcNow - $unhealthySinceUtc).TotalSeconds
+                    Write-Host ("      Tunnel wieder gesund nach etwa {0:N0} Sekunden." -f $outageSeconds) -ForegroundColor Green
                 }
+                $unhealthySinceUtc = $null
+                $lastFailureClass = ''
             }
             else {
-                if ($snapshot.Classification -eq $lastFailureClass) { $consecutiveSameFailures++ } else { $lastFailureClass = $snapshot.Classification; $consecutiveSameFailures = 1 }
-                $requiredFailures = Get-RequiredFailureCount -Snapshot $snapshot -IntervalSeconds $HealthCheckSeconds -DefaultThreshold $HealthFailureThreshold
-                Write-Warning ("Tunnelprüfung fehlgeschlagen: {0} ({1}/{2}). Public HTTP={3}, curl={4}, CF-Fehler={5}, Ready={6}, DNS={7}/3. {8}" -f $snapshot.Classification, $consecutiveSameFailures, $requiredFailures, $snapshot.PublicHttpStatus, $snapshot.PublicCurlExit, $snapshot.CloudflareError, $snapshot.Ready, $snapshot.PublicDnsSuccessCount, $snapshot.Message)
-                if ($consecutiveSameFailures -ge $requiredFailures) {
-                    Stop-WithError -Code 50 -Message ("Der öffentliche Quick Tunnel ist nicht mehr zuverlässig erreichbar.`nFehlerklasse: $($snapshot.Classification)`nCloudflared läuft möglicherweise noch, aber der Link hat die Gesundheitsprüfungen dauerhaft nicht bestanden.")
+                if (-not $unhealthySinceUtc) { $unhealthySinceUtc = [DateTime]::UtcNow }
+                $lastFailureClass = $snapshot.Classification
+                $unhealthySeconds = ([DateTime]::UtcNow - $unhealthySinceUtc).TotalSeconds
+                $allowedSeconds = Get-AllowedOutageSeconds -Classification $snapshot.Classification -RetryAfterSeconds $snapshot.RetryAfterSeconds
+                if ($snapshot.Classification -eq 'RateLimited') {
+                    if (([DateTime]::UtcNow - $lastRateLimitWarningUtc).TotalSeconds -ge 60) {
+                        Write-Warning ("Quick Tunnel meldet Rate-Limiting. Ungesund seit {0:N0}/{1}s; HTTP={2}, Retry-After={3}s." -f $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.RetryAfterSeconds)
+                        $lastRateLimitWarningUtc = [DateTime]::UtcNow
+                    }
+                }
+                else {
+                    Write-Warning ("Tunnel nicht gesund: {0}. Ununterbrochener Ausfall: {1:N0}/{2}s. HTTP={3}, curl={4}, CF={5}, Ready={6}. {7}" -f $snapshot.Classification, $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.PublicCurlExit, $snapshot.CloudflareError, $snapshot.Ready, $snapshot.Message)
+                }
+                if ($unhealthySeconds -ge $allowedSeconds) {
+                    Stop-WithError -Code 50 -Message ("Der öffentliche Quick Tunnel blieb {0:N0} Sekunden ungesund.`nAktuelle Fehlerklasse: {1}." -f $unhealthySeconds, $snapshot.Classification)
                 }
             }
             $nextHealthCheckUtc = [DateTime]::UtcNow.AddSeconds($HealthCheckSeconds)
@@ -2065,14 +2064,24 @@ catch {
         $parsedCode = [int]$matches[1]
         $message = $matches[2]
     }
+    $message = Protect-DiagnosticText -Text $message -KnownSecretUrls $script:SecretUrls
 
     $script:ExitCode = $parsedCode
     if ($script:ExitCode -ne 0 -and $script:SessionDirectory) {
+        try {
+            if ($script:CloudflaredMetricsPort -gt 0) {
+                $volatileDiagnosticPath = Join-Path $script:SessionDirectory 'volatile-cloudflared-ready.txt'
+                & $CurlPath @('--silent', '--show-error', '--max-time', '2', '--output', $volatileDiagnosticPath, ("http://127.0.0.1:{0}/ready" -f $script:CloudflaredMetricsPort)) 2>$null
+            }
+        }
+        catch {}
+        # Revoke public access before any nonessential copying or version checks.
+        Stop-ProcessSafe $script:CloudflaredProcess -WaitMilliseconds 3000
         Save-FailureDiagnostics `
             -SessionId $sessionId `
             -CloudflaredStdOut $cloudflaredStdOut `
             -CloudflaredStdErr $cloudflaredStdErr `
-            -MetricsPort $script:CloudflaredMetricsPort
+            -MetricsPort 0
     }
     Write-Host ''
     Write-Error $message
@@ -2094,6 +2103,9 @@ finally {
     }
 
     Stop-ProcessSafe $script:WatchdogProcess
+    foreach ($retiredWatchdog in $script:RetiredWatchdogProcesses) {
+        Stop-ProcessSafe $retiredWatchdog
+    }
     Disable-SystemAwake
     Clear-SensitiveClipboard
 
