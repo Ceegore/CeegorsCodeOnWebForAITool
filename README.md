@@ -142,6 +142,18 @@ ein Capability-Token nicht in der Befehlszeile oder im Verlauf erscheint.
   -Minutes 60
 ```
 
+Vor einer echten Langzeitabnahme muss der ausgegebene Quick-Tunnel-Hostname auch
+über den normalen Windows-DNS-Resolver erreichbar sein. Der Preflight schreibt
+keinen Hostnamen oder Link in Dateien:
+
+```powershell
+.\scripts\Test-QuickTunnelDns.ps1 -Hostname '<Quick-Tunnel-Hostname>'
+```
+
+Der Soak-Test ist im Standardmodus strikt: bereits ein fehlgeschlagener Sample
+liefert Exit-Code 1. Mit `-MaximumAllowedOutageSeconds` größer als null wird
+nur die längste zusammenhängende Störung gegen dieses Budget geprüft.
+
 ## Projektspezifische Ausschlüsse
 
 Optional im freizugebenden Workspace:

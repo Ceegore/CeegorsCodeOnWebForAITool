@@ -1,0 +1,31 @@
+name: Windows acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($error in @($errors)) {
+              $failed = $true
+              Write-Host "::error file=$($error.Extent.File),line=$($error.Extent.StartLineNumber)::$($error.Message)"
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Install dependencies
+        shell: powershell
+        run: .\Install-Dependencies.ps1 -Force
+      - name: Run acceptance tests
+        shell: powershell
+        run: .\tests\Test-WorkspaceShare.ps1

@@ -63,21 +63,29 @@ function Get-VerifiedProcess {
     }
 }
 
-function Stop-VerifiedProcess {
+function Stop-VerifiedProcessConfirmed {
     param(
         [int]$ProcessId,
         [string]$ExpectedPath,
         [long]$ExpectedStartTicks
     )
 
-    $process = Get-VerifiedProcess `
-        -ProcessId $ProcessId `
-        -ExpectedPath $ExpectedPath `
-        -ExpectedStartTicks $ExpectedStartTicks
-
-    if ($process) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    while ($true) {
+        $process = Get-VerifiedProcess `
+            -ProcessId $ProcessId `
+            -ExpectedPath $ExpectedPath `
+            -ExpectedStartTicks $ExpectedStartTicks
+        if (-not $process) {
+            if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { return $false }
+            return $true
+        }
+        try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
         try { [void]$process.WaitForExit(3000) } catch {}
+        if (-not (Get-VerifiedProcess -ProcessId $ProcessId -ExpectedPath $ExpectedPath -ExpectedStartTicks $ExpectedStartTicks)) {
+            if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { return $false }
+            return $true
+        }
+        Start-Sleep -Seconds 2
     }
 }
 
@@ -122,17 +130,19 @@ while ($true) {
 }
 
 # Öffentliches Ende zuerst.
-Stop-VerifiedProcess `
+$cloudStopped = Stop-VerifiedProcessConfirmed `
     -ProcessId $CloudflaredPid `
     -ExpectedPath $ExpectedCloudflaredPath `
     -ExpectedStartTicks $CloudflaredStartTicks
 
 Start-Sleep -Milliseconds 300
 
-Stop-VerifiedProcess `
+$serverStopped = Stop-VerifiedProcessConfirmed `
     -ProcessId $MiniservePid `
     -ExpectedPath $ExpectedMiniservePath `
     -ExpectedStartTicks $MiniserveStartTicks
+
+if (-not ($cloudStopped -and $serverStopped)) { exit 51 }
 
 if ($KeepArchive) {
     try {

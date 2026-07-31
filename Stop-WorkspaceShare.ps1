@@ -58,7 +58,7 @@ function Get-VerifiedProcess {
     }
 }
 
-function Stop-VerifiedProcess {
+function Stop-VerifiedProcessConfirmed {
     param(
         [int]$ProcessId,
         [string]$ExpectedPath,
@@ -66,26 +66,32 @@ function Stop-VerifiedProcess {
         [string]$Role
     )
 
-    $process = Get-VerifiedProcess `
-        -ProcessId $ProcessId `
-        -ExpectedPath $ExpectedPath `
-        -ExpectedStartTicks $ExpectedStartTicks
-
-    if (-not $process) {
-        if ($ProcessId -gt 0) {
-            Write-Host "$Role PID $ProcessId ist bereits beendet oder nicht eindeutig verifizierbar."
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $process = Get-VerifiedProcess `
+            -ProcessId $ProcessId `
+            -ExpectedPath $ExpectedPath `
+            -ExpectedStartTicks $ExpectedStartTicks
+        if (-not $process) {
+            $existing = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($existing) {
+                Write-Warning "$Role PID $ProcessId could not be identity-verified; session metadata is preserved."
+                return $false
+            }
+            if ($ProcessId -gt 0) { Write-Host "$Role PID $ProcessId ist bereits beendet oder nicht eindeutig verifizierbar." }
+            return $true
         }
-        return
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            try { [void]$process.WaitForExit(1500) } catch {}
+        }
+        catch { Write-Warning "$Role PID $($process.Id) konnte beim Versuch $attempt nicht beendet werden: $($_.Exception.Message)" }
+        if (-not (Get-VerifiedProcess -ProcessId $ProcessId -ExpectedPath $ExpectedPath -ExpectedStartTicks $ExpectedStartTicks)) {
+            Write-Host "$Role PID $ProcessId beendet."
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
     }
-
-    try {
-        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-        try { [void]$process.WaitForExit(3000) } catch {}
-        Write-Host "$Role PID $($process.Id) beendet."
-    }
-    catch {
-        Write-Warning "$Role PID $($process.Id) konnte nicht beendet werden: $($_.Exception.Message)"
-    }
+    return $false
 }
 
 if (-not (Test-Path -LiteralPath $sessionBase -PathType Container)) {
@@ -124,7 +130,8 @@ foreach ($directory in $sessionDirectories) {
         continue
     }
 
-    if ([int]$session.schema -lt 2) {
+    $requiredFields = @('schema','cloudflaredPid','cloudflaredPath','cloudflaredStartTicks','miniservePid','miniservePath','miniserveStartTicks','watchdogPid','watchdogPath','watchdogStartTicks')
+    if ([int]$session.schema -lt 2 -or @($requiredFields | Where-Object { $session.PSObject.Properties.Name -notcontains $_ }).Count -gt 0) {
         Write-Warning (
             "Altes Sitzungsformat ohne vollständigen PID-Reuse-Schutz. " +
             "Ordner bleibt unangetastet: $($directory.FullName)"
@@ -133,7 +140,7 @@ foreach ($directory in $sessionDirectories) {
     }
 
     # Tunnel zuerst, danach Dateiserver, zuletzt Watchdog.
-    Stop-VerifiedProcess `
+    $cloudStopped = Stop-VerifiedProcessConfirmed `
         -ProcessId ([int]$session.cloudflaredPid) `
         -ExpectedPath ([string]$session.cloudflaredPath) `
         -ExpectedStartTicks ([long]$session.cloudflaredStartTicks) `
@@ -141,17 +148,27 @@ foreach ($directory in $sessionDirectories) {
 
     Start-Sleep -Milliseconds 300
 
-    Stop-VerifiedProcess `
+    $serverStopped = Stop-VerifiedProcessConfirmed `
         -ProcessId ([int]$session.miniservePid) `
         -ExpectedPath ([string]$session.miniservePath) `
         -ExpectedStartTicks ([long]$session.miniserveStartTicks) `
         -Role 'miniserve'
 
-    Stop-VerifiedProcess `
+    if (-not ($cloudStopped -and $serverStopped)) {
+        Write-Warning 'Child shutdown could not be confirmed. Watchdog and session directory remain active.'
+        continue
+    }
+
+    $watchdogStopped = Stop-VerifiedProcessConfirmed `
         -ProcessId ([int]$session.watchdogPid) `
         -ExpectedPath ([string]$session.watchdogPath) `
         -ExpectedStartTicks ([long]$session.watchdogStartTicks) `
         -Role 'Watchdog'
+
+    if (-not $watchdogStopped) {
+        Write-Warning 'Watchdog shutdown could not be confirmed. Session directory remains active.'
+        continue
+    }
 
     $effectiveKeep = $KeepArchives -or [bool]$session.keepArchive
     if ($effectiveKeep) {

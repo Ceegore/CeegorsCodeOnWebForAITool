@@ -33,6 +33,7 @@ $bin = Join-Path $ToolRoot 'bin'
 $miniserve = Join-Path $bin 'miniserve.exe'
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $shareScript = Join-Path $ToolRoot 'Share-Workspace.ps1'
+$healthModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Health.psm1'
 $curl = (Get-Command 'curl.exe' -ErrorAction Stop).Source
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Test-' + [Guid]::NewGuid().ToString('N'))
 $server = $null
@@ -170,9 +171,10 @@ try {
     Assert-True (Test-Path -LiteralPath $miniserve -PathType Leaf) 'miniserve.exe vorhanden'
     Assert-True (Test-Path -LiteralPath $lockPath -PathType Leaf) 'dependencies.lock.json vorhanden'
     Assert-True (Test-Path -LiteralPath $shareScript -PathType Leaf) 'Share-Workspace.ps1 vorhanden'
+    Assert-True (Test-Path -LiteralPath $healthModule -PathType Leaf) 'Gemeinsames Health-Modul vorhanden'
     Assert-True ([bool]$curl) 'curl.exe vorhanden'
 
-    foreach ($powerShellFile in Get-ChildItem -LiteralPath $ToolRoot -Filter '*.ps1' -File -Recurse) {
+    foreach ($powerShellFile in @(Get-ChildItem -LiteralPath $ToolRoot -Filter '*.ps1' -File -Recurse) + @(Get-ChildItem -LiteralPath $ToolRoot -Filter '*.psm1' -File -Recurse)) {
         $tokens = $null
         $parseErrors = $null
         [System.Management.Automation.Language.Parser]::ParseFile($powerShellFile.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
@@ -189,9 +191,13 @@ try {
     if ($lock) {
         Assert-True ([int]$lock.schema -eq 2) 'Lockfile-Schema ist 2'
         Assert-True ([bool]$lock.installed) 'Lockfile bestätigt installierte Abhängigkeiten'
+        $expectedLockPaths = @{ cloudflared='bin/cloudflared.exe'; miniserve='bin/miniserve.exe'; Gitleaks='bin/gitleaks.exe'; '7-Zip'='bin/7za.exe' }
+        Assert-True (@($lock.dependencies).Count -eq $expectedLockPaths.Count) 'Lockfile enthält exakt die erwartete Abhängigkeitsanzahl'
 
         foreach ($dependency in @($lock.dependencies)) {
-            $path = Join-Path $ToolRoot ([string]$dependency.file).Replace('/', '\')
+            $expectedPath = $expectedLockPaths[[string]$dependency.name]
+            Assert-True ($null -ne $expectedPath -and ([string]$dependency.file).Replace('\','/') -eq $expectedPath) ('Lockpfad stimmt: ' + $dependency.name)
+            $path = Join-Path $ToolRoot $expectedPath.Replace('/', '\')
             $exists = Test-Path -LiteralPath $path -PathType Leaf
             Assert-True $exists ("Lockdatei vorhanden: " + $dependency.name)
             if ($exists) {
@@ -220,6 +226,11 @@ try {
     Assert-True ($shareText -match '/ready') 'Laufzeit prüft cloudflared-Readiness'
     Assert-True ($shareText -match '/quicktunnel') 'Laufzeit prüft Quick-Tunnel-Hostname'
     Assert-True ($shareText -match 'Get-AllowedOutageSeconds') 'Laufzeit besitzt ein zeitbasiertes Ausfallbudget'
+    Assert-True ($shareText -match 'Get-QuickTunnelHostnameState') 'Quick-Tunnel-Hostname wird roh und nur im Speicher verglichen'
+    Assert-True ($shareText -notmatch 'ReportedHostname') 'Roher Quick-Tunnel-Hostname wird nicht persistiert'
+    Assert-True ($shareText -match 'Stop-ProcessConfirmed') 'Launcher bestätigt das Stoppen von Kindprozessen'
+    Assert-True ($shareText -match 'Get-HealthSamplePlan') 'Laufzeit verwendet rotierende Health-Samples'
+    Assert-True ($shareText -match 'Invoke-CurlWithPrivateUrl') 'Capability-URLs werden nicht an curl-Kommandozeilen übergeben'
     Assert-True ($shareText -match 'BodySha256') 'Health-Probes vergleichen Byte-Samples per SHA-256'
     Assert-True ($shareText -match 'Protect-DiagnosticText') 'Diagnosetext wird zentral bereinigt'
     Assert-True ($shareText -match 'KeepDiagnosticsOnError') 'Sichere Fehlerdiagnosen können erhalten werden'
@@ -232,19 +243,25 @@ try {
         Assert-True ($shareText -match [regex]::Escape("'$resolver'")) ("DNS-Fallback enthält Resolver: $resolver")
     }
 
+    Import-Module -Name $healthModule -Force -ErrorAction Stop
     $sourceTokens = $null
     $sourceErrors = $null
     $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($shareScript, [ref]$sourceTokens, [ref]$sourceErrors)
-    $allowedOutageAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-AllowedOutageSeconds' }, $true) | Select-Object -First 1
     $sanitizerAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Protect-DiagnosticText' }, $true) | Select-Object -First 1
-    Assert-True ($null -ne $allowedOutageAst) 'Zeitbasierte Ausfallfunktion ist vorhanden'
     Assert-True ($null -ne $sanitizerAst) 'Zentraler Diagnosesanitizer ist vorhanden'
-    if ($allowedOutageAst -and $sanitizerAst) {
-        Invoke-Expression $allowedOutageAst.Extent.Text
+    if ($sanitizerAst) {
         Invoke-Expression $sanitizerAst.Extent.Text
         Assert-True ((Get-AllowedOutageSeconds -Classification 'EdgeDisconnected') -eq 150) 'Edge-Ausfallbudget ist zeitbasiert'
-        Assert-True ((Get-AllowedOutageSeconds -Classification 'RateLimited' -RetryAfterSeconds 0) -eq 300) 'Persistentes Rate-Limit hat ein endliches Budget'
-        Assert-True ((Get-AllowedOutageSeconds -Classification 'RateLimited' -RetryAfterSeconds 600) -eq 660) 'Retry-After erweitert das Rate-Limit-Budget endlich'
+        Assert-True ((Get-AllowedOutageSeconds -Classification 'RateLimited' -RetryAfterSeconds 999999) -eq 660) 'Retry-After erweitert das Rate-Limit-Budget nur endlich'
+        Assert-True ((Get-BoundedRetryAfterSeconds -RetryAfterSeconds -1) -eq 0) 'Negativer Retry-After wird begrenzt'
+        Assert-True ((Get-BoundedRetryAfterSeconds -RetryAfterSeconds 999999) -eq 600) 'Übermäßiger Retry-After wird begrenzt'
+        $samplePlan = @(Get-HealthSamplePlan -ArchiveSize 1048576)
+        Assert-True ($samplePlan.Count -eq 3 -and $samplePlan[0].Start -eq 0 -and $samplePlan[2].End -eq 1048575) 'Health-Sample-Plan deckt Anfang, Mitte und Ende ab'
+        Assert-True (@(Get-HealthSamplePlan -ArchiveSize 1).Count -eq 1) 'Kleine Archive erhalten genau einen Vollfile-Sample'
+        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $true -HostnameAvailable $true -HostnameMatches $false -PublicHttpStatus 206 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $false -PublicSampleValid $true
+        Assert-True ($classification -eq 'Healthy') 'End-to-End-Hash schlägt abweichende Hilfssignale'
+        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $false -HostnameAvailable $true -HostnameMatches $true -PublicHttpStatus 429 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $true -PublicSampleValid $false
+        Assert-True ($classification -eq 'RateLimited') 'Rate-Limit wird nicht als Hostname-Wechsel klassifiziert'
         $diagnosticToken = New-Token
         $diagnosticUrl = "https://unit-test.trycloudflare.com/d/$diagnosticToken/"
         $sanitized = Protect-DiagnosticText -Text ("curl failed: $diagnosticUrl Location: /d/$diagnosticToken/") -KnownSecretUrls @($diagnosticUrl)
