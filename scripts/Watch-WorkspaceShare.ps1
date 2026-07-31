@@ -1,24 +1,16 @@
 #requires -Version 5.1
-<#
-.SYNOPSIS
-    Sicherheits-Watchdog für WorkspaceShare.
-
-.DESCRIPTION
-    Besitzt niemals Capability-Token oder vollständige URL.
-    Beendet ausschließlich über PID, Executable-Pfad und Prozessstartzeit
-    verifizierte Prozesse. Dadurch werden PID-Reuse-Fehlabschüsse verhindert.
-#>
-
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][int]$ParentPid,
     [Parameter(Mandatory = $true)][long]$ParentStartTicks,
+    [Parameter(Mandatory = $true)][string]$ExpectedParentPath,
     [Parameter(Mandatory = $true)][int]$MiniservePid,
     [Parameter(Mandatory = $true)][long]$MiniserveStartTicks,
     [Parameter(Mandatory = $true)][int]$CloudflaredPid,
     [Parameter(Mandatory = $true)][long]$CloudflaredStartTicks,
     [Parameter(Mandatory = $true)][string]$SessionPath,
     [Parameter(Mandatory = $true)][string]$NormalExitMarker,
+    [Parameter(Mandatory = $true)][string]$ReadyMarker,
     [Parameter(Mandatory = $true)][datetime]$ExpiresUtc,
     [Parameter(Mandatory = $true)][string]$ExpectedMiniservePath,
     [Parameter(Mandatory = $true)][string]$ExpectedCloudflaredPath,
@@ -26,132 +18,41 @@ param(
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$processModulePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Process.psm1'
+Import-Module -Name $processModulePath -Force -ErrorAction Stop
 
-function Get-VerifiedProcess {
-    param(
-        [int]$ProcessId,
-        [string]$ExpectedPath,
-        [long]$ExpectedStartTicks
-    )
+function Test-GoneState { param($State) return $State.State -in @('Absent', 'Conflict') }
 
-    if ($ProcessId -le 0 -or -not $ExpectedPath -or $ExpectedStartTicks -le 0) {
-        return $null
-    }
-
-    try {
-        $process = Get-Process -Id $ProcessId -ErrorAction Stop
-        if (-not $process.Path) {
-            return $null
-        }
-
-        if (
-            [IO.Path]::GetFullPath($process.Path) -ne
-            [IO.Path]::GetFullPath($ExpectedPath)
-        ) {
-            return $null
-        }
-
-        if ($process.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) {
-            return $null
-        }
-
-        return $process
-    }
-    catch {
-        return $null
-    }
+try {
+    New-Item -ItemType File -Path $ReadyMarker -Force -ErrorAction Stop | Out-Null
 }
-
-function Stop-VerifiedProcessConfirmed {
-    param(
-        [int]$ProcessId,
-        [string]$ExpectedPath,
-        [long]$ExpectedStartTicks
-    )
-
-    while ($true) {
-        $process = Get-VerifiedProcess `
-            -ProcessId $ProcessId `
-            -ExpectedPath $ExpectedPath `
-            -ExpectedStartTicks $ExpectedStartTicks
-        if (-not $process) {
-            if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { return $false }
-            return $true
-        }
-        try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
-        try { [void]$process.WaitForExit(3000) } catch {}
-        if (-not (Get-VerifiedProcess -ProcessId $ProcessId -ExpectedPath $ExpectedPath -ExpectedStartTicks $ExpectedStartTicks)) {
-            if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { return $false }
-            return $true
-        }
-        Start-Sleep -Seconds 2
-    }
-}
-
-function Test-OriginalParentAlive {
-    try {
-        $parent = Get-Process -Id $ParentPid -ErrorAction Stop
-        return ($parent.StartTime.ToUniversalTime().Ticks -eq $ParentStartTicks)
-    }
-    catch {
-        return $false
-    }
-}
+catch { exit 50 }
 
 while ($true) {
-    $normalExitRequested = Test-Path -LiteralPath $NormalExitMarker -PathType Leaf
-
-    if ($normalExitRequested) {
-        # Der Launcher setzt den Marker erst nach dem Stoppen beider Kindprozesse.
-        $cloudAlive = Get-VerifiedProcess `
-            -ProcessId $CloudflaredPid `
-            -ExpectedPath $ExpectedCloudflaredPath `
-            -ExpectedStartTicks $CloudflaredStartTicks
-        $serverAlive = Get-VerifiedProcess `
-            -ProcessId $MiniservePid `
-            -ExpectedPath $ExpectedMiniservePath `
-            -ExpectedStartTicks $MiniserveStartTicks
-
-        if (-not $cloudAlive -and -not $serverAlive) {
-            exit 0
-        }
+    if (Test-Path -LiteralPath $NormalExitMarker -PathType Leaf) {
+        $cloudState = Get-ProcessIdentityState -ProcessId $CloudflaredPid -ExpectedPath $ExpectedCloudflaredPath -ExpectedStartTicks $CloudflaredStartTicks
+        $serverState = Get-ProcessIdentityState -ProcessId $MiniservePid -ExpectedPath $ExpectedMiniservePath -ExpectedStartTicks $MiniserveStartTicks
+        if ((Test-GoneState $cloudState) -and (Test-GoneState $serverState)) { exit 0 }
     }
 
-    if (-not (Test-OriginalParentAlive)) {
-        break
-    }
-
-    if ([DateTime]::UtcNow -ge $ExpiresUtc.ToUniversalTime()) {
-        break
-    }
-
+    $parentState = Get-ProcessIdentityState -ProcessId $ParentPid -ExpectedPath $ExpectedParentPath -ExpectedStartTicks $ParentStartTicks
+    if ($parentState.State -in @('Absent', 'Conflict')) { break }
+    if ($parentState.State -eq 'Unknown') { Start-Sleep -Seconds 2; continue }
+    if ([DateTime]::UtcNow -ge $ExpiresUtc.ToUniversalTime()) { break }
     Start-Sleep -Seconds 2
 }
 
-# Öffentliches Ende zuerst.
-$cloudStopped = Stop-VerifiedProcessConfirmed `
-    -ProcessId $CloudflaredPid `
-    -ExpectedPath $ExpectedCloudflaredPath `
-    -ExpectedStartTicks $CloudflaredStartTicks
-
+$cloudStopped = Stop-TrackedProcessConfirmed -ProcessId $CloudflaredPid -ExpectedPath $ExpectedCloudflaredPath -ExpectedStartTicks $CloudflaredStartTicks -Attempts 60 -WaitMilliseconds 1000
 Start-Sleep -Milliseconds 300
-
-$serverStopped = Stop-VerifiedProcessConfirmed `
-    -ProcessId $MiniservePid `
-    -ExpectedPath $ExpectedMiniservePath `
-    -ExpectedStartTicks $MiniserveStartTicks
-
+$serverStopped = Stop-TrackedProcessConfirmed -ProcessId $MiniservePid -ExpectedPath $ExpectedMiniservePath -ExpectedStartTicks $MiniserveStartTicks -Attempts 60 -WaitMilliseconds 1000
 if (-not ($cloudStopped -and $serverStopped)) { exit 51 }
 
 if ($KeepArchive) {
-    try {
-        New-Item -ItemType File -Path (Join-Path $SessionPath 'keep.archive') -Force | Out-Null
-    }
-    catch {}
+    try { New-Item -ItemType File -Path (Join-Path $SessionPath 'keep.archive') -Force | Out-Null } catch {}
 }
 else {
-    Remove-Item -LiteralPath $SessionPath -Recurse -Force -ErrorAction SilentlyContinue
+    try { Remove-Item -LiteralPath $SessionPath -Recurse -Force -ErrorAction Stop } catch { exit 52 }
+    if (Test-Path -LiteralPath $SessionPath) { exit 52 }
 }
-
 exit 0

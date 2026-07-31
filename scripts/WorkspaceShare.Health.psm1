@@ -51,6 +51,8 @@ function Get-TunnelClassification {
         [int]$PublicCurlExit,
         [bool]$OverrideDiagnosticSuccess,
         [int]$PublicDnsSuccessCount,
+        [bool]$DnsChecked = $false,
+        [bool]$SystemDnsSuccess = $false,
         [bool]$Ready,
         [bool]$PublicSampleValid
     )
@@ -60,8 +62,8 @@ function Get-TunnelClassification {
     if ($HostnameAvailable -and -not $HostnameMatches) { return 'HostnameChanged' }
     if ($PublicHttpStatus -eq 429 -or $CloudflareError -eq 1015) { return 'RateLimited' }
     if ($CloudflareError -eq 1033) { return 'NoHealthyConnector' }
-    if ($PublicCurlExit -eq 6 -and $OverrideDiagnosticSuccess) { return 'DnsResolutionFailure' }
-    if ($PublicDnsSuccessCount -eq 0) { return 'DnsMissing' }
+    if ($PublicCurlExit -eq 6 -and -not $SystemDnsSuccess -and ($PublicDnsSuccessCount -gt 0 -or $OverrideDiagnosticSuccess)) { return 'DnsResolutionFailure' }
+    if ($DnsChecked -and -not $SystemDnsSuccess -and $PublicDnsSuccessCount -eq 0) { return 'DnsMissing' }
     if (-not $Ready) { return 'EdgeDisconnected' }
     if ($PublicHttpStatus -eq 502 -or ($PublicHttpStatus -eq 530 -and $CloudflareError -ne 1033)) { return 'CloudflareProxyFailure' }
     return 'PublicTransportFailure'
