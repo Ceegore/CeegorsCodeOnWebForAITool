@@ -122,6 +122,27 @@ Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopier
 | `-NoClipboard` | kopiert den Link nicht |
 | `-KeepClipboard` | leert den Link nach Ende nicht automatisch |
 | `-UnsafeSkipSecretScan -TestMode` | ausschließlich für isolierte Tests; im normalen Betrieb verboten |
+| `-TunnelProtocol auto\|quic\|http2` | Cloudflared-Transport; Standard `auto` mit QUIC-/HTTP2-Fallback |
+| `-TunnelEdgeIpVersion auto\|4\|6` | Edge-IP-Modus; Standard `auto` |
+| `-HealthCheckSeconds 5..120` | Intervall für lokale, Edge-, DNS- und öffentliche Byte-Prüfungen; Standard 15 |
+| `-HealthFailureThreshold 2..12` | Basis-Fehlerbudget vor Abbruch; Standard 4 |
+| `-TunnelRetries 5..12` | Cloudflared-Verbindungsversuche; Standard 8 |
+| `-KeepDiagnosticsOnError $true\|$false` | speichert bei Fehlern sichere Logs außerhalb des Snapshot-Ordners; Standard `$true` |
+
+## Langzeittest
+
+Während einer aktiven Freigabe kann ein unabhängiger Soak-Test die lokale Route,
+Cloudflared-Readiness, Quick-Tunnel-Hostname, normales öffentliches DNS und einen
+öffentlichen Byte-Abruf protokollieren. Die JSONL-Ausgabe enthält weder Token noch
+vollständige URLs.
+
+```powershell
+.\scripts\Test-TunnelSoak.ps1 `
+  -PublicUrl 'https://…trycloudflare.com/d/<token>/' `
+  -LocalUrl 'http://127.0.0.1:<port>/d/<token>/' `
+  -MetricsPort <port> `
+  -Minutes 60
+```
 
 ## Projektspezifische Ausschlüsse
 

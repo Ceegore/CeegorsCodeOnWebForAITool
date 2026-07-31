@@ -205,8 +205,17 @@ try {
 
     Assert-True ($shareText -match "MINISERVE_ROUTE_PREFIX") 'Capability-Token wird über Environment gesetzt'
     Assert-True ($shareText -match "'--interfaces', '127.0.0.1'") 'Loopback-Bindung ist statisch konfiguriert'
-    Assert-True ($shareText -match "'--stderr', 'NUL'") 'curl-Fehler werden als Exitcode behandelt'
-    Assert-True ($shareText -match 'DnsOverrideCache') 'Öffentliche DNS-Antwort wird für Folgetests stabil gecacht'
+    Assert-True ($shareText -match 'Invoke-CurlProbe') 'Strukturierte curl-Probes erfassen HTTP- und Fehlerdetails'
+    Assert-True ($shareText -match '''--protocol'',\s*\$Protocol') 'Tunnel-Protokoll ist konfigurierbar'
+    Assert-True ($shareText -match '''--edge-ip-version'',\s*\$EdgeIpVersion') 'Edge-IP-Modus ist konfigurierbar'
+    Assert-True ($shareText -match "'--metrics'") 'cloudflared-Metrics-Endpunkt wird explizit konfiguriert'
+    Assert-True ($shareText -match '/ready') 'Laufzeit prüft cloudflared-Readiness'
+    Assert-True ($shareText -match '/quicktunnel') 'Laufzeit prüft Quick-Tunnel-Hostname'
+    Assert-True ($shareText -match 'HealthFailureThreshold') 'Laufzeit besitzt ein Fehlerbudget'
+    Assert-True ($shareText -match 'KeepDiagnosticsOnError') 'Sichere Fehlerdiagnosen können erhalten werden'
+    Assert-True ($shareText -match 'https://<redacted>\.trycloudflare\.com') 'Diagnoselogs schwärzen die Tunnel-URL'
+    Assert-True ($shareText -notmatch 'DnsOverrideCache') 'Permanenter DNS-IP-Cache wurde entfernt'
+    Assert-True ($shareText -match 'Get-LiveDnsOverrideArguments') 'DNS-Override existiert nur als frische Diagnosehilfe'
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         Assert-True ($shareText -match [regex]::Escape("'$resolver'")) ("DNS-Fallback enthält Resolver: $resolver")
     }
