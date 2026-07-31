@@ -27,11 +27,16 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 $version = (Get-Content -LiteralPath (Join-Path $ToolRoot 'VERSION') -Raw).Trim()
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $testScript = Join-Path $ToolRoot 'tests\Test-WorkspaceShare.ps1'
+$lifecycleTestScript = Join-Path $ToolRoot 'tests\Test-LifecycleHardening.ps1'
 $sevenZip = Join-Path $ToolRoot 'bin\7za.exe'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Release-' + [Guid]::NewGuid().ToString('N'))
 $stage = Join-Path $temp 'WorkspaceShare'
 $archive = Join-Path $OutputDirectory ("WorkspaceShare-{0}.zip" -f $version)
 $hashFile = $archive + '.sha256.txt'
+$releaseMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
+$releaseMutexHeld = $false
+try { $releaseMutexHeld = $releaseMutex.WaitOne([TimeSpan]::FromSeconds(30)) } catch { throw 'The dependency/release mutex could not be acquired.' }
+if (-not $releaseMutexHeld) { throw 'A dependency installation or another release build is active.' }
 
 function Require-File {
     param([string]$Path, [string]$Name)
@@ -43,6 +48,7 @@ function Require-File {
 try {
     Require-File $lockPath 'Lockfile'
     Require-File $testScript 'Testskript'
+    Require-File $lifecycleTestScript 'Lifecycle-Testskript'
     Require-File $sevenZip '7za.exe'
 
     $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
@@ -55,6 +61,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Automatisierte Tests fehlgeschlagen (Exit $LASTEXITCODE)."
     }
+    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $lifecycleTestScript -ToolRoot $ToolRoot
+    if($LASTEXITCODE -ne 0){throw "Lifecycle-Tests fehlgeschlagen (Exit $LASTEXITCODE)."}
 
     Write-Host '[2/5] Release-Inhalt statisch prüfen ...'
     $textFiles = @(
@@ -109,10 +117,11 @@ try {
         'SECURITY.md',
         'THIRD_PARTY_NOTICES.md',
         'dependencies.lock.json',
-        'config',
-        'scripts',
-        'tests',
-        'bin'
+        'config\mandatory-excludes.txt','config\generated-excludes.txt','config\gitleaks-workspaceshare.toml',
+        'scripts\WorkspaceShare.Process.psm1','scripts\WorkspaceShare.Curl.psm1','scripts\WorkspaceShare.Health.psm1','scripts\WorkspaceShare.Job.psm1','scripts\WorkspaceShare.Path.psm1','scripts\Watch-WorkspaceShare.ps1','scripts\Test-TunnelSoak.ps1','scripts\Test-QuickTunnelDns.ps1',
+        'tests\Test-WorkspaceShare.ps1','tests\Test-LifecycleHardening.ps1',
+        'bin\cloudflared.exe','bin\miniserve.exe','bin\gitleaks.exe','bin\7za.exe','bin\README.md',
+        'bin\licenses\cloudflared-LICENSE.txt','bin\licenses\miniserve-LICENSE.txt','bin\licenses\Gitleaks-LICENSE.txt','bin\licenses\7-Zip-LICENSE.txt'
     )
 
     foreach ($relative in $releasePaths) {
@@ -120,12 +129,10 @@ try {
         if (-not (Test-Path -LiteralPath $source)) {
             throw "Release-Pfad fehlt: $relative"
         }
-        Copy-Item -LiteralPath $source -Destination $stage -Recurse -Force
+        $destination=Join-Path $stage $relative
+        New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force|Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
     }
-
-    # Keine Laufzeitdaten oder Entwicklungsartefakte verteilen.
-    Remove-Item -LiteralPath (Join-Path $stage 'scripts\Build-InternalRelease.ps1') -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $stage 'tests\New-TestFixtures.ps1') -Force -ErrorAction SilentlyContinue
 
     Write-Host '[4/5] Distributions-ZIP erzeugen und testen ...'
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -161,4 +168,6 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    if ($releaseMutexHeld) { try { $releaseMutex.ReleaseMutex() } catch {} }
+    $releaseMutex.Dispose()
 }

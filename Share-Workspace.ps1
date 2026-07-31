@@ -102,6 +102,10 @@ $script:RetiredWatchdogProcesses = New-Object 'System.Collections.Generic.List[S
 $script:ArchiveLockStream = $null
 $script:LastDnsDiagnosticUtc = [DateTime]::MinValue
 $script:LastDnsObservation = $null
+$script:StopReason = 'StartupFailure'
+$script:RuntimeTimer = $null
+$script:JobHandle = [IntPtr]::Zero
+$script:JobName = $null
 
 $BinDirectory = Join-Path $ToolRoot 'bin'
 $ConfigDirectory = Join-Path $ToolRoot 'config'
@@ -112,7 +116,7 @@ $MiniservePath = Join-Path $BinDirectory 'miniserve.exe'
 $CloudflaredPath = Join-Path $BinDirectory 'cloudflared.exe'
 $GitleaksPath = Join-Path $BinDirectory 'gitleaks.exe'
 $curlCommand = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
-$CurlPath = if ($curlCommand) { $curlCommand.Source } else { $null }
+$script:CurlPath = if ($curlCommand) { $curlCommand.Source } else { $null }
 
 $MandatoryExcludesPath = Join-Path $ConfigDirectory 'mandatory-excludes.txt'
 $GeneratedExcludesPath = Join-Path $ConfigDirectory 'generated-excludes.txt'
@@ -122,6 +126,8 @@ $WatchdogScriptPath = Join-Path $ScriptsDirectory 'Watch-WorkspaceShare.ps1'
 $HealthModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Health.psm1'
 $ProcessModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Process.psm1'
 $CurlModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Curl.psm1'
+$JobModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Job.psm1'
+$PathModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Path.psm1'
 
 $SessionBase = if ($env:LOCALAPPDATA) {
     Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions'
@@ -168,6 +174,15 @@ function Require-File {
 
 function Test-DirectoryPathsOverlap {
     param([Parameter(Mandatory = $true)][string]$First,[Parameter(Mandatory = $true)][string]$Second)
+    if ((Test-Path -LiteralPath $First -PathType Container) -and (Test-Path -LiteralPath $Second -PathType Container)) {
+        $firstIdentity = Resolve-WorkspaceDirectoryIdentity -Path $First
+        $secondIdentity = Resolve-WorkspaceDirectoryIdentity -Path $Second
+        if ($firstIdentity.Identity -eq $secondIdentity.Identity) { return $true }
+        $separator = [IO.Path]::DirectorySeparatorChar
+        $firstFinal = $firstIdentity.FinalPath.TrimEnd('\','/') + $separator
+        $secondFinal = $secondIdentity.FinalPath.TrimEnd('\','/') + $separator
+        return ($firstFinal.StartsWith($secondFinal,[StringComparison]::OrdinalIgnoreCase) -or $secondFinal.StartsWith($firstFinal,[StringComparison]::OrdinalIgnoreCase))
+    }
     $normalize = { param($candidate) ([IO.Path]::GetFullPath($candidate).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar) }
     $firstPath=& $normalize $First; $secondPath=& $normalize $Second
     return ($firstPath.StartsWith($secondPath,[StringComparison]::OrdinalIgnoreCase) -or $secondPath.StartsWith($firstPath,[StringComparison]::OrdinalIgnoreCase))
@@ -184,12 +199,55 @@ function Lock-ArchiveReadOnly {
     $script:ArchiveLockStream = New-Object IO.FileStream($ArchivePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
 }
 
+function Test-StopRequested {
+    return ($script:SessionDirectory -and (Test-Path -LiteralPath (Join-Path $script:SessionDirectory 'stop.requested') -PathType Leaf))
+}
+
+function Test-EffectiveKeepArchive {
+    return ([bool]$KeepArchive -or ($script:KeepArchiveMarker -and (Test-Path -LiteralPath $script:KeepArchiveMarker -PathType Leaf)))
+}
+
+function Write-OwnerMetadata {
+    param([Parameter(Mandatory=$true)][string]$Phase)
+    $launcher=Get-Process -Id $PID -ErrorAction Stop
+    $owner=[ordered]@{magic='WorkspaceShareSession';schema=1;phase=$Phase;createdUtc=[DateTime]::UtcNow.ToString('o');launcherPid=$PID;launcherPath=$launcher.Path;launcherStartTicks=$launcher.StartTime.ToUniversalTime().Ticks}
+    Write-JsonFileAtomic -Value $owner -Destination (Join-Path $script:SessionDirectory 'owner.json')
+}
+
+function Set-PrivateDirectoryAcl {
+    param([Parameter(Mandatory=$true)][string]$Directory)
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & "$env:SystemRoot\System32\icacls.exe" $Directory '/inheritance:r' '/grant:r' ("*{0}:(OI)(CI)F" -f $sid)|Out-Null
+    if($LASTEXITCODE -ne 0){Stop-WithError -Code 10 -Message "Private Verzeichnisrechte konnten nicht gesetzt werden: $Directory"}
+}
+
+function Read-BoundedDiagnosticText {
+    param([Parameter(Mandatory=$true)][string]$Path,[int]$MaximumBytes=1048576)
+    $stream=New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+    try{$length=[Math]::Min([int64]$MaximumBytes,$stream.Length);$stream.Seek(-$length,[IO.SeekOrigin]::End)|Out-Null;$bytes=New-Object byte[] $length;[void]$stream.Read($bytes,0,$bytes.Length);return [Text.Encoding]::UTF8.GetString($bytes)}finally{$stream.Dispose()}
+}
+
+function Get-SessionIntegrityMap {
+    $map=New-Object 'System.Collections.Generic.List[string]'
+    foreach($file in @(Get-ChildItem -LiteralPath $script:SessionDirectory -File -Recurse -ErrorAction Stop|Where-Object{
+        $_.Name -notmatch '^probe-(body|headers|error)-.*\.tmp$' -and
+        $_.Name -notin @('miniserve.stdout.log','miniserve.stderr.log')
+    })){$relative=$file.FullName.Substring($script:SessionDirectory.Length).ToLowerInvariant();$map.Add(('{0}|{1}|{2}' -f $relative,$file.Length,(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash))}
+    return @($map|Sort-Object)
+}
+
 function Test-ExactArchiveContents {
-    param([Parameter(Mandatory = $true)][string]$ArchivePath,[Parameter(Mandatory = $true)][string]$VerificationRoot,[Parameter(Mandatory = $true)][string]$GitleaksReportPath)
+    param([Parameter(Mandatory = $true)][string]$ArchivePath,[Parameter(Mandatory = $true)][string]$VerificationRoot,[Parameter(Mandatory = $true)][string]$GitleaksReportPath,[string[]]$ExclusionPatterns=@())
     New-Item -ItemType Directory -Path $VerificationRoot -Force | Out-Null
     try {
         & $SevenZipPath @('x','-y','-bd','-bb1',("-o$VerificationRoot"),$ArchivePath) | Out-Null
         if($LASTEXITCODE -ne 0){Stop-WithError -Code 23 -Message 'Das fertige Archiv konnte nicht zur Inhaltsprüfung extrahiert werden.'}
+        foreach($entry in @(Get-ChildItem -LiteralPath $VerificationRoot -Recurse -Force -ErrorAction Stop)){
+            $relative=$entry.FullName.Substring($VerificationRoot.Length).TrimStart('\','/') -replace '/','\'
+            $parts=@($relative -split '\\')
+            if(@($parts|Where-Object{$_ -in @('.git','.svn','.hg')}).Count -gt 0){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält ausgeschlossene Versionskontrolldaten: $relative"}
+            foreach($pattern in $ExclusionPatterns){$normalized=$pattern -replace '/','\';if($relative -like $normalized -or $entry.Name -like $normalized){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält einen ausgeschlossenen Pfad: $relative"}}
+        }
         $inspection=Inspect-Workspace -Root $VerificationRoot -IncludeGeneratedContent
         if($inspection.AccessErrors.Count -gt 0 -or $inspection.ReparsePoints.Count -gt 0 -or $inspection.ForbiddenFiles.Count -gt 0){Stop-WithError -Code 22 -Message 'Das fertige Archiv hat die exakte Inhaltsprüfung nicht bestanden.'}
         Invoke-GitleaksScan -SourceRoot $VerificationRoot -ReportPath $GitleaksReportPath
@@ -211,20 +269,6 @@ function Get-ProcessStartTicksSafe {
     catch {
         return [int64]0
     }
-}
-
-function Test-ProcessIdentity {
-    param(
-        [int]$ProcessId,
-        [string]$ExpectedPath,
-        [long]$ExpectedStartTicks
-    )
-
-    if ($ProcessId -le 0 -or -not $ExpectedPath -or $ExpectedStartTicks -le 0) {
-        return $false
-    }
-
-    return ((Get-ProcessIdentityState -ProcessId $ProcessId -ExpectedPath $ExpectedPath -ExpectedStartTicks $ExpectedStartTicks).State -eq 'Match')
 }
 
 function Assert-DependencyLock {
@@ -423,6 +467,10 @@ function Start-NativeProcess {
     $startInfo.CreateNoWindow = [bool]$CreateNoWindow
     $startInfo.WorkingDirectory = $WorkingDirectory
 
+    if([IO.Path]::GetFileName($FilePath) -ieq 'miniserve.exe'){
+        foreach($key in @($startInfo.EnvironmentVariables.Keys)){if(([string]$key).StartsWith('MINISERVE_',[StringComparison]::OrdinalIgnoreCase)){[void]$startInfo.EnvironmentVariables.Remove([string]$key)}}
+    }
+
     foreach ($key in $Environment.Keys) {
         $startInfo.EnvironmentVariables[$key] = [string]$Environment[$key]
     }
@@ -433,6 +481,8 @@ function Start-NativeProcess {
     if (-not $process.Start()) {
         Stop-WithError -Code 30 -Message "Prozess konnte nicht gestartet werden: $FilePath"
     }
+
+    $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
 
     return $process
 }
@@ -478,7 +528,7 @@ function Stop-ProcessConfirmed {
     )
 
     if ($null -eq $Process) { return $true }
-    try { $Process.Refresh(); return (Stop-TrackedProcessConfirmed -ProcessId $Process.Id -ExpectedPath $ExpectedPath -ExpectedStartTicks $Process.StartTime.ToUniversalTime().Ticks -Attempts $Attempts -WaitMilliseconds $WaitMilliseconds) } catch { return $false }
+    try{$Process.Refresh();$ticks=if($Process.PSObject.Properties.Name -contains 'WorkspaceShareStartTicks'){[long]$Process.WorkspaceShareStartTicks}else{[long]$Process.StartTime.ToUniversalTime().Ticks};return (Stop-TrackedProcessConfirmed -ProcessId $Process.Id -ExpectedPath $ExpectedPath -ExpectedStartTicks $ticks -Attempts $Attempts -WaitMilliseconds $WaitMilliseconds)}catch{return $false}
 }
 
 function Get-CurlStatus {
@@ -488,14 +538,18 @@ function Get-CurlStatus {
         [switch]$Head
     )
 
-    return (Invoke-CurlProbe -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head).HttpStatus
+    $probe=Invoke-CurlProbe -Url $Url -TimeoutSeconds $TimeoutSeconds -Head:$Head
+    if($probe.CurlExit -ne 0){return 0}
+    return $probe.HttpStatus
 }
 
 function Assert-DeniedRoute {
     param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string]$Description, [int]$Code = 43)
-    $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 10 -Head -MaximumBytes 65536
-    if ($probe.CurlExit -ne 0) { Stop-WithError -Code $Code -Message "$Description konnte nicht geprüft werden (curl exit $($probe.CurlExit))." }
-    if ($probe.HttpStatus -notin @(401, 403, 404)) { Stop-WithError -Code $Code -Message "$Description lieferte unerwartetes HTTP $($probe.HttpStatus); erwartet wird eine explizite 4xx-Ablehnung." }
+    foreach($head in @($true,$false)){
+        $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 10 -Head:$head -MaximumBytes 65536
+        if ($probe.CurlExit -ne 0) { Stop-WithError -Code $Code -Message "$Description konnte nicht geprüft werden (curl exit $($probe.CurlExit))." }
+        if ($probe.HttpStatus -notin @(401,403,404)) { Stop-WithError -Code $Code -Message "$Description lieferte unerwartetes HTTP $($probe.HttpStatus); erwartet wird eine explizite 4xx-Ablehnung." }
+    }
 }
 
 function Protect-DiagnosticText {
@@ -517,9 +571,9 @@ function Protect-DiagnosticText {
     return $safe
 }
 
-function Invoke-CurlWithPrivateUrl {
+function Invoke-WorkspaceCurl {
     param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string[]]$Arguments, [string[]]$PrivateConfigLines = @())
-    return WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $CurlPath -Url $Url -Arguments $Arguments -PrivateConfigLines $PrivateConfigLines
+    return WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $script:CurlPath -Url $Url -Arguments $Arguments -PrivateConfigLines $PrivateConfigLines
 }
 
 function Invoke-CurlProbe {
@@ -533,6 +587,7 @@ function Invoke-CurlProbe {
         [int64]$ExpectedBytes = 0,
         [int64]$ExpectedRangeStart = 0,
         [int64]$MaximumBytes = 65536,
+        [switch]$ReadTextBody,
         [switch]$AllowFullFileResponse
     )
 
@@ -546,11 +601,11 @@ function Invoke-CurlProbe {
         $arguments = @('--silent', '--show-error', '--stderr', $errorPath, '--output', $bodyPath,
             '--dump-header', $headerPath, '--max-time', [string]$TimeoutSeconds,
             '--header', 'Accept: application/json', '--write-out', '%{http_code}|%{remote_ip}|%{time_total}|%{size_download}')
-        if ($MaximumBytes -gt 0) { $arguments += @('--max-filesize', [string]$MaximumBytes) }
+        if (-not $Head -and $MaximumBytes -gt 0) { $arguments += @('--max-filesize', [string]$MaximumBytes) }
         if ($Head) { $arguments += '--head' }
         if (-not [string]::IsNullOrWhiteSpace($Range)) { $arguments += @('--range', $Range) }
         if ($ExtraArguments) { $arguments += $ExtraArguments }
-        $result = Invoke-CurlWithPrivateUrl -Url $Url -Arguments $arguments -PrivateConfigLines $PrivateConfigLines
+        $result = Invoke-WorkspaceCurl -Url $Url -Arguments $arguments -PrivateConfigLines $PrivateConfigLines
         $raw = $result.StdOut
         $curlExit = $result.ExitCode
         $parts = @(((($raw | Select-Object -Last 1) | Out-String).Trim()).Split('|'))
@@ -563,13 +618,13 @@ function Invoke-CurlProbe {
         if ($parts.Count -ge 4) { [void][double]::TryParse($parts[3], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sizeDownload) }
         $actualBodyBytes = if (Test-Path -LiteralPath $bodyPath -PathType Leaf) { [int64](Get-Item -LiteralPath $bodyPath).Length } else { [int64]0 }
         $bodySha256 = if ($actualBodyBytes -gt 0) { (Get-FileHash -LiteralPath $bodyPath -Algorithm SHA256).Hash } else { '' }
-        $body = if (Test-Path -LiteralPath $bodyPath) { [string](Get-Content -LiteralPath $bodyPath -Raw -ErrorAction SilentlyContinue) } else { '' }
+        $body = ''
         $headers = if (Test-Path -LiteralPath $headerPath) { [string](Get-Content -LiteralPath $headerPath -Raw -ErrorAction SilentlyContinue) } else { '' }
         $errorText = if (Test-Path -LiteralPath $errorPath) { [string](Get-Content -LiteralPath $errorPath -Raw -ErrorAction SilentlyContinue) } else { '' }
         if ($result.StdErr) { $errorText += [Environment]::NewLine + $result.StdErr }
         $retryAfter = 0
-        $retryMatch = [regex]::Match($headers, '(?im)^Retry-After:\s*(\d+)\s*$')
-        if ($retryMatch.Success) { [void][int]::TryParse($retryMatch.Groups[1].Value, [ref]$retryAfter) }
+        $retryMatch = [regex]::Match($headers, '(?im)^Retry-After:\s*([^\r\n]+)')
+        if($retryMatch.Success){$value=$retryMatch.Groups[1].Value.Trim();if(-not[int]::TryParse($value,[ref]$retryAfter)){$date=[DateTime]::MinValue;if([DateTime]::TryParseExact($value,'r',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$date)){$retryAfter=[int][Math]::Max(0,[Math]::Ceiling(($date.ToUniversalTime()-[DateTime]::UtcNow).TotalSeconds))}}}
         $cfRay = ''
         $rayMatch = [regex]::Match($headers, '(?im)^CF-Ray:\s*([^\r\n]+)')
         if ($rayMatch.Success) { $cfRay = $rayMatch.Groups[1].Value.Trim() }
@@ -577,10 +632,7 @@ function Invoke-CurlProbe {
         $contentRangeMatch = [regex]::Match($headers, '(?im)^Content-Range:\s*([^\r\n]+)')
         if ($contentRangeMatch.Success) { $contentRange = $contentRangeMatch.Groups[1].Value.Trim() }
         $cloudflareError = 0
-        foreach ($pattern in @('(?i)"code"\s*:\s*(10\d{2})', '(?i)\berror\s+(10\d{2})\b', '(?i)\b(1033)\b')) {
-            $match = [regex]::Match($body, $pattern)
-            if ($match.Success) { [void][int]::TryParse($match.Groups[1].Value, [ref]$cloudflareError); break }
-        }
+        if(($ReadTextBody -or $httpStatus -ge 400) -and (Test-Path -LiteralPath $bodyPath)){$body=[string](Get-Content -LiteralPath $bodyPath -Raw -ErrorAction SilentlyContinue);if($httpStatus -ge 400){foreach($pattern in @('(?i)"code"\s*:\s*(10\d{2})','(?i)\berror\s+(10\d{2})\b','(?i)\b(1033)\b')){$match=[regex]::Match($body,$pattern);if($match.Success){[void][int]::TryParse($match.Groups[1].Value,[ref]$cloudflareError);break}}}}
         $sampleValid = if ($ExpectedBytes -gt 0) {
             $expectedRangeEnd = $ExpectedRangeStart + $ExpectedBytes - 1
             $validStatus = ($httpStatus -eq 206 -and $contentRange -match ('^bytes\s+{0}-{1}/' -f $ExpectedRangeStart, $expectedRangeEnd))
@@ -602,12 +654,12 @@ function Invoke-CurlProbe {
     }
 }
 
-function Get-LiveDnsOverrideArguments {
+function Get-LiveDnsOverrideConfigLines {
     param([Parameter(Mandatory = $true)][string]$HostName)
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         try {
-            $address = Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
-            if ($address) { return @('resolve = "{0}:443:{1}"' -f $HostName, $address) }
+            $address = Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
+            if ($address) {$value='{0}:443:{1}' -f $HostName,$address;return @('resolve = "{0}"' -f (WorkspaceShare.Curl\ConvertTo-CurlConfigQuoted $value))}
         } catch {}
     }
     return @()
@@ -640,11 +692,13 @@ function Wait-ForHttpStatus {
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $script:LastHttpProbe = $null
 
     do {
-        $status = Get-CurlStatus -Url $Url -TimeoutSeconds 5 -Head
-        if ($AcceptedStatus -contains $status) {
-            return $status
+        $probe = Invoke-CurlProbe -Url $Url -TimeoutSeconds 5 -Head
+        $script:LastHttpProbe = $probe
+        if ($probe.CurlExit -eq 0 -and $AcceptedStatus -contains $probe.HttpStatus) {
+            return $probe.HttpStatus
         }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -681,7 +735,8 @@ function Test-MatchingRangeRequest {
 function Get-HeaderDump {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [switch]$Head
     )
 
     $arguments = @(
@@ -689,11 +744,11 @@ function Get-HeaderDump {
         '--show-error',
         '--stderr', 'NUL',
         '--max-time', '20',
-        '--head',
         '--dump-header', $OutputPath,
         '--output', 'NUL'
     )
-    return (Invoke-CurlWithPrivateUrl -Url $Url -Arguments $arguments).ExitCode
+    if($Head){$arguments+='--head'}else{$arguments+=@('--range','0-0','--max-filesize','1')}
+    return (Invoke-WorkspaceCurl -Url $Url -Arguments $arguments).ExitCode
 }
 
 function Read-PatternFile {
@@ -837,6 +892,20 @@ function Inspect-Workspace {
         ReparsePoints = @($reparsePoints)
         AccessErrors = @($accessErrors)
     }
+}
+
+function Get-SourceConsistencyManifest {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    $result=New-Object 'System.Collections.Generic.List[string]'
+    try{
+        foreach($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force -ErrorAction Stop)){
+            if(($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
+            $relative=$file.FullName.Substring($Root.Length).TrimStart('\','/').ToLowerInvariant()
+            $hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+            $result.Add(('{0}|{1}|{2}' -f $relative,$file.Length,$hash))
+        }
+    }catch{Stop-WithError -Code 20 -Message ('Die Quelle änderte sich oder konnte während der Snapshot-Prüfung nicht gelesen werden: '+$_.Exception.Message)}
+    return @($result|Sort-Object)
 }
 
 function Get-CloudflaredConfigConflicts {
@@ -1016,17 +1085,35 @@ function Start-MiniserveReadOnly {
         $Archive
     )
 
-    # Token bewusst nicht in der Prozesskommandozeile:
-    $environment = @{
-        MINISERVE_ROUTE_PREFIX = ("d/{0}" -f $CapabilityToken)
+    # Token bewusst nicht in der Prozesskommandozeile. Die kurze Änderung der
+    # Launcher-Umgebung ist nötig, weil CreateProcess den Server zunächst
+    # angehalten und damit ohne unüberwachten Prozess-Spalt in den Job startet.
+    $saved = @{}
+    $names = @([Environment]::GetEnvironmentVariables('Process').Keys | Where-Object {
+        ([string]$_).StartsWith('MINISERVE_', [StringComparison]::OrdinalIgnoreCase)
+    })
+    try {
+        foreach ($name in $names) {
+            $saved[[string]$name] = [Environment]::GetEnvironmentVariable([string]$name, 'Process')
+            [Environment]::SetEnvironmentVariable([string]$name, $null, 'Process')
+        }
+        [Environment]::SetEnvironmentVariable('MINISERVE_ROUTE_PREFIX', ("d/{0}" -f $CapabilityToken), 'Process')
+        $process = Start-WorkspaceProcessInJob `
+            -Job $script:JobHandle `
+            -FilePath $MiniservePath `
+            -Arguments $arguments `
+            -WorkingDirectory $script:SessionDirectory `
+            -StdOutPath (Join-Path $script:SessionDirectory 'miniserve.stdout.log') `
+            -StdErrPath (Join-Path $script:SessionDirectory 'miniserve.stderr.log')
+        $process | Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+        return $process
     }
-
-    return Start-NativeProcess `
-        -FilePath $MiniservePath `
-        -Arguments $arguments `
-        -Environment $environment `
-        -WorkingDirectory $script:SessionDirectory `
-        -CreateNoWindow
+    finally {
+        [Environment]::SetEnvironmentVariable('MINISERVE_ROUTE_PREFIX', $null, 'Process')
+        foreach ($name in $saved.Keys) {
+            [Environment]::SetEnvironmentVariable([string]$name, [string]$saved[$name], 'Process')
+        }
+    }
 }
 
 function Start-CloudflaredQuickTunnel {
@@ -1050,13 +1137,14 @@ function Start-CloudflaredQuickTunnel {
         '--loglevel', 'info'
     )
 
-    return Start-Process `
-        -FilePath $CloudflaredPath `
-        -ArgumentList $arguments `
-        -RedirectStandardOutput $StdOutPath `
-        -RedirectStandardError $StdErrPath `
-        -WindowStyle Hidden `
-        -PassThru
+    $blocked=@('TUNNEL_TOKEN','TUNNEL_ORIGIN_CERT','TUNNEL_CRED_FILE','TUNNEL_CONFIG','CLOUDFLARED_CONFIG','SSLKEYLOGFILE')
+    $saved=@{}
+    try{
+        foreach($name in $blocked){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process');[Environment]::SetEnvironmentVariable($name,$null,'Process')}
+        $process=Start-WorkspaceProcessInJob -Job $script:JobHandle -FilePath $CloudflaredPath -Arguments $arguments -WorkingDirectory $script:SessionDirectory -StdOutPath $StdOutPath -StdErrPath $StdErrPath
+        $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+        return $process
+    }finally{foreach($name in $blocked){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}}
 }
 
 function Wait-ForCloudflaredMetrics {
@@ -1068,6 +1156,7 @@ function Wait-ForCloudflaredMetrics {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
+        if(Test-StopRequested){return $false}
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
         $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/healthcheck" -TimeoutSeconds 3
@@ -1079,7 +1168,7 @@ function Wait-ForCloudflaredMetrics {
 
 function Get-CloudflaredReadiness {
     param([Parameter(Mandatory = $true)][int]$MetricsPort)
-    $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/ready" -TimeoutSeconds 5
+    $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/ready" -TimeoutSeconds 5 -ReadTextBody
     $readyConnections = 0
     $connectorId = ''
     if ($probe.Body) {
@@ -1096,7 +1185,7 @@ function Get-QuickTunnelHostnameState {
     param([Parameter(Mandatory = $true)][int]$MetricsPort, [Parameter(Mandatory = $true)][string]$ExpectedHostname)
     $temporaryPath = Join-Path ([IO.Path]::GetTempPath()) ("workspaceshare-quicktunnel-{0}.json" -f [Guid]::NewGuid().ToString('N'))
     try {
-        $result = Invoke-CurlWithPrivateUrl -Url "http://127.0.0.1:$MetricsPort/quicktunnel" -Arguments @('--silent', '--show-error', '--max-time', '5', '--max-filesize', '65536', '--output', $temporaryPath)
+        $result = Invoke-WorkspaceCurl -Url "http://127.0.0.1:$MetricsPort/quicktunnel" -Arguments @('--silent', '--show-error', '--max-time', '5', '--max-filesize', '65536', '--output', $temporaryPath)
         if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) {
             return [pscustomobject]@{ Available = $false; Matches = $false; CurlExit = $result.ExitCode; ParseError = $false }
         }
@@ -1110,7 +1199,7 @@ function Get-QuickTunnelHostnameState {
 
 function Get-CloudflaredConnectionMetric {
     param([Parameter(Mandatory = $true)][int]$MetricsPort)
-    $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/metrics" -TimeoutSeconds 5
+    $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/metrics" -TimeoutSeconds 5 -MaximumBytes 4194304 -ReadTextBody
     if ($probe.CurlExit -ne 0 -or $probe.HttpStatus -ne 200) { return -1 }
     $matches = [regex]::Matches($probe.Body, '(?m)^cloudflared_tunnel_ha_connections(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$')
     if ($matches.Count -eq 0) { return -1 }
@@ -1155,14 +1244,14 @@ function Get-TunnelHealthSnapshot {
             $script:LastDnsObservation = $dns
             $script:LastDnsDiagnosticUtc = [DateTime]::UtcNow
         }
-        $overrideArguments = @(Get-LiveDnsOverrideArguments -HostName $expectedHost)
+        $overrideArguments = @(Get-LiveDnsOverrideConfigLines -HostName $expectedHost)
         if ($overrideArguments.Count -gt 0) {
             $overrideProbe = Invoke-CurlProbe -Url $PublicUrl -TimeoutSeconds 12 -Range $sampleRange -ExpectedRangeStart $SampleStart -ExpectedBytes $SampleBytes -MaximumBytes 65536 -PrivateConfigLines $overrideArguments -AllowFullFileResponse:$AllowFullFileResponse
         }
     }
 
     $overrideSuccess = if ($overrideProbe) { [bool]$overrideProbe.Success } else { $false }
-    $classification = Get-TunnelClassification -LocalSampleValid $localProbe.SampleValid -EndToEndSampleValid $endToEndSampleValid -HostnameAvailable $hostnameState.Available -HostnameMatches $hostnameState.Matches -PublicHttpStatus $publicProbe.HttpStatus -CloudflareError $publicProbe.CloudflareError -PublicCurlExit $publicProbe.CurlExit -OverrideDiagnosticSuccess $overrideSuccess -PublicDnsSuccessCount $(if ($dns) { [int]$dns.PublicSuccessCount } else { 0 }) -DnsChecked ($null -ne $dns) -SystemDnsSuccess $(if ($dns) { [bool]$dns.SystemSuccess } else { $false }) -Ready $readiness.Ready -PublicSampleValid $publicProbe.SampleValid
+    $classification = Get-TunnelClassification -LocalSampleValid $localProbe.SampleValid -EndToEndSampleValid $endToEndSampleValid -HostnameAvailable $hostnameState.Available -HostnameMatches $hostnameState.Matches -PublicHttpStatus $publicProbe.HttpStatus -CloudflareError $publicProbe.CloudflareError -PublicCurlExit $publicProbe.CurlExit -OverrideDiagnosticSuccess $overrideSuccess -PublicDnsSuccessCount $(if ($dns) { [int]$dns.PublicSuccessCount } else { 0 }) -DnsChecked ($null -ne $dns) -SystemDnsSuccess $(if ($dns) { [bool]$dns.SystemSuccess } else { $false }) -Ready $readiness.Ready
     $message = 'Exact public archive sample matches the local archive sample.'
     $readinessDisagreement = ($endToEndSampleValid -and -not $readiness.Ready)
     switch ($classification) {
@@ -1219,16 +1308,18 @@ function Wait-ForHealthyTunnel {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $snapshot = $null
     do {
+        if(Test-StopRequested){$script:StopReason='ManualStop';return $null}
         $snapshot = Get-TunnelHealthSnapshot -PublicUrl $PublicUrl -LocalUrl $LocalUrl -MetricsPort $MetricsPort -SampleStart $SampleStart -SampleBytes $SampleBytes -AllowFullFileResponse:$AllowFullFileResponse
         [void](Write-HealthSnapshot -Snapshot $snapshot)
         if ($snapshot.Classification -eq 'Healthy') { return $snapshot }
+        if(Test-StopRequested){$script:StopReason='ManualStop';return $null}
         Start-Sleep -Seconds 2
     } while ([DateTime]::UtcNow -lt $deadline)
     return $snapshot
 }
 
 function Save-FailureDiagnostics {
-    param([string]$SessionId, [string]$CloudflaredStdOut, [string]$CloudflaredStdErr, [int]$MetricsPort)
+    param([string]$SessionId, [string]$CloudflaredStdOut, [string]$CloudflaredStdErr)
     if (-not $KeepDiagnosticsOnError -or $script:FailureDiagnosticsSaved -or -not $script:SessionDirectory) { return }
     try {
         $diagnosticsBase = Join-Path (Split-Path $SessionBase -Parent) 'diagnostics'
@@ -1236,11 +1327,12 @@ function Save-FailureDiagnostics {
         $safeSessionName = if ($SessionId) { $SessionId } else { [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') }
         $script:DiagnosticsPath = Join-Path $diagnosticsBase $safeSessionName
         New-Item -ItemType Directory -Path $script:DiagnosticsPath -Force | Out-Null
+        Set-PrivateDirectoryAcl -Directory $script:DiagnosticsPath
         $sources = New-Object 'System.Collections.Generic.List[string]'
         foreach ($source in @($CloudflaredStdOut, $CloudflaredStdErr, $script:HealthLogPath, (Join-Path $script:SessionDirectory 'public-headers.txt'), (Join-Path $script:SessionDirectory 'volatile-cloudflared-ready.txt'))) {
             if ($source) { $sources.Add($source) }
         }
-        foreach ($name in @('gitleaks-redacted.json','7zip-create.log','7zip-test.log','archive-manifest.txt','archive.sha256.txt')) {
+        foreach ($name in @('gitleaks-redacted.json','7zip-create.log','7zip-test.log','archive.sha256.txt')) {
             $candidate = Join-Path $script:SessionDirectory $name
             if (Test-Path -LiteralPath $candidate -PathType Leaf) { $sources.Add($candidate) }
         }
@@ -1250,7 +1342,7 @@ function Save-FailureDiagnostics {
         foreach ($source in @($sources | Select-Object -Unique)) {
             if ($source -and (Test-Path -LiteralPath $source -PathType Leaf)) {
                 $destination = Join-Path $script:DiagnosticsPath (Split-Path $source -Leaf)
-                $sanitized = Protect-DiagnosticText -Text (Get-Content -LiteralPath $source -Raw -ErrorAction SilentlyContinue) -KnownSecretUrls $script:SecretUrls
+                $sanitized = Protect-DiagnosticText -Text (Read-BoundedDiagnosticText -Path $source) -KnownSecretUrls $script:SecretUrls
                 Set-Content -LiteralPath $destination -Value $sanitized -Encoding UTF8
             }
         }
@@ -1280,9 +1372,10 @@ function Wait-ForQuickTunnelUrl {
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $regex = 'https://[a-z0-9-]+\.trycloudflare\.com'
+    $regex = '(?<![a-z0-9.-])https://[a-z0-9-]+\.trycloudflare\.com(?:/|\s|$)'
 
     do {
+        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $Process.Refresh()
         if ($Process.HasExited) {
             Stop-WithError -Code 41 -Message (
@@ -1300,7 +1393,7 @@ function Wait-ForQuickTunnelUrl {
 
         $match = [regex]::Match($combined, $regex)
         if ($match.Success) {
-            return $match.Value.TrimEnd('/')
+            return $match.Value.Trim().TrimEnd('/')
         }
 
         Start-Sleep -Milliseconds 500
@@ -1317,23 +1410,13 @@ function Assert-CacheHeaders {
         [Parameter(Mandatory = $true)][string]$HeaderPath
     )
 
-    $curlExit = Get-HeaderDump -Url $Url -OutputPath $HeaderPath
-    if ($curlExit -ne 0) {
-        Stop-WithError -Code 43 -Message "Öffentliche Antwortheader konnten nicht geprüft werden."
-    }
-
-    $headers = Get-Content -LiteralPath $HeaderPath -Raw
-
-    if ($headers -match '(?im)^cf-cache-status:\s*HIT\s*$') {
-        Stop-WithError -Code 43 -Message (
-            "Cloudflare meldet CF-Cache-Status: HIT. Die Freigabe wird nicht fortgesetzt."
-        )
-    }
-
-    if ($headers -notmatch '(?im)^cache-control:.*\bno-store\b') {
-        Stop-WithError -Code 43 -Message (
-            "Der öffentliche Endpunkt liefert keinen bestätigten Cache-Control:no-store-Header."
-        )
+    foreach($head in @($true,$false)){
+        $path=if($head){$HeaderPath}else{[IO.Path]::ChangeExtension($HeaderPath,'get.txt')}
+        $curlExit=Get-HeaderDump -Url $Url -OutputPath $path -Head:$head
+        if($curlExit -ne 0){Stop-WithError -Code 43 -Message 'Öffentliche Antwortheader konnten nicht geprüft werden.'}
+        $headers=Get-Content -LiteralPath $path -Raw
+        if($headers -match '(?im)^cf-cache-status:\s*HIT\s*$'){Stop-WithError -Code 43 -Message 'Cloudflare meldet CF-Cache-Status: HIT. Die Freigabe wird nicht fortgesetzt.'}
+        if($headers -notmatch '(?im)^cache-control:.*\bno-store\b'){Stop-WithError -Code 43 -Message 'Der öffentliche Endpunkt liefert keinen bestätigten Cache-Control:no-store-Header.'}
     }
 }
 
@@ -1428,6 +1511,7 @@ function Clear-SensitiveClipboard {
 
 function Write-SessionMetadata {
     param(
+        [ValidateSet('SetupProtected','Active','Stopping','Retained')][string]$Phase='SetupProtected',
         [Parameter(Mandatory = $true)][datetime]$ExpiresUtc,
         [Parameter(Mandatory = $true)][string]$SourceRoot,
         [Parameter(Mandatory = $true)][string]$Archive,
@@ -1439,7 +1523,9 @@ function Write-SessionMetadata {
     $launcherProcess = Get-Process -Id $PID
 
     $metadata = [ordered]@{
+        magic = 'WorkspaceShareSession'
         schema = 2
+        phase = $Phase
         createdUtc = [DateTime]::UtcNow.ToString('o')
         expiresUtc = $ExpiresUtc.ToString('o')
         sourceRoot = $SourceRoot
@@ -1447,7 +1533,7 @@ function Write-SessionMetadata {
 
         launcherPid = $PID
         launcherStartTicks = $launcherProcess.StartTime.ToUniversalTime().Ticks
-        launcherPath = $powershellExe
+        launcherPath = $launcherProcess.Path
 
         miniservePid = if ($script:MiniserveProcess) { $script:MiniserveProcess.Id } else { 0 }
         miniserveStartTicks = Get-ProcessStartTicksSafe $script:MiniserveProcess
@@ -1461,7 +1547,7 @@ function Write-SessionMetadata {
         watchdogStartTicks = $WatchdogStartTicks
         watchdogPath = $powershellExe
 
-        keepArchive = [bool]$KeepArchive
+        keepArchive = [bool](Test-EffectiveKeepArchive)
         # Bewusst keine URL und kein Capability-Token.
     }
 
@@ -1470,10 +1556,13 @@ function Write-SessionMetadata {
 
 function Test-SessionMetadataShape {
     param([Parameter(Mandatory = $true)]$Session)
-    $requiredProperties = @('schema', 'miniservePid', 'miniserveStartTicks', 'miniservePath', 'cloudflaredPid', 'cloudflaredStartTicks', 'cloudflaredPath', 'watchdogPid', 'watchdogStartTicks', 'watchdogPath')
+    $requiredProperties = @('magic','schema','phase','launcherPid','launcherStartTicks','launcherPath','miniservePid','miniserveStartTicks','miniservePath','cloudflaredPid','cloudflaredStartTicks','cloudflaredPath','watchdogPid','watchdogStartTicks','watchdogPath','archivePath','expiresUtc','keepArchive')
     $present = @($Session.PSObject.Properties.Name)
     foreach ($propertyName in $requiredProperties) { if ($present -notcontains $propertyName) { return $false } }
-    return ([int]$Session.schema -eq 2)
+    if([string]$Session.magic -ne 'WorkspaceShareSession' -or [int]$Session.schema -ne 2 -or [string]$Session.phase -notin @('SetupProtected','Active','Stopping','Retained')){return $false}
+    foreach($prefix in @('launcher','miniserve','cloudflared','watchdog')){if([int]$Session.($prefix+'Pid') -le 0 -or [long]$Session.($prefix+'StartTicks') -le 0 -or [string]::IsNullOrWhiteSpace([string]$Session.($prefix+'Path')) -or -not[IO.Path]::IsPathRooted([string]$Session.($prefix+'Path'))){return $false}}
+    if(-not[IO.Path]::IsPathRooted([string]$Session.archivePath)){return $false};$expiry=[DateTime]::MinValue;if(-not[DateTime]::TryParse([string]$Session.expiresUtc,[ref]$expiry)){return $false}
+    return $true
 }
 
 function Remove-OldDiagnostics {
@@ -1515,6 +1604,8 @@ function Start-Watchdog {
         '-CloudflaredPid', [string]$script:CloudflaredProcess.Id,
         '-CloudflaredStartTicks', [string]$cloudflaredStartTicks,
         '-SessionPath', $script:SessionDirectory,
+        '-ArchivePath', $script:ArchivePath,
+        '-JobName', $script:JobName,
         '-NormalExitMarker', $script:NormalExitMarker,
         '-ReadyMarker', $ReadyMarker,
         '-ExpiresUtc', $ExpiresUtc.ToString('o'),
@@ -1538,14 +1629,16 @@ function Start-ValidatedWatchdog {
     param([Parameter(Mandatory = $true)][datetime]$ExpiresUtc)
     $readyMarker = Join-Path $script:SessionDirectory ('watchdog-{0}.ready' -f [Guid]::NewGuid().ToString('N'))
     $watchdog = Start-Watchdog -ExpiresUtc $ExpiresUtc -ReadyMarker $readyMarker
-    $deadline = [DateTime]::UtcNow.AddSeconds(5)
-    do {
-        try { $watchdog.Refresh(); if ($watchdog.HasExited) { Stop-WithError -Code 50 -Message 'Der Watchdog wurde beendet, bevor er bereit war.' } } catch { Stop-WithError -Code 50 -Message 'Der Watchdog konnte vor der Bereitschaft nicht überprüft werden.' }
-        if (Test-Path -LiteralPath $readyMarker -PathType Leaf) { return [pscustomobject]@{ Process = $watchdog; ReadyMarker = $readyMarker } }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    [void](Stop-ProcessConfirmed -Process $watchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 5 -WaitMilliseconds 500)
-    Stop-WithError -Code 50 -Message 'Der Watchdog hat seinen Bereitschaftsmarker nicht veröffentlicht.'
+    $script:RetiredWatchdogProcesses.Add($watchdog)
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    try {
+        do { $watchdog.Refresh();if($watchdog.HasExited){Stop-WithError -Code 50 -Message 'Der Watchdog wurde beendet, bevor er bereit war.'};if(Test-Path -LiteralPath $readyMarker -PathType Leaf){return [pscustomobject]@{Process=$watchdog;ReadyMarker=$readyMarker}};Start-Sleep -Milliseconds 100 } while($timer.Elapsed.TotalSeconds -lt 5)
+        Stop-WithError -Code 50 -Message 'Der Watchdog hat seinen Bereitschaftsmarker nicht veröffentlicht.'
+    } catch {
+        $stopped=Stop-ProcessConfirmed -Process $watchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000
+        if(-not $stopped){$script:ExitCode=50;throw [Exception]::new('Ein unbereiter Watchdog konnte nicht bestätigt beendet werden; die Sitzung bleibt erhalten.',$_.Exception)}
+        throw
+    }
 }
 
 function Remove-StaleSessions {
@@ -1566,7 +1659,11 @@ function Remove-StaleSessions {
 
         $metadataPath = Join-Path $directory.FullName 'session.json'
         if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
-            Write-Warning "Alte Sitzung ohne verifizierbare Metadaten bleibt bestehen: $($directory.FullName)"
+            $ownerPath=Join-Path $directory.FullName 'owner.json'
+            try{$owner=Get-Content -LiteralPath $ownerPath -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop}catch{Write-Warning "Alte Sitzung ohne verifizierbare Eigentümerdaten bleibt bestehen: $($directory.FullName)";continue}
+            if([string]$owner.magic -ne 'WorkspaceShareSession' -or [int]$owner.schema -ne 1){Write-Warning "Alte Sitzung mit ungültigen Eigentümerdaten bleibt bestehen: $($directory.FullName)";continue}
+            $ownerState=Get-ProcessIdentityState -ProcessId ([int]$owner.launcherPid) -ExpectedPath ([string]$owner.launcherPath) -ExpectedStartTicks ([long]$owner.launcherStartTicks)
+            if($ownerState.State -in @('Absent','Conflict')){Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue}
             continue
         }
 
@@ -1582,6 +1679,8 @@ function Remove-StaleSessions {
             Write-Warning "Alte Sitzung mit unvollständigen Metadaten bleibt bestehen: $($directory.FullName)"
             continue
         }
+
+        if([bool]$session.keepArchive){continue}
 
         $active = $false
         try {
@@ -1624,15 +1723,25 @@ try {
     Write-Host ''
 
     $totalSteps = 8
+    if ($HealthFailureThreshold -ne 4) {
+        Write-Warning '-HealthFailureThreshold is retained for compatibility; version 3.1 uses bounded time-based outage budgets.'
+    }
+
+    if($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5){Stop-WithError -Code 10 -Message 'WorkspaceShare benötigt Windows PowerShell 5.1 (powershell.exe), nicht pwsh.exe.'}
 
     foreach ($module in @(
         @{ Path = $HealthModulePath; Name = 'Health-Modul' },
         @{ Path = $ProcessModulePath; Name = 'Process-Modul' },
         @{ Path = $CurlModulePath; Name = 'Curl-Modul' }
+        @{ Path = $JobModulePath; Name = 'Job-Modul' }
+        @{ Path = $PathModulePath; Name = 'Path-Modul' }
     )) { Require-File -FilePath $module.Path -FriendlyName $module.Name -Code 10 }
     Import-Module -Name $HealthModulePath -Force -ErrorAction Stop
     Import-Module -Name $ProcessModulePath -Force -ErrorAction Stop
     Import-Module -Name $CurlModulePath -Force -ErrorAction Stop
+    Import-Module -Name $JobModulePath -Force -ErrorAction Stop
+    Import-Module -Name $PathModulePath -Force -ErrorAction Stop
+    Enable-SystemAwake
 
     Write-Step 1 $totalSteps 'Abhängigkeiten und Umgebung prüfen ...'
 
@@ -1655,7 +1764,7 @@ try {
         Require-File -FilePath $required.Path -FriendlyName $required.Name -Code $required.Code
     }
 
-    if (-not $CurlPath) {
+    if (-not $script:CurlPath) {
         Stop-WithError -Code 10 -Message (
             "curl.exe wurde nicht gefunden. Moderne Windows-10/11-Versionen enthalten curl.exe."
         )
@@ -1760,6 +1869,7 @@ try {
     )
     $script:SessionDirectory = Join-Path $SessionBase $sessionId
     New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
+    Set-PrivateDirectoryAcl -Directory $script:SessionDirectory
     $script:HealthLogPath = Join-Path $script:SessionDirectory 'health.jsonl'
 
     $script:NormalExitMarker = Join-Path $script:SessionDirectory 'normal.exit'
@@ -1767,16 +1877,18 @@ try {
     $script:ArchivePath = Join-Path $script:SessionDirectory (
         "workspace-{0}.zip" -f [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
     )
+    $script:JobName='Local\WorkspaceShare.{0}' -f $sessionId
+    $script:JobHandle=New-WorkspaceJob -Name $script:JobName
+    Write-OwnerMetadata -Phase 'Preparing'
 
     Assert-FreeDiskSpace `
         -TargetDirectory $script:SessionDirectory `
         -EstimatedSourceBytes $inspection.EstimatedBytes
 
+    $gitleaksReport = Join-Path $script:SessionDirectory 'gitleaks-redacted.json'
     if (-not $UnsafeSkipSecretScan) {
-        Write-Step 3 $totalSteps 'Workspace mit Gitleaks prüfen ...'
-        $gitleaksReport = Join-Path $script:SessionDirectory 'gitleaks-redacted.json'
-        Invoke-GitleaksScan -SourceRoot $resolvedRoot -ReportPath $gitleaksReport
-        Write-Host '      Keine von Gitleaks erkannten Secrets.'
+        Write-Step 3 $totalSteps 'Finaler Archivscan wird vorbereitet ...'
+        Write-Host '      Der maßgebliche Gitleaks-Scan läuft auf dem exakt extrahierten ZIP.'
     } else {
         Write-Step 3 $totalSteps 'Gitleaks-Prüfung wurde explizit übersprungen.'
         Write-Warning (
@@ -1786,6 +1898,8 @@ try {
     }
 
     Write-Step 4 $totalSteps 'Bereinigten ZIP64-Snapshot erzeugen ...'
+
+    $sourceManifestBefore=@(Get-SourceConsistencyManifest -Root $resolvedRoot)
 
     $exclusions = New-Object System.Collections.Generic.List[string]
 
@@ -1817,6 +1931,9 @@ try {
         -ExclusionPatterns @($exclusions | Select-Object -Unique) `
         -LogPath $archiveCreateLog
 
+    $sourceManifestAfter=@(Get-SourceConsistencyManifest -Root $resolvedRoot)
+    if(Compare-Object $sourceManifestBefore $sourceManifestAfter){Stop-WithError -Code 20 -Message 'Die Quelle wurde während der Archiverstellung verändert. Der inkonsistente Snapshot wird nicht freigegeben.'}
+
     Test-SevenZipArchive `
         -ArchivePath $script:ArchivePath `
         -LogPath $archiveTestLog
@@ -1825,7 +1942,7 @@ try {
     Lock-ArchiveReadOnly -ArchivePath $script:ArchivePath
 
     if (-not $UnsafeSkipSecretScan) {
-        Test-ExactArchiveContents -ArchivePath $script:ArchivePath -VerificationRoot (Join-Path $script:SessionDirectory 'archive-verification') -GitleaksReportPath $gitleaksReport
+        Test-ExactArchiveContents -ArchivePath $script:ArchivePath -VerificationRoot (Join-Path $script:SessionDirectory 'archive-verification') -GitleaksReportPath $gitleaksReport -ExclusionPatterns @($exclusions|Select-Object -Unique)
     }
 
     Write-SevenZipManifest `
@@ -1883,8 +2000,11 @@ try {
     }
 
     if (-not $miniserveStarted) {
+        $probeSummary = if ($script:LastHttpProbe) {
+            " Letzte Probe: curl exit $($script:LastHttpProbe.CurlExit), HTTP $($script:LastHttpProbe.HttpStatus), Fehler '$($script:LastHttpProbe.ErrorText)'."
+        } else { '' }
         Stop-WithError -Code 30 -Message (
-            "miniserve konnte nach fünf Versuchen nicht zuverlässig auf Loopback starten."
+            "miniserve konnte nach fünf Versuchen nicht zuverlässig auf Loopback starten.$probeSummary"
         )
     }
 
@@ -1901,32 +2021,30 @@ try {
 
     # Read-only-Prüfung: Methoden dürfen weder Datei noch Sitzungsverzeichnis verändern.
     $hashBeforeMethodTests = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
-    $filesBeforeMethodTests = @(
-        Get-ChildItem -LiteralPath $script:SessionDirectory -File -Recurse |
-        ForEach-Object { $_.FullName.Substring($script:SessionDirectory.Length).ToLowerInvariant() } |
-        Sort-Object
-    )
+    $filesBeforeMethodTests=@(Get-SessionIntegrityMap)
+    $mutationReference = Invoke-CurlProbe -Url $localUrl -TimeoutSeconds 10 -Range '0-0' -ExpectedRangeStart 0 -ExpectedBytes 1 -MaximumBytes 1024 -AllowFullFileResponse:($archiveSize -eq 1)
+    if (-not $mutationReference.SampleValid) {
+        Stop-WithError -Code 31 -Message 'Die Referenzantwort für Read-only-Mutationstests konnte nicht bestätigt werden.'
+    }
 
     foreach ($method in @('POST', 'PUT', 'PATCH', 'DELETE', 'PROPFIND', 'MKCOL', 'MOVE', 'COPY')) {
-        $mutationArguments = @(
-            '--silent',
-            '--show-error',
-            '--stderr', 'NUL',
-            '--max-time', '10',
+        $mutationProbe = Invoke-CurlProbe -Url $localUrl -TimeoutSeconds 10 -Range '0-0' -ExpectedRangeStart 0 -ExpectedBytes 1 -MaximumBytes 1024 -AllowFullFileResponse:($archiveSize -eq 1) -ExtraArguments @(
             '--request', $method,
             '--header', 'Destination: /d/forbidden-target',
-            '--data-binary', 'WorkspaceShare mutation probe',
-            '--output', 'NUL'
+            '--data-binary', 'WorkspaceShare mutation probe'
         )
-        [void](Invoke-CurlWithPrivateUrl -Url $localUrl -Arguments $mutationArguments)
+        $explicitlyDenied = ($mutationProbe.CurlExit -eq 0 -and $mutationProbe.HttpStatus -ge 400 -and $mutationProbe.HttpStatus -lt 500)
+        $servedUnchangedByte = ($mutationProbe.SampleValid -and $mutationProbe.BodySha256 -eq $mutationReference.BodySha256)
+        $servedUnchangedArchive = ($mutationProbe.CurlExit -eq 0 -and $mutationProbe.HttpStatus -eq 200 -and $mutationProbe.ActualBodyBytes -eq $archiveSize -and $mutationProbe.BodySha256 -eq $archiveHash)
+        $contentLengthMatch = [regex]::Match($mutationProbe.Headers, '(?im)^Content-Length:\s*(\d+)\s*$')
+        $boundedStaticResponse = ($mutationProbe.CurlExit -eq 63 -and $mutationProbe.HttpStatus -eq 200 -and $contentLengthMatch.Success -and [int64]$contentLengthMatch.Groups[1].Value -eq $archiveSize -and $mutationProbe.ActualBodyBytes -le 1024)
+        if (-not ($explicitlyDenied -or $servedUnchangedByte -or $servedUnchangedArchive -or $boundedStaticResponse)) {
+            Stop-WithError -Code 31 -Message "Read-only-Mutationstest $method lieferte weder eine 4xx-Ablehnung noch den unveränderten bestätigten Dateiinhalt (curl=$($mutationProbe.CurlExit), HTTP=$($mutationProbe.HttpStatus))."
+        }
     }
 
     $hashAfterMethodTests = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
-    $filesAfterMethodTests = @(
-        Get-ChildItem -LiteralPath $script:SessionDirectory -File -Recurse |
-        ForEach-Object { $_.FullName.Substring($script:SessionDirectory.Length).ToLowerInvariant() } |
-        Sort-Object
-    )
+    $filesAfterMethodTests=@(Get-SessionIntegrityMap)
 
     if (
         $hashBeforeMethodTests -ne $hashAfterMethodTests -or
@@ -1945,10 +2063,11 @@ try {
     $cloudflaredStdOut = $null
     $cloudflaredStdErr = $null
     $originUrl = "http://127.0.0.1:{0}" -f $port
-    $expiresUtc = [DateTime]::UtcNow.AddMinutes(15)
+    $expiresUtc = $null
 
     $cloudflaredStarted = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $expiresUtc = [DateTime]::UtcNow.AddMinutes(15)
         $attemptStdOut = Join-Path $script:SessionDirectory ("cloudflared-attempt-{0}.stdout.log" -f $attempt)
         $attemptStdErr = Join-Path $script:SessionDirectory ("cloudflared-attempt-{0}.stderr.log" -f $attempt)
         $script:CloudflaredMetricsPort = Get-FreeTcpPort
@@ -1990,11 +2109,7 @@ try {
     # Watchdog aktiv sein. Ein harter Launcher-Abbruch während URL-Erkennung oder
     # öffentlicher Tests darf keinen verwaisten Tunnel hinterlassen.
     Write-SessionMetadata `
-        -ExpiresUtc $expiresUtc `
-        -SourceRoot $resolvedRoot `
-        -Archive $script:ArchivePath
-
-    Write-SessionMetadata `
+        -Phase 'SetupProtected' `
         -ExpiresUtc $expiresUtc `
         -SourceRoot $resolvedRoot `
         -Archive $script:ArchivePath `
@@ -2023,7 +2138,7 @@ try {
 
     if (-not $initialSnapshot -or $initialSnapshot.Classification -ne 'Healthy') {
         $hostName = ([Uri]$finalUrl).DnsSafeHost
-        $diagnosticArguments = @(Get-LiveDnsOverrideArguments -HostName $hostName)
+        $diagnosticArguments = @(Get-LiveDnsOverrideConfigLines -HostName $hostName)
         if ($diagnosticArguments.Count -gt 0) {
             $overrideDiagnostic = Invoke-CurlProbe -Url $finalUrl -TimeoutSeconds 10 -Range ("{0}-{1}" -f $startupSample.Start, $startupSample.End) -ExpectedRangeStart $startupSample.Start -ExpectedBytes $startupSample.Length -MaximumBytes 65536 -PrivateConfigLines $diagnosticArguments -AllowFullFileResponse:$startupSample.AllowFullFileResponse
             if ($overrideDiagnostic.Success) {
@@ -2037,6 +2152,7 @@ try {
     }
 
     foreach ($sample in $healthSamples) {
+        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $sampleSnapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort -SampleStart $sample.Start -SampleBytes $sample.Length -AllowFullFileResponse:$sample.AllowFullFileResponse
         [void](Write-HealthSnapshot -Snapshot $sampleSnapshot)
         if ($sampleSnapshot.Classification -ne 'Healthy') {
@@ -2054,9 +2170,11 @@ try {
             "Der öffentliche Range-Test (206/$publicRangeLength Bytes) ist fehlgeschlagen."
         )
     }
+    if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     $publicHeadersPath = Join-Path $script:SessionDirectory 'public-headers.txt'
     Assert-CacheHeaders -Url $finalUrl -HeaderPath $publicHeadersPath
+    if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     # Replace the temporary setup lease with the requested lifetime only after
     # every public gate has succeeded.
@@ -2066,13 +2184,13 @@ try {
     # The replacement is live before retiring the temporary setup watchdog.
     $script:WatchdogProcess = $newWatchdog
     Write-SessionMetadata `
+        -Phase 'Active' `
         -ExpiresUtc $expiresUtc `
         -SourceRoot $resolvedRoot `
         -Archive $script:ArchivePath `
         -WatchdogPid $newWatchdog.Id `
         -WatchdogStartTicks (Get-ProcessStartTicksSafe $newWatchdog)
     if ($oldWatchdog) {
-        $script:RetiredWatchdogProcesses.Add($oldWatchdog)
         $oldWatchdogStopped = Stop-ProcessConfirmed -Process $oldWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 10 -WaitMilliseconds 1000
         if (-not $oldWatchdogStopped) {
             Stop-WithError -Code 50 -Message 'Der temporäre Setup-Watchdog konnte nicht beendet werden.'
@@ -2082,8 +2200,6 @@ try {
     Write-Host '      Öffentliche HEAD-, Negativ-, Range- und Cache-Gates bestanden.'
 
     Write-Step 8 $totalSteps 'Freigabe aktivieren und Ablauf überwachen ...'
-
-    Enable-SystemAwake
 
     $linkCopied = Copy-LinkToClipboard -Url $finalUrl
 
@@ -2108,47 +2224,54 @@ try {
     Write-Host ''
 
     $lastMinuteShown = -1
-    $nextHealthCheckUtc = [DateTime]::UtcNow
-    $lastLoopUtc = [DateTime]::UtcNow
-    $unhealthySinceUtc = $null
+    $script:RuntimeTimer=[Diagnostics.Stopwatch]::StartNew()
+    $nextHealthCheckSeconds=0.0
+    $lastLoopSeconds=0.0
+    $unhealthySinceSeconds=$null
+    $observedOutageBudget=[double]::PositiveInfinity
     $lastRateLimitWarningUtc = [DateTime]::MinValue
     $healthSampleIndex = 0
 
-    while ([DateTime]::UtcNow -lt $expiresUtc) {
+    $script:StopReason='Expired'
+    while ($script:RuntimeTimer.Elapsed.TotalSeconds -lt $duration.TotalSeconds) {
         $nowUtc = [DateTime]::UtcNow
-        if ($nowUtc -ge $expiresUtc) { $script:ExitCode = 0; break }
-        $loopGapSeconds = ($nowUtc - $lastLoopUtc).TotalSeconds
-        $lastLoopUtc = $nowUtc
+        $nowSeconds=$script:RuntimeTimer.Elapsed.TotalSeconds
+        if(Test-StopRequested){$script:StopReason='ManualStop';$script:ExitCode=0;break}
+        $loopGapSeconds = $nowSeconds-$lastLoopSeconds
+        $lastLoopSeconds=$nowSeconds
         $script:MiniserveProcess.Refresh()
         $script:CloudflaredProcess.Refresh()
         $script:WatchdogProcess.Refresh()
-        $stopRequested = Test-Path -LiteralPath (Join-Path $script:SessionDirectory 'stop.requested') -PathType Leaf
-        if ($script:MiniserveProcess.HasExited) { if ([DateTime]::UtcNow -ge $expiresUtc -or $stopRequested) { $script:ExitCode = 0; break }; Stop-WithError -Code 50 -Message "miniserve wurde unerwartet beendet (Exit $($script:MiniserveProcess.ExitCode))." }
-        if ($script:CloudflaredProcess.HasExited) { if ([DateTime]::UtcNow -ge $expiresUtc -or $stopRequested) { $script:ExitCode = 0; break }; Stop-WithError -Code 50 -Message "cloudflared wurde unerwartet beendet (Exit $($script:CloudflaredProcess.ExitCode))." }
-        if ($script:WatchdogProcess.HasExited) { if ([DateTime]::UtcNow -ge $expiresUtc -or $stopRequested) { $script:ExitCode = 0; break }; Stop-WithError -Code 50 -Message 'Der Sicherheits-Watchdog wurde unerwartet beendet.' }
+        $stopRequested=Test-StopRequested
+        if ($script:MiniserveProcess.HasExited) { if ($script:RuntimeTimer.Elapsed.TotalSeconds -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "miniserve wurde unerwartet beendet (Exit $($script:MiniserveProcess.ExitCode))." }
+        if ($script:CloudflaredProcess.HasExited) { if ($script:RuntimeTimer.Elapsed.TotalSeconds -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "cloudflared wurde unerwartet beendet (Exit $($script:CloudflaredProcess.ExitCode))." }
+        if ($script:WatchdogProcess.HasExited) { if ($script:RuntimeTimer.Elapsed.TotalSeconds -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message 'Der Sicherheits-Watchdog wurde unerwartet beendet.' }
 
         if ($loopGapSeconds -gt [Math]::Max(30, $HealthCheckSeconds * 3)) {
             Write-Warning ("Die Überwachung war {0:N0} Sekunden unterbrochen. Möglicher Standby-/Netzwerkwechsel; vollständige Prüfung läuft sofort." -f $loopGapSeconds)
-            $nextHealthCheckUtc = [DateTime]::UtcNow
+            $nextHealthCheckSeconds=$nowSeconds
         }
-        if ([DateTime]::UtcNow -ge $nextHealthCheckUtc) {
-            if (($expiresUtc - [DateTime]::UtcNow).TotalSeconds -le 2) { Start-Sleep -Milliseconds 250; continue }
+        if ($script:RuntimeTimer.Elapsed.TotalSeconds -ge $nextHealthCheckSeconds) {
+            if (($duration.TotalSeconds-$script:RuntimeTimer.Elapsed.TotalSeconds) -le 2) { Start-Sleep -Milliseconds 250; continue }
             $sample = $healthSamples[$healthSampleIndex % $healthSamples.Count]
             $healthSampleIndex++
             $snapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort -SampleStart $sample.Start -SampleBytes $sample.Length -AllowFullFileResponse:$sample.AllowFullFileResponse
             [void](Write-HealthSnapshot -Snapshot $snapshot)
-            if ([DateTime]::UtcNow -ge $expiresUtc) { $script:ExitCode = 0; break }
+            if(Test-StopRequested){$script:StopReason='ManualStop';$script:ExitCode=0;break}
+            if ($script:RuntimeTimer.Elapsed.TotalSeconds -ge $duration.TotalSeconds) { $script:ExitCode = 0; break }
             if ($snapshot.Classification -eq 'Healthy') {
-                if ($unhealthySinceUtc) {
-                    $outageSeconds = ([DateTime]::UtcNow - $unhealthySinceUtc).TotalSeconds
+                if ($null -ne $unhealthySinceSeconds) {
+                    $outageSeconds = $script:RuntimeTimer.Elapsed.TotalSeconds-$unhealthySinceSeconds
                     Write-Host ("      Tunnel wieder gesund nach etwa {0:N0} Sekunden." -f $outageSeconds) -ForegroundColor Green
                 }
-                $unhealthySinceUtc = $null
+                $unhealthySinceSeconds = $null;$observedOutageBudget=[double]::PositiveInfinity
             }
             else {
-                if (-not $unhealthySinceUtc) { $unhealthySinceUtc = [DateTime]::Parse($snapshot.StartedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
-                $unhealthySeconds = ([DateTime]::UtcNow - $unhealthySinceUtc).TotalSeconds
-                $allowedSeconds = Get-AllowedOutageSeconds -Classification $snapshot.Classification -RetryAfterSeconds $snapshot.RetryAfterSeconds
+                if ($null -eq $unhealthySinceSeconds) { $unhealthySinceSeconds=$script:RuntimeTimer.Elapsed.TotalSeconds }
+                $unhealthySeconds = $script:RuntimeTimer.Elapsed.TotalSeconds-$unhealthySinceSeconds
+                $currentBudget=Get-AllowedOutageSeconds -Classification $snapshot.Classification -RetryAfterSeconds $snapshot.RetryAfterSeconds
+                $observedOutageBudget=[Math]::Min($observedOutageBudget,$currentBudget)
+                $allowedSeconds=[Math]::Min(180,$observedOutageBudget)
                 if ($snapshot.Classification -eq 'RateLimited') {
                     if (([DateTime]::UtcNow - $lastRateLimitWarningUtc).TotalSeconds -ge 60) {
                         Write-Warning ("Quick Tunnel meldet Rate-Limiting. Ungesund seit {0:N0}/{1}s; HTTP={2}, Retry-After={3}s." -f $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.RetryAfterSeconds)
@@ -2162,10 +2285,11 @@ try {
                     Stop-WithError -Code 50 -Message ("Der öffentliche Quick Tunnel blieb {0:N0} Sekunden ungesund.`nAktuelle Fehlerklasse: {1}." -f $unhealthySeconds, $snapshot.Classification)
                 }
             }
-            $nextHealthCheckUtc = [DateTime]::UtcNow.AddSeconds($HealthCheckSeconds)
+            $nextHealthCheckSeconds+=$HealthCheckSeconds
+            if($nextHealthCheckSeconds -lt $script:RuntimeTimer.Elapsed.TotalSeconds){$nextHealthCheckSeconds=$script:RuntimeTimer.Elapsed.TotalSeconds}
         }
 
-        $remaining = $expiresUtc - [DateTime]::UtcNow
+        $remaining = [TimeSpan]::FromSeconds([Math]::Max(0,$duration.TotalSeconds-$script:RuntimeTimer.Elapsed.TotalSeconds))
         $wholeMinutes = [Math]::Max(0, [Math]::Ceiling($remaining.TotalMinutes))
         if ($wholeMinutes -ne $lastMinuteShown) {
             Write-Host ("      Verbleibend: ca. {0} Minute(n); letzte Tunnelprüfung wird alle {1}s ausgeführt." -f $wholeMinutes, $HealthCheckSeconds)
@@ -2175,7 +2299,7 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'Die festgelegte Freigabezeit ist abgelaufen.'
+    if($script:StopReason -eq 'ManualStop'){Write-Host 'Die Freigabe wurde auf Benutzerwunsch beendet.'}else{Write-Host 'Die festgelegte Freigabezeit ist abgelaufen.'}
     $script:ExitCode = 0
 }
 catch {
@@ -2190,7 +2314,7 @@ catch {
         try {
             if ($script:CloudflaredMetricsPort -gt 0) {
                 $volatileDiagnosticPath = Join-Path $script:SessionDirectory 'volatile-cloudflared-ready.txt'
-                & $CurlPath @('--silent', '--show-error', '--max-time', '2', '--output', $volatileDiagnosticPath, ("http://127.0.0.1:{0}/ready" -f $script:CloudflaredMetricsPort)) 2>$null
+                & $script:CurlPath @('--silent', '--show-error', '--max-time', '2', '--output', $volatileDiagnosticPath, ("http://127.0.0.1:{0}/ready" -f $script:CloudflaredMetricsPort)) 2>$null
             }
         }
         catch {}
@@ -2199,39 +2323,41 @@ catch {
     [Console]::Error.WriteLine($message)
 }
 finally {
+    if ($script:ExitCode -ne 0 -and $script:SessionDirectory) { Save-FailureDiagnostics -SessionId $sessionId -CloudflaredStdOut $cloudflaredStdOut -CloudflaredStdErr $cloudflaredStdErr }
     # Öffentliches Ende zuerst. Der Watchdog bleibt bis zur bestätigten Beendigung aktiv.
     $cloudflaredStopped = Stop-ProcessConfirmed -Process $script:CloudflaredProcess -ExpectedPath $CloudflaredPath -Attempts 5 -WaitMilliseconds 1500
     Start-Sleep -Milliseconds 300
     $miniserveStopped = Stop-ProcessConfirmed -Process $script:MiniserveProcess -ExpectedPath $MiniservePath -Attempts 5 -WaitMilliseconds 1500
     $childrenStopped = ($cloudflaredStopped -and $miniserveStopped)
-    if ($script:ArchiveLockStream) { try { $script:ArchiveLockStream.Dispose() } catch {}; $script:ArchiveLockStream = $null }
+    if ($miniserveStopped -and $script:ArchiveLockStream) { try { $script:ArchiveLockStream.Dispose() } catch {$script:ExitCode=50}; $script:ArchiveLockStream = $null }
+    elseif(-not $miniserveStopped -and $script:ArchiveLockStream){$script:ExitCode=50;Write-Warning 'Die Archivsperre bleibt aktiv, weil miniserve nicht bestätigt beendet wurde.'}
 
+    $allWatchdogsStopped=$false
     if (-not $childrenStopped) {
         $script:ExitCode = 50
         Write-Warning 'Mindestens ein Kindprozess konnte nicht bestätigt beendet werden. Watchdog und Sitzungsmetadaten bleiben erhalten.'
     }
     else {
-        if ($script:ExitCode -ne 0 -and $script:SessionDirectory) {
-            Save-FailureDiagnostics -SessionId $sessionId -CloudflaredStdOut $cloudflaredStdOut -CloudflaredStdErr $cloudflaredStdErr -MetricsPort 0
-        }
         if ($script:NormalExitMarker -and $script:SessionDirectory) {
             try { New-Item -ItemType File -Path $script:NormalExitMarker -Force | Out-Null } catch {}
         }
-        [void](Stop-ProcessConfirmed -Process $script:WatchdogProcess -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 3 -WaitMilliseconds 1000)
+        $allWatchdogsStopped=$true
+        if(-not(Stop-ProcessConfirmed -Process $script:WatchdogProcess -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
         foreach ($retiredWatchdog in $script:RetiredWatchdogProcesses) {
-            [void](Stop-ProcessConfirmed -Process $retiredWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 3 -WaitMilliseconds 1000)
+            if(-not(Stop-ProcessConfirmed -Process $retiredWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
         }
     }
+    $cleanupComplete=($childrenStopped -and $allWatchdogsStopped)
+    if(-not $cleanupComplete){$script:ExitCode=50}
     Disable-SystemAwake
     Clear-SensitiveClipboard
 
-    if ($childrenStopped -and $script:SessionDirectory -and (Test-Path -LiteralPath $script:SessionDirectory)) {
-        if ($KeepArchive) {
+    if ($cleanupComplete -and $script:SessionDirectory -and (Test-Path -LiteralPath $script:SessionDirectory)) {
+        if (Test-EffectiveKeepArchive) {
             try {
-                New-Item -ItemType File -Path $script:KeepArchiveMarker -Force | Out-Null
+                New-Item -ItemType File -Path $script:KeepArchiveMarker -Force -ErrorAction Stop | Out-Null
             }
-            catch {
-            }
+            catch {$script:ExitCode=50;Write-Warning 'Der Aufbewahrungsmarker konnte nicht bestätigt geschrieben werden; die Sitzung bleibt vorsichtshalber erhalten.'}
 
             Write-Warning (
                 "Der lokale Sitzungsordner bleibt wegen -KeepArchive bestehen:`n" +
@@ -2251,15 +2377,16 @@ finally {
         }
     }
 
-    if (-not $childrenStopped -and $script:SessionDirectory) {
+    if (-not $cleanupComplete -and $script:SessionDirectory) {
         Write-Warning ("Sitzungsordner für die Watchdog-Bereinigung erhalten:`n" + $script:SessionDirectory)
     }
 
     Write-Host ''
     if ($childrenStopped) { Write-Host 'Tunnel und lokaler Server wurden beendet.' }
-    if ($childrenStopped -and -not $KeepArchive -and -not (Test-Path -LiteralPath $script:SessionDirectory)) {
+    if ($cleanupComplete -and -not (Test-EffectiveKeepArchive) -and -not (Test-Path -LiteralPath $script:SessionDirectory)) {
         Write-Host 'Der temporäre Snapshot wurde gelöscht.'
     }
+    if($cleanupComplete -and $script:JobHandle -ne [IntPtr]::Zero){try{Close-WorkspaceJob -Job $script:JobHandle}catch{$script:ExitCode=50};$script:JobHandle=[IntPtr]::Zero}
 }
 
 exit $script:ExitCode

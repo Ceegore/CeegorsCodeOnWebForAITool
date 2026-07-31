@@ -4,13 +4,14 @@ param([Parameter(Mandatory = $true)][string]$Hostname)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if($Hostname -notmatch '^[a-z0-9-]+\.trycloudflare\.com$'){[Console]::Error.WriteLine('Expected one exact trycloudflare.com hostname.');exit 2}
 
 function Resolve-Addresses {
     param([Parameter(Mandatory = $true)][string]$Name, [string]$Server)
     $addresses = @()
     foreach ($type in @('A', 'AAAA')) {
         try {
-            $parameters = @{ Name = $Name; Type = $type; DnsOnly = $true; ErrorAction = 'Stop' }
+            $parameters = @{ Name = $Name; Type = $type; DnsOnly = $true; QuickTimeout=$true; ErrorAction = 'Stop' }
             if ($Server) { $parameters.Server = $Server }
             $addresses += @(Resolve-DnsName @parameters | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
         }

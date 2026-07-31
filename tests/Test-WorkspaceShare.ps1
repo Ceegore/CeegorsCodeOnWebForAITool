@@ -34,11 +34,15 @@ $miniserve = Join-Path $bin 'miniserve.exe'
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $shareScript = Join-Path $ToolRoot 'Share-Workspace.ps1'
 $healthModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Health.psm1'
+$curlModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Curl.psm1'
 $curl = (Get-Command 'curl.exe' -ErrorAction Stop).Source
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Test-' + [Guid]::NewGuid().ToString('N'))
 $server = $null
 $failed = 0
 $passed = 0
+Import-Module $curlModule -Force -ErrorAction Stop
+
+function Invoke-TestCurl { param([string]$Url,[string[]]$Arguments);$result=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url $Url -Arguments $Arguments -ProcessTimeoutSeconds 90;$global:LASTEXITCODE=$result.ExitCode;return $result.StdOut }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -123,9 +127,7 @@ function Curl-Status {
         '--max-time','15'
     )
     $arguments += $Extra
-    $arguments += $Url
-
-    $output = & $curl @arguments 2>$null
+    $output = Invoke-TestCurl -Url $Url -Arguments $arguments
     if ($LASTEXITCODE -ne 0 -and -not $output) {
         return 0
     }
@@ -236,7 +238,7 @@ try {
     Assert-True ($shareText -match 'KeepDiagnosticsOnError') 'Sichere Fehlerdiagnosen können erhalten werden'
     Assert-True ($shareText -match 'https://<redacted>\.trycloudflare\.com') 'Diagnoselogs schwärzen die Tunnel-URL'
     Assert-True ($shareText -notmatch 'DnsOverrideCache') 'Permanenter DNS-IP-Cache wurde entfernt'
-    Assert-True ($shareText -match 'Get-LiveDnsOverrideArguments') 'DNS-Override existiert nur als frische Diagnosehilfe'
+    Assert-True ($shareText -match 'Get-LiveDnsOverrideConfigLines') 'DNS-Override existiert nur als private frische Diagnosehilfe'
     Assert-True ($shareText -notmatch 'Get-CurlStatusViaCloudflareDns') 'Veralteter DNS-Fallback wurde entfernt'
     Assert-True ($shareText -notmatch 'Get-CloudflareDnsOverrideArguments') 'Veraltete DNS-Override-Hilfe wurde entfernt'
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
@@ -258,10 +260,12 @@ try {
         $samplePlan = @(Get-HealthSamplePlan -ArchiveSize 1048576)
         Assert-True ($samplePlan.Count -eq 3 -and $samplePlan[0].Start -eq 0 -and $samplePlan[2].End -eq 1048575) 'Health-Sample-Plan deckt Anfang, Mitte und Ende ab'
         Assert-True (@(Get-HealthSamplePlan -ArchiveSize 1).Count -eq 1) 'Kleine Archive erhalten genau einen Vollfile-Sample'
-        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $true -HostnameAvailable $true -HostnameMatches $false -PublicHttpStatus 206 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $false -PublicSampleValid $true
+        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $true -HostnameAvailable $true -HostnameMatches $false -PublicHttpStatus 206 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $false
         Assert-True ($classification -eq 'Healthy') 'End-to-End-Hash schlägt abweichende Hilfssignale'
-        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $false -HostnameAvailable $true -HostnameMatches $true -PublicHttpStatus 429 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $true -PublicSampleValid $false
+        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $false -HostnameAvailable $true -HostnameMatches $true -PublicHttpStatus 429 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 3 -Ready $true
         Assert-True ($classification -eq 'RateLimited') 'Rate-Limit wird nicht als Hostname-Wechsel klassifiziert'
+        $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $false -HostnameAvailable $true -HostnameMatches $true -PublicHttpStatus 500 -CloudflareError 0 -PublicCurlExit 0 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 0 -DnsChecked $true -SystemDnsSuccess $false -Ready $true
+        Assert-True ($classification -ne 'DnsMissing') 'HTTP-Fehler ohne curl-Resolverfehler wird nicht als DnsMissing klassifiziert'
         $diagnosticToken = New-Token
         $diagnosticUrl = "https://unit-test.trycloudflare.com/d/$diagnosticToken/"
         $sanitized = Protect-DiagnosticText -Text ("curl failed: $diagnosticUrl Location: /d/$diagnosticToken/") -KnownSecretUrls @($diagnosticUrl)
@@ -308,6 +312,9 @@ try {
     [void]$server.Start()
 
     Assert-True (Wait-Ready $localUrl) 'Geheimroute liefert lokal HTTP 200'
+    $resolveLine='resolve = "fake.example:{0}:127.0.0.1"' -f $port
+    $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output','NUL') -PrivateConfigLines @($resolveLine)
+    Assert-True ($resolvedResult.ExitCode -eq 0 -and $resolveLine -notmatch '\\"') 'Private resolve-Konfiguration ist syntaktisch gültig und bleibt aus argv'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/" -Extra @('--head')) -ne 200) 'Root ohne Token liefert nicht 200'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/d/$(New-Token)/" -Extra @('--head')) -ne 200) 'Falsches Token liefert nicht 200'
 
@@ -331,45 +338,41 @@ try {
     }
 
     $rangeFile = Join-Path $temp 'range.bin'
-    $rangeStatus = & $curl @(
+    $rangeStatus = Invoke-TestCurl -Url $localUrl -Arguments @(
         '--silent','--show-error',
         '--header','Range: bytes=0-1023',
         '--output',$rangeFile,
-        '--write-out','%{http_code}',
-        $localUrl
-    ) 2>$null
+        '--write-out','%{http_code}'
+    )
 
     Assert-True (((($rangeStatus | Select-Object -Last 1) | Out-String).Trim()) -eq '206') 'Range liefert HTTP 206'
     Assert-True ((Get-Item -LiteralPath $rangeFile).Length -eq 1024) 'Range liefert exakt 1024 Bytes'
 
     $resume = Join-Path $temp 'resume.zip'
-    & $curl @(
+    [void](Invoke-TestCurl -Url $localUrl -Arguments @(
         '--silent','--show-error',
         '--header','Range: bytes=0-1048575',
-        '--output',$resume,
-        $localUrl
-    ) | Out-Null
+        '--output',$resume
+    ))
     Assert-True ($LASTEXITCODE -eq 0) 'Erster Teil des Resume-Downloads erfolgreich'
 
-    & $curl @(
+    [void](Invoke-TestCurl -Url $localUrl -Arguments @(
         '--silent','--show-error',
         '--continue-at','-',
-        '--output',$resume,
-        $localUrl
-    ) | Out-Null
+        '--output',$resume
+    ))
     Assert-True ($LASTEXITCODE -eq 0) 'Resume-Aufruf erfolgreich'
     Assert-True ((Get-FileHash -LiteralPath $resume -Algorithm SHA256).Hash -eq $originalHash) 'Fortgesetzter Download besitzt korrekten Hash'
 
     $beforeFiles = Get-RelativeFiles $temp
     foreach ($method in @('POST','PUT','PATCH','DELETE','PROPFIND','MKCOL','MOVE','COPY')) {
-        & $curl @(
+        [void](Invoke-TestCurl -Url $localUrl -Arguments @(
             '--silent','--show-error',
             '--request',$method,
             '--header','Destination: /d/forbidden-target',
             '--data-binary','mutation-test',
-            '--output','NUL',
-            $localUrl
-        ) 2>$null | Out-Null
+            '--output','NUL'
+        ))
     }
     $afterFiles = Get-RelativeFiles $temp
 
@@ -377,7 +380,7 @@ try {
     Assert-True (-not (Compare-Object $beforeFiles $afterFiles)) 'Mutation-Probes erzeugen keine zusätzlichen Dateien'
 
     $headers = Join-Path $temp 'local-headers.txt'
-    & $curl @('--silent','--head','--dump-header',$headers,'--output','NUL',$localUrl) | Out-Null
+    [void](Invoke-TestCurl -Url $localUrl -Arguments @('--silent','--head','--dump-header',$headers,'--output','NUL'))
     $headerText = Get-Content -LiteralPath $headers -Raw
     Assert-True ($headerText -match '(?im)^cache-control:.*no-store') 'Lokales Cache-Control enthält no-store'
 
@@ -398,19 +401,18 @@ try {
         Assert-True ((Curl-Status -Url $publicWrong -Extra @('--head')) -ne 200) 'Öffentliches falsches Token liefert nicht 200'
 
         $publicRange = Join-Path $temp 'public-range.bin'
-        $publicStatus = & $curl @(
+        $publicStatus = Invoke-TestCurl -Url $PublicUrl -Arguments @(
             '--silent','--show-error',
             '--header','Range: bytes=0-1023',
             '--output',$publicRange,
-            '--write-out','%{http_code}',
-            $PublicUrl
-        ) 2>$null
+            '--write-out','%{http_code}'
+        )
 
         Assert-True (((($publicStatus | Select-Object -Last 1) | Out-String).Trim()) -eq '206') 'Öffentliche Range liefert 206'
         Assert-True ((Get-Item -LiteralPath $publicRange).Length -eq 1024) 'Öffentliche Range liefert 1024 Bytes'
 
         $publicHeaders = Join-Path $temp 'public-headers.txt'
-        & $curl @('--silent','--head','--dump-header',$publicHeaders,'--output','NUL',$PublicUrl) | Out-Null
+        [void](Invoke-TestCurl -Url $PublicUrl -Arguments @('--silent','--head','--dump-header',$publicHeaders,'--output','NUL'))
         $publicHeaderText = Get-Content -LiteralPath $publicHeaders -Raw
         Assert-True ($publicHeaderText -match '(?im)^cache-control:.*no-store') 'Öffentliches Cache-Control enthält no-store'
         Assert-True ($publicHeaderText -notmatch '(?im)^cf-cache-status:\s*HIT\s*$') 'Cloudflare meldet keinen Cache-HIT'

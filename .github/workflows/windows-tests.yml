@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 20
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,9 +26,11 @@ jobs:
           if ($failed) { exit 1 }
       - name: Install dependencies
         shell: powershell
+        timeout-minutes: 10
         run: .\Install-Dependencies.ps1 -Force
       - name: Run acceptance tests
         shell: powershell
+        timeout-minutes: 10
         run: |
           .\tests\Test-WorkspaceShare.ps1
           .\tests\Test-LifecycleHardening.ps1

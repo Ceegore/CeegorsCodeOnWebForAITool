@@ -33,12 +33,23 @@ if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
 }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {
+    throw 'WorkspaceShare dependencies support only 64-bit Windows/x64 PowerShell.'
+}
+
+$installMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
+$installMutexHeld = $false
+try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) } catch { throw 'The dependency-install mutex could not be acquired.' }
+if (-not $installMutexHeld) { throw 'Another dependency installation or release build is active.' }
 
 $bin = Join-Path $ToolRoot 'bin'
-$licenses = Join-Path $bin 'licenses'
+$installId=[Guid]::NewGuid().ToString('N')
+$stage = Join-Path $ToolRoot ('.bin-stage-' + $installId)
+$backup = Join-Path $ToolRoot ('.bin-backup-' + $installId)
+$licenses = Join-Path $stage 'licenses'
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Dependencies-' + [Guid]::NewGuid().ToString('N'))
-$stage = Join-Path $temp 'stage'
 
 $assets = @(
     # 2026.7.2 ist bewusst gepinnt: 2026.7.3 verlor im Langzeittest den
@@ -52,6 +63,7 @@ $assets = @(
         output = 'cloudflared.exe'
         license = 'Apache-2.0'
         licenseUrl = 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.7.2/LICENSE'
+        licenseSha256 = '58D1E17FFE5109A7AE296CAAFCADFDBE6A7D176F0BC4AB01E12A689B0499D8BD'
         source = 'https://github.com/cloudflare/cloudflared/releases/tag/2026.7.2'
     },
     [ordered]@{
@@ -63,6 +75,7 @@ $assets = @(
         output = 'miniserve.exe'
         license = 'MIT'
         licenseUrl = 'https://raw.githubusercontent.com/svenstaro/miniserve/v0.35.0/LICENSE'
+        licenseSha256 = 'BEDB87F0760796C7BE677651EB10AD949410E90C55BC7F607D848E8E9D65375A'
         source = 'https://github.com/svenstaro/miniserve/releases/tag/v0.35.0'
     },
     [ordered]@{
@@ -75,6 +88,7 @@ $assets = @(
         output = 'gitleaks.exe'
         license = 'MIT'
         licenseUrl = 'https://raw.githubusercontent.com/gitleaks/gitleaks/v8.30.1/LICENSE'
+        licenseSha256 = 'E3884B252B3BFC045E55BE43A34D1E80DA070BC6F804AC95BF4660E97D62EBC6'
         source = 'https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1'
     },
     [ordered]@{
@@ -86,6 +100,7 @@ $assets = @(
         output = '7za.exe'
         license = 'LGPL-2.1-or-later plus bundled notices/exceptions'
         licenseUrl = ''
+        licenseSha256 = '39D2187B942CC88818DD959E53C6B7DDDD152097A42061467C4D56050168D646'
         source = 'https://github.com/ip7z/7zip/releases/tag/26.02'
     }
 )
@@ -126,14 +141,29 @@ function Download-File {
     $directory = Split-Path -Path $Destination -Parent
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 
-    $client = New-Object System.Net.WebClient
-    $client.Headers['User-Agent'] = 'WorkspaceShare-DependencyInstaller/3.1'
-    try {
-        $client.DownloadFile($Url, $Destination)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $client = New-Object Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromMinutes(2)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd('WorkspaceShare-DependencyInstaller/3.1')
+        try {
+            $response = $client.GetAsync($Url, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $response.EnsureSuccessStatusCode() | Out-Null
+            $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $file = New-Object IO.FileStream($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { [void]$stream.CopyToAsync($file).GetAwaiter().GetResult() } finally { $file.Dispose(); $stream.Dispose(); $response.Dispose() }
+            $lastError = $null
+            break
+        }
+        catch {
+            $lastError = $_.Exception
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            if ($attempt -lt 3) { Start-Sleep -Seconds ([Math]::Pow(2, $attempt)) }
+        }
+        finally { $client.Dispose() }
     }
-    finally {
-        $client.Dispose()
-    }
+
+    if ($lastError) { throw "Download failed after three bounded attempts: $($lastError.Message)" }
 
     if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
         throw "Download wurde nicht erstellt: $Destination"
@@ -164,8 +194,9 @@ function Find-SevenZip {
 }
 
 function Ensure-SevenZipExtractor {
+    $expectedHash = '83967F1B02B43C4EFEDA302795722C809E0E81B8307DE73558D10484D5676A7D'
     $sevenZip = Find-SevenZip
-    if ($sevenZip) {
+    if ($sevenZip -and (Get-Sha256 $sevenZip) -eq $expectedHash) {
         return $sevenZip
     }
 
@@ -191,7 +222,7 @@ function Ensure-SevenZipExtractor {
     }
 
     $sevenZip = Find-SevenZip
-    if (-not $sevenZip) {
+    if (-not $sevenZip -or (Get-Sha256 $sevenZip) -ne $expectedHash) {
         throw '7-Zip wurde angefordert, aber 7z.exe konnte anschließend nicht gefunden werden.'
     }
 
@@ -230,6 +261,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $temp -Force | Out-Null
+    if(Test-Path -LiteralPath $stage){throw "Unerwartetes Staging-Verzeichnis vorhanden: $stage"}
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
 
@@ -315,6 +347,7 @@ try {
             $licensePath = Join-Path $licenses ($asset.name.Replace(' ','-') + '-LICENSE.txt')
             try {
                 Download-File -Url $asset.licenseUrl -Destination $licensePath
+                Assert-Hash -Path $licensePath -Expected $asset.licenseSha256 -Name ("$($asset.name) license")
             }
             catch {
                 throw "Lizenztext für $($asset.name) konnte nicht geladen werden: $($_.Exception.Message)"
@@ -336,20 +369,20 @@ sowie THIRD_PARTY_NOTICES.md. Vor interner Weitergabe muss das vollständige
 Original-Lizenzpaket mitgeführt werden.
 '@ | Set-Content -LiteralPath (Join-Path $licenses '7-Zip-LICENSE.txt') -Encoding UTF8
     }
+    Assert-Hash -Path (Join-Path $licenses '7-Zip-LICENSE.txt') -Expected (($assets | Where-Object name -eq '7-Zip').licenseSha256) -Name '7-Zip license'
 
     Write-Phase 5 5 'Binärdateien atomar übernehmen und Lockfile erzeugen ...'
 
-    New-Item -ItemType Directory -Path $bin -Force | Out-Null
-    foreach ($file in @('cloudflared.exe','miniserve.exe','gitleaks.exe','7za.exe')) {
-        $source = Join-Path $stage $file
-        $destination = Join-Path $bin $file
-        Copy-Item -LiteralPath $source -Destination $destination -Force
-    }
+    if(Test-Path -LiteralPath (Join-Path $bin 'README.md') -PathType Leaf){Copy-Item -LiteralPath (Join-Path $bin 'README.md') -Destination (Join-Path $stage 'README.md') -Force}
+    $allowedStageFiles = @('cloudflared.exe','miniserve.exe','gitleaks.exe','7za.exe','README.md','licenses\cloudflared-LICENSE.txt','licenses\miniserve-LICENSE.txt','licenses\Gitleaks-LICENSE.txt','licenses\7-Zip-LICENSE.txt')
+    $actualStageFiles = @(Get-ChildItem -LiteralPath $stage -File -Recurse | ForEach-Object { $_.FullName.Substring($stage.Length).TrimStart('\') } | Sort-Object)
+    $stageDifference = @(Compare-Object ($allowedStageFiles | Sort-Object) $actualStageFiles)
+    if ($stageDifference.Count -gt 0) { throw ('Staged dependency files do not match the exact allowlist: ' + (($stageDifference | ForEach-Object InputObject) -join ', ')) }
 
     $lockDependencies = @()
     foreach ($asset in $assets) {
         $fileName = [string]$asset.output
-        $installedPath = Join-Path $bin $fileName
+        $installedPath = Join-Path $stage $fileName
         $lockDependencies += [ordered]@{
             name = [string]$asset.name
             file = ('bin/' + $fileName)
@@ -370,7 +403,17 @@ Original-Lizenzpaket mitgeführt werden.
         dependencies = $lockDependencies
     }
 
-    $lock | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $lockPath -Encoding UTF8
+    $lockTemporary=Join-Path $ToolRoot ('.dependencies.lock.'+$installId+'.tmp')
+    $lock|ConvertTo-Json -Depth 6|Set-Content -LiteralPath $lockTemporary -Encoding UTF8 -ErrorAction Stop
+    try{
+        if(Test-Path -LiteralPath $bin){Move-Item -LiteralPath $bin -Destination $backup -ErrorAction Stop}
+        Move-Item -LiteralPath $stage -Destination $bin -ErrorAction Stop
+        if(Test-Path -LiteralPath $lockPath -PathType Leaf){$lockBackup=$lockPath+'.previous';[IO.File]::Replace($lockTemporary,$lockPath,$lockBackup);Remove-Item -LiteralPath $lockBackup -Force -ErrorAction SilentlyContinue}else{[IO.File]::Move($lockTemporary,$lockPath)}
+        if(Test-Path -LiteralPath $backup){Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop}
+    }catch{
+        if((Test-Path -LiteralPath $bin) -and (Test-Path -LiteralPath $backup)){Remove-Item -LiteralPath $bin -Recurse -Force -ErrorAction SilentlyContinue;Move-Item -LiteralPath $backup -Destination $bin -ErrorAction SilentlyContinue}
+        throw
+    }finally{Remove-Item -LiteralPath $lockTemporary -Force -ErrorAction SilentlyContinue}
 
     Write-Host ''
     Write-Host 'Abhängigkeiten wurden erfolgreich installiert und gesperrt.'
@@ -382,4 +425,7 @@ Original-Lizenzpaket mitgeführt werden.
 }
 finally {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if ($installMutexHeld) { try { $installMutex.ReleaseMutex() } catch {} }
+    $installMutex.Dispose()
 }

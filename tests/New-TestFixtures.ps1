@@ -17,16 +17,25 @@
 [CmdletBinding()]
 param(
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'WorkspaceShare-Fixtures'),
-    [switch]$IncludeLargeFiles
+    [switch]$IncludeLargeFiles,
+    [switch]$ForceReset
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (Test-Path -LiteralPath $OutputRoot) {
-    Remove-Item -LiteralPath $OutputRoot -Recurse -Force
+$resolvedOutput=[IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
+$safeBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
+if(-not $resolvedOutput.StartsWith($safeBase,[StringComparison]::OrdinalIgnoreCase)){throw 'Fixture output must be below the system temporary directory.'}
+if($resolvedOutput -eq $safeBase.TrimEnd('\') -or $resolvedOutput -eq [IO.Path]::GetPathRoot($resolvedOutput).TrimEnd('\')){throw 'Refusing unsafe fixture root.'}
+if (Test-Path -LiteralPath $resolvedOutput) {
+    $marker=Join-Path $resolvedOutput '.workspace-share-fixtures-root'
+    if(-not $ForceReset -or -not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Existing fixture root may be deleted only with -ForceReset and its safety marker.'}
+    Remove-Item -LiteralPath $resolvedOutput -Recurse -Force
 }
-New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
+$OutputRoot=$resolvedOutput
+New-Item -ItemType File -Path (Join-Path $OutputRoot '.workspace-share-fixtures-root') -Force|Out-Null
 
 function New-Fixture {
     param([string]$Name)
