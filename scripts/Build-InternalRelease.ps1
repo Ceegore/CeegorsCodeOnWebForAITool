@@ -111,10 +111,14 @@ try {
     }
 
     Write-Host '[1/5] Automatisierte Tests ausführen ...'
-    $testResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$testScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0)
+    $testResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$testScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
     if($testResult.StdOut){Write-Host $testResult.StdOut}
-    $lifecycleResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$lifecycleTestScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0)
+    if($testResult.StdErr){Write-Warning $testResult.StdErr}
+    if($testResult.ExitCode -ne 0){throw "Acceptance tests failed with exit $($testResult.ExitCode)."}
+    $lifecycleResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$lifecycleTestScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
     if($lifecycleResult.StdOut){Write-Host $lifecycleResult.StdOut}
+    if($lifecycleResult.StdErr){Write-Warning $lifecycleResult.StdErr}
+    if($lifecycleResult.ExitCode -ne 0){throw "Lifecycle tests failed with exit $($lifecycleResult.ExitCode)."}
     $dependencyLease=Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Exclusive -TimeoutSeconds 30
 
     Write-Host '[2/5] Release-Inhalt statisch prüfen ...'

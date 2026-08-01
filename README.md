@@ -25,7 +25,7 @@ Der vollständige Link ist ein Bearer-Secret. Jeder Besitzer kann die Datei heru
 - Windows PowerShell 5.1
 - `curl.exe`
 - ausgehender Internetzugriff für GitHub-Downloads und Cloudflare Tunnel
-- WinGet oder eine vorhandene `7z.exe` für den einmaligen Dependency-Bootstrap
+- Netzwerkzugriff auf die gepinnten offiziellen Release-Assets; falls keine exakt passende `7z.exe` vorhanden ist, wird der SHA-256-geprüfte eigenständige `7zr.exe`-Bootstrapper verwendet
 - ausreichend freier lokaler Speicher für den Snapshot
 
 Keine Domain, kein Cloudflare-Konto, keine Portweiterleitung und keine eingehende Firewallregel sind erforderlich.

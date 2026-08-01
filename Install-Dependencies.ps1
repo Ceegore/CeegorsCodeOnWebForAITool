@@ -8,8 +8,9 @@
     SHA-256-Werte vor dem Entpacken und erzeugt anschließend ein Lockfile mit
     den SHA-256-Werten der tatsächlich ausgeführten EXE-Dateien.
 
-    Für das Entpacken des offiziellen 7-Zip-Extra-Pakets wird eine vorhandene
-    7z.exe verwendet. Fehlt sie, installiert das Skript 7-Zip 26.02 über WinGet.
+    Für das Entpacken des offiziellen 7-Zip-Extra-Pakets wird eine vorhandene,
+    exakt gepinnte 7z.exe verwendet. Andernfalls lädt das Skript den offiziellen,
+    eigenständigen 7zr.exe-Bootstrapper und prüft auch dessen SHA-256-Wert.
 
 .EXAMPLE
     .\Install-Dependencies.ps1
@@ -22,6 +23,7 @@
 param(
     [switch]$Force,
     [string]$ToolRoot,
+    [switch]$TestForceStandaloneSevenZip,
     [ValidateSet('','OldBinMoved','NewBinInstalled','LockReplaced','Reverified','Committed','BackupCleanup')]
     [string]$TestFailAfter = ''
 )
@@ -208,29 +210,22 @@ function Find-SevenZip {
 }
 
 function Ensure-SevenZipExtractor {
+    param([switch]$ForceStandalone)
+
     $expectedHash = '83967F1B02B43C4EFEDA302795722C809E0E81B8307DE73558D10484D5676A7D'
     $sevenZip = Find-SevenZip
-    if ($sevenZip -and (Get-Sha256 $sevenZip) -eq $expectedHash) {
+    if (-not $ForceStandalone -and $sevenZip -and (Get-Sha256 $sevenZip) -eq $expectedHash) {
         return $sevenZip
     }
 
-    $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
-    if (-not $winget) {
-        throw (
-            "Zum einmaligen Entpacken des offiziellen 7-Zip-Extra-Pakets wird 7z.exe benötigt. " +
-            "Installiere 7-Zip 26.02 oder stelle winget.exe bereit und starte erneut."
-        )
-    }
-
-    Write-Host '      7z.exe fehlt; installiere 7-Zip 26.02 über WinGet ...'
-    Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $winget.Source -Arguments @('install','--id','7zip.7zip','--version','26.02','--exact','--accept-package-agreements','--accept-source-agreements','--disable-interactivity') -WorkingDirectory $temp -TimeoutSeconds 900 -ExpectedExitCodes @(0)|Out-Null
-
-    $sevenZip = Find-SevenZip
-    if (-not $sevenZip -or (Get-Sha256 $sevenZip) -ne $expectedHash) {
-        throw '7-Zip wurde angefordert, aber 7z.exe konnte anschließend nicht gefunden werden.'
-    }
-
-    return $sevenZip
+    # Do not use winget here: an already-installed newer 7-Zip makes a pinned
+    # install return APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE. 7zr.exe is
+    # the official standalone extractor from the same pinned upstream release.
+    $bootstrapPath = Join-Path $temp '7zr-26.02.exe'
+    Write-Host '      Verwende geprüften eigenständigen 7-Zip-26.02-Bootstrapper ...'
+    Download-File -Url 'https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe' -Destination $bootstrapPath
+    Assert-Hash -Path $bootstrapPath -Expected '56B8CC9F4971CEF253644FAFE54063ED7FDCA551D4DEE0F8C6BAA81B855ACD72' -Name '7-Zip bootstrap extractor'
+    return $bootstrapPath
 }
 
 function Get-VersionText {
@@ -352,7 +347,7 @@ try {
     }
     Copy-Item -LiteralPath $gitleaksExe.FullName -Destination (Join-Path $stage 'gitleaks.exe') -Force
 
-    $sevenZipExtractor = Ensure-SevenZipExtractor
+    $sevenZipExtractor = Ensure-SevenZipExtractor -ForceStandalone:$TestForceStandaloneSevenZip
     $sevenZipExtract = Join-Path $temp '7zip-extra'
     New-Item -ItemType Directory -Path $sevenZipExtract -Force | Out-Null
     $extractResult=Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $sevenZipExtractor -Arguments @('x',$downloaded['7-Zip'],("-o$sevenZipExtract"),'-y','-bd') -WorkingDirectory $temp -TimeoutSeconds 300 -ExpectedExitCodes @(0)
@@ -429,8 +424,11 @@ Original-Lizenzpaket mitgeführt werden.
 
     Write-Phase 5 5 'Binärdateien atomar übernehmen und Lockfile erzeugen ...'
 
-    if(Test-Path -LiteralPath (Join-Path $bin 'README.md') -PathType Leaf){Copy-Item -LiteralPath (Join-Path $bin 'README.md') -Destination (Join-Path $stage 'README.md') -Force}
-    $allowedStageFiles = @('cloudflared.exe','miniserve.exe','gitleaks.exe','7za.exe','README.md','licenses\cloudflared-LICENSE.txt','licenses\miniserve-LICENSE.txt','licenses\Gitleaks-LICENSE.txt','licenses\7-Zip-LICENSE.txt')
+    $allowedStageFiles = @('cloudflared.exe','miniserve.exe','gitleaks.exe','7za.exe','licenses\cloudflared-LICENSE.txt','licenses\miniserve-LICENSE.txt','licenses\Gitleaks-LICENSE.txt','licenses\7-Zip-LICENSE.txt')
+    if(Test-Path -LiteralPath (Join-Path $bin 'README.md') -PathType Leaf){
+        Copy-Item -LiteralPath (Join-Path $bin 'README.md') -Destination (Join-Path $stage 'README.md') -Force
+        $allowedStageFiles += 'README.md'
+    }
     $actualStageFiles = @(Get-ChildItem -LiteralPath $stage -File -Recurse | ForEach-Object { $_.FullName.Substring($stage.Length).TrimStart('\') } | Sort-Object)
     $stageDifference = @(Compare-Object ($allowedStageFiles | Sort-Object) $actualStageFiles)
     if ($stageDifference.Count -gt 0) { throw ('Staged dependency files do not match the exact allowlist: ' + (($stageDifference | ForEach-Object InputObject) -join ', ')) }
