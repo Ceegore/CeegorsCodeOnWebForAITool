@@ -42,7 +42,16 @@ $failed = 0
 $passed = 0
 Import-Module $curlModule -Force -ErrorAction Stop
 
-function Invoke-TestCurl { param([string]$Url,[string[]]$Arguments);$result=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url $Url -Arguments $Arguments -ProcessTimeoutSeconds 90;$global:LASTEXITCODE=$result.ExitCode;return $result.StdOut }
+function Invoke-TestCurl {
+    param([string]$Url,[string[]]$Arguments)
+    $uri=$null
+    if([Uri]::TryCreate($Url,[UriKind]::Absolute,[ref]$uri) -and $uri.Host -in @('127.0.0.1','localhost','::1')){
+        $Arguments=@('--noproxy','*')+@($Arguments)
+    }
+    $result=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url $Url -Arguments $Arguments -ProcessTimeoutSeconds 90
+    $global:LASTEXITCODE=$result.ExitCode
+    return $result.StdOut
+}
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -365,7 +374,8 @@ try {
     )
 
     Assert-True (((($rangeStatus | Select-Object -Last 1) | Out-String).Trim()) -eq '206') 'Range liefert HTTP 206'
-    Assert-True ((Get-Item -LiteralPath $rangeFile).Length -eq 1024) 'Range liefert exakt 1024 Bytes'
+    $rangeLength=if(Test-Path -LiteralPath $rangeFile -PathType Leaf){(Get-Item -LiteralPath $rangeFile).Length}else{-1}
+    Assert-True ($rangeLength -eq 1024) 'Range liefert exakt 1024 Bytes'
 
     $resume = Join-Path $temp 'resume.zip'
     [void](Invoke-TestCurl -Url $localUrl -Arguments @(
