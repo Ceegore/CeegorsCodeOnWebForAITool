@@ -50,6 +50,10 @@ function Invoke-TestCurl {
     }
     $result=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url $Url -Arguments $Arguments -ProcessTimeoutSeconds 90
     $global:LASTEXITCODE=$result.ExitCode
+    if($result.ExitCode -ne 0){
+        $safeError=WorkspaceShare.Curl\Protect-DiagnosticText -Text $result.StdErr -KnownSecretUrls @($Url)
+        Write-Warning ("curl.exe failed with exit {0} ({1}): {2}" -f $result.ExitCode,$curl,$safeError.Trim())
+    }
     return $result.StdOut
 }
 
@@ -391,7 +395,8 @@ try {
         '--output',$resume
     ))
     Assert-True ($LASTEXITCODE -eq 0) 'Resume-Aufruf erfolgreich'
-    Assert-True ((Get-FileHash -LiteralPath $resume -Algorithm SHA256).Hash -eq $originalHash) 'Fortgesetzter Download besitzt korrekten Hash'
+    $resumeHash=if(Test-Path -LiteralPath $resume -PathType Leaf){(Get-FileHash -LiteralPath $resume -Algorithm SHA256).Hash}else{''}
+    Assert-True ($resumeHash -eq $originalHash) 'Fortgesetzter Download besitzt korrekten Hash'
 
     $beforeFiles = Get-RelativeFiles $temp
     foreach ($method in @('POST','PUT','PATCH','DELETE','PROPFIND','MKCOL','MOVE','COPY')) {
@@ -410,7 +415,7 @@ try {
 
     $headers = Join-Path $temp 'local-headers.txt'
     [void](Invoke-TestCurl -Url $localUrl -Arguments @('--silent','--head','--dump-header',$headers,'--output','NUL'))
-    $headerText = Get-Content -LiteralPath $headers -Raw
+    $headerText = if(Test-Path -LiteralPath $headers -PathType Leaf){Get-Content -LiteralPath $headers -Raw}else{''}
     Assert-True ($headerText -match '(?im)^cache-control:.*no-store') 'Lokales Cache-Control enthält no-store'
 
     if ($PublicUrl) {
