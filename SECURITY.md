@@ -25,6 +25,19 @@ Nicht vorgesehen:
 8. Tunnel wird vor dem lokalen Server beendet.
 9. Watchdog und Stop-Skript verifizieren PID, Executable-Pfad und Startzeit.
 10. `-KeepArchive` betrifft nur lokale Daten und verlängert die URL nicht.
+11. miniserve, cloudflared, curl, Gitleaks und 7-Zip starten angehalten, werden vor dem Resume einem auf den aktuellen Benutzer beschränkten Windows Job Object zugewiesen und besitzen harte Laufzeitgrenzen.
+12. Launcher und Watchdog verwenden denselben monotonen Startzeitpunkt und dieselbe Dauer; UTC-Angaben dienen nur Anzeige und Forensik.
+13. Ein unerwarteter Watchdog-Fehler nach Bereitschaft beendet das gesamte Job Object und wartet auf das bestätigte Ende der Kinder.
+14. Die installierte Dependency-Menge wird mit einer Leser-/Schreiber-Lease und einem wiederherstellbaren Transaktionsjournal geschützt.
+15. Die finale Archivrichtlinie wird auch in isolierten Tests mit deaktiviertem Gitleaks-Scan immer ausgeführt.
+
+## Konsistenzgrenze
+
+Das Tool erstellt selbst keinen VSS-Snapshot. Es hasht die nach Ausschlussregeln
+enthaltenen Quelldateien vor und nach der Archiverstellung und verwirft das Archiv
+bei einer Änderung. Das erkennt normale konkurrierende Schreibvorgänge, ist aber
+keine dateisystemweite atomare Momentaufnahme. Für eine harte Point-in-time-Garantie
+muss als Quelle eine zuvor außerhalb von WorkspaceShare erstellte VSS-Kopie dienen.
 
 ## Umgang mit dem Link
 

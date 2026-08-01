@@ -1,16 +1,24 @@
 name: Windows acceptance
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-acceptance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     timeout-minutes: 20
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Parse PowerShell
         shell: powershell
         run: |
@@ -32,5 +40,18 @@ jobs:
         shell: powershell
         timeout-minutes: 10
         run: |
-          .\tests\Test-WorkspaceShare.ps1
-          .\tests\Test-LifecycleHardening.ps1
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          & .\tests\Test-WorkspaceShare.ps1 2>&1 | Tee-Object -FilePath artifacts\test-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\tests\Test-LifecycleHardening.ps1 2>&1 | Tee-Object -FilePath artifacts\lifecycle-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\tests\Test-NativeRunnerSmoke.ps1 2>&1 | Tee-Object -FilePath artifacts\native-runner-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload sanitized failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-acceptance-failure-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: ignore
+          retention-days: 7

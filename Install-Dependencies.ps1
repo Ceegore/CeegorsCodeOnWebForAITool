@@ -21,7 +21,9 @@
 [CmdletBinding()]
 param(
     [switch]$Force,
-    [string]$ToolRoot
+    [string]$ToolRoot,
+    [ValidateSet('','OldBinMoved','NewBinInstalled','LockReplaced','Reverified','Committed','BackupCleanup')]
+    [string]$TestFailAfter = ''
 )
 
 Set-StrictMode -Version Latest
@@ -31,6 +33,9 @@ $ProgressPreference = 'SilentlyContinue'
 if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
     $ToolRoot = $PSScriptRoot
 }
+
+Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Dependency.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
@@ -42,6 +47,14 @@ $installMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.Depende
 $installMutexHeld = $false
 try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) } catch { throw 'The dependency-install mutex could not be acquired.' }
 if (-not $installMutexHeld) { throw 'Another dependency installation or release build is active.' }
+$dependencyLease = $null
+try { $dependencyLease = Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Exclusive -TimeoutSeconds 30 }
+catch {
+    if ($installMutexHeld) { try { $installMutex.ReleaseMutex() } catch {} }
+    $installMutex.Dispose()
+    throw
+}
+$installJob=[IntPtr]::Zero
 
 $bin = Join-Path $ToolRoot 'bin'
 $installId=[Guid]::NewGuid().ToString('N')
@@ -49,6 +62,7 @@ $stage = Join-Path $ToolRoot ('.bin-stage-' + $installId)
 $backup = Join-Path $ToolRoot ('.bin-backup-' + $installId)
 $licenses = Join-Path $stage 'licenses'
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
+$transactionPath = Join-Path $ToolRoot '.dependencies.transaction.json'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Dependencies-' + [Guid]::NewGuid().ToString('N'))
 
 $assets = @(
@@ -209,17 +223,7 @@ function Ensure-SevenZipExtractor {
     }
 
     Write-Host '      7z.exe fehlt; installiere 7-Zip 26.02 über WinGet ...'
-    & $winget.Source install `
-        --id 7zip.7zip `
-        --version 26.02 `
-        --exact `
-        --accept-package-agreements `
-        --accept-source-agreements `
-        --disable-interactivity
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinGet konnte 7-Zip 26.02 nicht installieren (Exit $LASTEXITCODE)."
-    }
+    Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $winget.Source -Arguments @('install','--id','7zip.7zip','--version','26.02','--exact','--accept-package-agreements','--accept-source-agreements','--disable-interactivity') -WorkingDirectory $temp -TimeoutSeconds 900 -ExpectedExitCodes @(0)|Out-Null
 
     $sevenZip = Find-SevenZip
     if (-not $sevenZip -or (Get-Sha256 $sevenZip) -ne $expectedHash) {
@@ -235,14 +239,65 @@ function Get-VersionText {
         [string[]]$Arguments
     )
 
-    $output = & $FilePath @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Versionsabfrage fehlgeschlagen: $FilePath"
+    $result=Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $temp -TimeoutSeconds 30 -ExpectedExitCodes @(0)
+    return (($result.StdOut | Out-String).Trim())
+}
+
+function Write-JsonAtomic {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path)
+    $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $replaceBackup=$Path+'.'+[Guid]::NewGuid().ToString('N')+'.replace-backup'
+    try {
+        $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8 -ErrorAction Stop
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, $replaceBackup)
+        }
+        else { [IO.File]::Move($temporary, $Path) }
     }
-    return (($output | Out-String).Trim())
+    finally { Remove-Item -LiteralPath $temporary,$replaceBackup -Force -ErrorAction SilentlyContinue }
+}
+
+function Invoke-TestFailure {
+    param([string]$Phase)
+    if ($TestFailAfter -eq $Phase) { throw "Injected installer failure after $Phase." }
+}
+
+function Recover-DependencyTransaction {
+    if (-not (Test-Path -LiteralPath $transactionPath -PathType Leaf)) { return }
+
+    Write-Warning 'Recovering an interrupted dependency transaction.'
+    $journal = Get-Content -LiteralPath $transactionPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ([int]$journal.schema -ne 1 -or [string]$journal.toolRoot -ne [IO.Path]::GetFullPath($ToolRoot)) {
+        throw 'The dependency transaction journal is invalid or belongs to another tool root.'
+    }
+
+    if (Test-Path -LiteralPath ([string]$journal.backupBin) -PathType Container) {
+        if (Test-Path -LiteralPath ([string]$journal.bin) -PathType Container) {
+            Remove-Item -LiteralPath ([string]$journal.bin) -Recurse -Force -ErrorAction Stop
+        }
+        Move-Item -LiteralPath ([string]$journal.backupBin) -Destination ([string]$journal.bin) -ErrorAction Stop
+    }
+    elseif (-not [bool]$journal.oldBinExisted -and (Test-Path -LiteralPath ([string]$journal.bin))) {
+        Remove-Item -LiteralPath ([string]$journal.bin) -Recurse -Force -ErrorAction Stop
+    }
+
+    if ([bool]$journal.oldLockExisted) {
+        if (-not (Test-Path -LiteralPath ([string]$journal.oldLockBackup) -PathType Leaf)) {
+            throw 'Cannot recover the previous dependency lock: its journal backup is missing.'
+        }
+        Copy-Item -LiteralPath ([string]$journal.oldLockBackup) -Destination ([string]$journal.lockPath) -Force -ErrorAction Stop
+    }
+    else { Remove-Item -LiteralPath ([string]$journal.lockPath) -Force -ErrorAction SilentlyContinue }
+
+    Remove-Item -LiteralPath ([string]$journal.stagedBin) -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ([string]$journal.newLockTemporary) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ([string]$journal.oldLockBackup) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $transactionPath -Force -ErrorAction Stop
 }
 
 try {
+    $installJob=New-WorkspaceJob -Name ('Local\WorkspaceShare.DependencyInstall.'+[Guid]::NewGuid().ToString('N'))
+    Recover-DependencyTransaction
     if ((Test-Path -LiteralPath $lockPath -PathType Leaf) -and -not $Force) {
         $existing = $null
         try {
@@ -300,7 +355,8 @@ try {
     $sevenZipExtractor = Ensure-SevenZipExtractor
     $sevenZipExtract = Join-Path $temp '7zip-extra'
     New-Item -ItemType Directory -Path $sevenZipExtract -Force | Out-Null
-    & $sevenZipExtractor x $downloaded['7-Zip'] "-o$sevenZipExtract" -y -bd | Out-Null
+    $extractResult=Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $sevenZipExtractor -Arguments @('x',$downloaded['7-Zip'],("-o$sevenZipExtract"),'-y','-bd') -WorkingDirectory $temp -TimeoutSeconds 300 -ExpectedExitCodes @(0)
+    $global:LASTEXITCODE=$extractResult.ExitCode
     if ($LASTEXITCODE -ne 0) {
         throw "Das geprüfte 7-Zip-Extra-Paket konnte nicht entpackt werden (Exit $LASTEXITCODE)."
     }
@@ -404,14 +460,47 @@ Original-Lizenzpaket mitgeführt werden.
     }
 
     $lockTemporary=Join-Path $ToolRoot ('.dependencies.lock.'+$installId+'.tmp')
+    $lockBackup=Join-Path $ToolRoot ('.dependencies.lock.'+$installId+'.previous')
     $lock|ConvertTo-Json -Depth 6|Set-Content -LiteralPath $lockTemporary -Encoding UTF8 -ErrorAction Stop
+    $oldBinExisted = Test-Path -LiteralPath $bin -PathType Container
+    $oldLockExisted = Test-Path -LiteralPath $lockPath -PathType Leaf
+    if ($oldLockExisted) { Copy-Item -LiteralPath $lockPath -Destination $lockBackup -Force -ErrorAction Stop }
+    $journal = [ordered]@{
+        schema = 1; id = $installId; phase = 'Prepared'; toolRoot = [IO.Path]::GetFullPath($ToolRoot)
+        bin = $bin; backupBin = $backup; stagedBin = $stage; lockPath = $lockPath
+        oldLockBackup = $lockBackup; newLockTemporary = $lockTemporary
+        oldBinExisted = [bool]$oldBinExisted; oldLockExisted = [bool]$oldLockExisted
+    }
+    Write-JsonAtomic -Value $journal -Path $transactionPath
+    $committed = $false
     try{
-        if(Test-Path -LiteralPath $bin){Move-Item -LiteralPath $bin -Destination $backup -ErrorAction Stop}
+        if($oldBinExisted){Move-Item -LiteralPath $bin -Destination $backup -ErrorAction Stop}
+        $journal.phase='OldBinMoved'; Write-JsonAtomic -Value $journal -Path $transactionPath
+        Invoke-TestFailure 'OldBinMoved'
         Move-Item -LiteralPath $stage -Destination $bin -ErrorAction Stop
-        if(Test-Path -LiteralPath $lockPath -PathType Leaf){$lockBackup=$lockPath+'.previous';[IO.File]::Replace($lockTemporary,$lockPath,$lockBackup);Remove-Item -LiteralPath $lockBackup -Force -ErrorAction SilentlyContinue}else{[IO.File]::Move($lockTemporary,$lockPath)}
+        $journal.phase='NewBinInstalled'; Write-JsonAtomic -Value $journal -Path $transactionPath
+        Invoke-TestFailure 'NewBinInstalled'
+        if($oldLockExisted){$replaceBackup=$lockPath+'.'+$installId+'.replace-backup';try{[IO.File]::Replace($lockTemporary,$lockPath,$replaceBackup)}finally{Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue}}else{[IO.File]::Move($lockTemporary,$lockPath)}
+        $journal.phase='LockReplaced'; Write-JsonAtomic -Value $journal -Path $transactionPath
+        Invoke-TestFailure 'LockReplaced'
+
+        $installedLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+        foreach ($dependency in $installedLock.dependencies) {
+            $installedFile = Join-Path $ToolRoot ([string]$dependency.file).Replace('/','\')
+            Assert-Hash -Path $installedFile -Expected ([string]$dependency.sha256) -Name ([string]$dependency.name)
+        }
+        $journal.phase='Reverified'; Write-JsonAtomic -Value $journal -Path $transactionPath
+        Invoke-TestFailure 'Reverified'
+
+        Remove-Item -LiteralPath $transactionPath -Force -ErrorAction Stop
+        $committed = $true
+        Invoke-TestFailure 'Committed'
         if(Test-Path -LiteralPath $backup){Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop}
+        Remove-Item -LiteralPath $lockBackup -Force -ErrorAction SilentlyContinue
+        Invoke-TestFailure 'BackupCleanup'
     }catch{
-        if((Test-Path -LiteralPath $bin) -and (Test-Path -LiteralPath $backup)){Remove-Item -LiteralPath $bin -Recurse -Force -ErrorAction SilentlyContinue;Move-Item -LiteralPath $backup -Destination $bin -ErrorAction SilentlyContinue}
+        if(-not $committed){ Recover-DependencyTransaction }
+        else{Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $lockBackup -Force -ErrorAction SilentlyContinue}
         throw
     }finally{Remove-Item -LiteralPath $lockTemporary -Force -ErrorAction SilentlyContinue}
 
@@ -426,6 +515,8 @@ Original-Lizenzpaket mitgeführt werden.
 finally {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if($installJob -ne [IntPtr]::Zero){try{Stop-WorkspaceJob -Job $installJob}catch{};try{Close-WorkspaceJob -Job $installJob}catch{};$installJob=[IntPtr]::Zero}
+    if ($dependencyLease) { $dependencyLease.Dispose() }
     if ($installMutexHeld) { try { $installMutex.ReleaseMutex() } catch {} }
     $installMutex.Dispose()
 }

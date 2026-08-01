@@ -11,7 +11,10 @@ function Get-ProcessIdentityState {
     try{$process=Get-Process -Id $ProcessId -ErrorAction Stop}
     catch [System.ArgumentException]{return New-ProcessState Absent $null}
     catch [System.Management.Automation.ItemNotFoundException]{return New-ProcessState Absent $null}
-    catch [Microsoft.PowerShell.Commands.ProcessCommandException]{return New-ProcessState Absent $null}
+    catch [Microsoft.PowerShell.Commands.ProcessCommandException]{
+        if([string]$_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*'){return New-ProcessState Absent $null}
+        return New-ProcessState Unknown $null $_.Exception.Message
+    }
     catch{return New-ProcessState Unknown $null $_.Exception.Message}
     try {
         $path=$process.Path

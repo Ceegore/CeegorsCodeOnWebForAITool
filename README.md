@@ -8,14 +8,14 @@ WorkspaceShare gibt niemals das Originalverzeichnis frei. Der Ablauf ist:
 
 1. Workspace vollständig prüfen.
 2. offensichtliche Schlüsseldateien und Reparse-Points blockieren;
-3. Gitleaks-Scan ausführen;
-4. bereinigtes ZIP64 erzeugen, testen, manifestieren und hashen;
+3. bereinigtes ZIP64 aus den eingeschlossenen Dateien erzeugen und die Quelle davor/danach vergleichen;
+4. das fertige ZIP extrahieren, die Ausschlussregeln erneut erzwingen und genau diesen Inhalt mit Gitleaks scannen;
 5. exakt dieses eine Archiv mit miniserve auf `127.0.0.1` bereitstellen;
 6. 256-Bit-Capability-Token als geheimen Route-Prefix setzen;
 7. Cloudflare Quick Tunnel starten;
 8. lokale und öffentliche Sicherheits-Gates ausführen;
 9. Link nur bei vollständig grünen Gates ausgeben;
-10. Tunnel, Server und Snapshot nach Ablauf oder Abbruch beseitigen.
+10. alle nativen Prozesse in einem Windows Job Object überwachen und Tunnel, Server und Snapshot nach Ablauf oder Abbruch beseitigen.
 
 Der vollständige Link ist ein Bearer-Secret. Jeder Besitzer kann die Datei herunterladen und weitergeben.
 
@@ -76,6 +76,11 @@ Das Installationsskript:
 - prüft die gemeldeten Versionen;
 - kopiert die vier EXE-Dateien nach `bin\`;
 - erzeugt `dependencies.lock.json` mit den Hashes der tatsächlich ausgeführten Dateien.
+
+Die Übernahme von `bin\` und Lockfile ist journalgestützt und wird nach einem
+Abbruch auf den letzten konsistenten Stand zurückgesetzt. Aktive und vorbereitende
+Freigaben halten eine gemeinsame Lesesperre; Installer und Release-Build benötigen
+die exklusive Sperre und können deshalb keine bereits geprüften Binärdateien ersetzen.
 
 Ohne gültiges Lockfile startet `Share-Workspace.ps1` nicht.
 
@@ -175,6 +180,16 @@ HugeRawAssets\*
 
 Die Pflichtausschlüsse aus `config\mandatory-excludes.txt` können projektseitig nicht aufgehoben werden.
 
+## Snapshot-Konsistenz
+
+WorkspaceShare verwendet keine Volume Shadow Copy. Der Snapshot ist deshalb eine
+bestmögliche, verifizierte Momentaufnahme: Nur Dateien, die nach den aktiven Regeln
+tatsächlich enthalten werden, fließen in den Vorher-/Nachher-Hashvergleich ein.
+Ändert sich eine enthaltene Datei während 7-Zip liest, wird das Archiv verworfen.
+Änderungen an ausgeschlossenen Build- und Cache-Inhalten brechen die Freigabe nicht
+ab. Für Workspaces mit dauerhaft schreibenden Prozessen sollten diese Prozesse vor
+dem Snapshot pausiert oder eine außerhalb des Tools erzeugte VSS-Kopie geteilt werden.
+
 ## Freigabe sofort beenden
 
 Im aktiven Terminal:
@@ -188,6 +203,11 @@ Notfall-Stop aus einem zweiten Terminal:
 ```powershell
 .\Stop-WorkspaceShare.ps1
 ```
+
+Der Notfall-Stop signalisiert zuerst kooperativ. Ist der Launcher nicht mehr
+vorhanden, beendet er anschließend das in den Sitzungsmetadaten gespeicherte Job
+Object und prüft die einzelnen Prozessidentitäten als Fallback. `-KeepArchives`
+oder ein vorhandener `keep.archive`-Marker betrifft nur die lokale Aufbewahrung.
 
 Oder:
 

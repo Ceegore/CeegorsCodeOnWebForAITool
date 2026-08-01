@@ -1,9 +1,10 @@
 Set-StrictMode -Version Latest
 
 function Protect-DiagnosticText {
-    param([AllowNull()][string]$Text,[string[]]$KnownSecretUrls=@())
+    param([AllowNull()][string]$Text,[string[]]$KnownSecretUrls=@(),[string[]]$SecretTokens=@())
     if([string]::IsNullOrEmpty($Text)){return ''}
     $safe=$Text
+    foreach($secret in @($SecretTokens)){if(-not[string]::IsNullOrWhiteSpace($secret)){$safe=$safe.Replace($secret,'<redacted-token>')}}
     foreach($url in @($KnownSecretUrls)){if($url){$safe=$safe.Replace($url,'https://<redacted>.trycloudflare.com/d/<redacted>/')}}
     $safe=$safe -replace '(?i)\b[a-z0-9-]+\.trycloudflare\.com\b','<redacted>.trycloudflare.com'
     $safe=$safe -replace '(?i)/d/[A-Za-z0-9_-]{43}(?=/|\?|#|\s|"|''|$)','/d/<redacted>'
@@ -27,8 +28,14 @@ function Remove-UnsafeEnvironment {
 }
 
 function Invoke-CurlWithPrivateUrl {
-    param([Parameter(Mandatory=$true)][string]$CurlPath,[Parameter(Mandatory=$true)][string]$Url,[Parameter(Mandatory=$true)][string[]]$Arguments,[string[]]$PrivateConfigLines=@(),[ValidateRange(1,600)][int]$ProcessTimeoutSeconds=90)
+    param([Parameter(Mandatory=$true)][string]$CurlPath,[Parameter(Mandatory=$true)][string]$Url,[Parameter(Mandatory=$true)][string[]]$Arguments,[string[]]$PrivateConfigLines=@(),[ValidateRange(1,600)][int]$ProcessTimeoutSeconds=90,[IntPtr]$Job=[IntPtr]::Zero)
     $quote={param([string]$v) if($null -eq $v -or $v.Length -eq 0){'""'}elseif($v -notmatch '[\s"]'){$v}else{'"'+($v -replace '(\\*)"','$1$1\\"' -replace '(\\+)$','$1$1')+'"'}}
+    $privateInput=('url = "{0}"' -f (ConvertTo-CurlConfigQuoted $Url))+[Environment]::NewLine+(($PrivateConfigLines|ForEach-Object{$_}) -join [Environment]::NewLine)+[Environment]::NewLine
+    if($Job -ne [IntPtr]::Zero){
+        $base=[IO.Path]::GetTempPath();$id=[Guid]::NewGuid().ToString('N');$stdout=Join-Path $base ('workspace-curl-'+$id+'.stdout');$stderr=Join-Path $base ('workspace-curl-'+$id+'.stderr');$process=$null
+        try{$environment=New-WorkspaceChildEnvironment;$process=Start-WorkspaceProcessInJob -Job $Job -FilePath $CurlPath -Arguments (@('--disable')+@($Arguments)+@('--config','-')) -WorkingDirectory $base -StdOutPath $stdout -StdErrPath $stderr -StandardInputText $privateInput -Environment $environment;$nativeProcessHandle=$process.Handle;if(-not$process.WaitForExit($ProcessTimeoutSeconds*1000)){try{Stop-WorkspaceJob -Job $Job}catch{};throw 'curl.exe exceeded its process timeout; the session Job was terminated.'};$exitCode=[WorkspaceShare.NativeJob]::GetExitCode($nativeProcessHandle);return [pscustomobject]@{ExitCode=$exitCode;StdOut=if(Test-Path $stdout){[IO.File]::ReadAllText($stdout)}else{''};StdErr=if(Test-Path $stderr){[IO.File]::ReadAllText($stderr)}else{''}}}
+        finally{try{if($process){$process.Dispose()}}catch{};Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue}
+    }
     $info=New-Object Diagnostics.ProcessStartInfo
     $info.FileName=$CurlPath
     $info.Arguments=((@('--disable')+@($Arguments)+@('--config','-')|ForEach-Object {&$quote $_}) -join ' ')
@@ -37,8 +44,7 @@ function Invoke-CurlWithPrivateUrl {
     $process=New-Object Diagnostics.Process;$process.StartInfo=$info
     try {
         if(-not $process.Start()){throw 'curl.exe could not be started.'}
-        $process.StandardInput.WriteLine(('url = "{0}"' -f (ConvertTo-CurlConfigQuoted $Url)))
-        foreach($line in $PrivateConfigLines){$process.StandardInput.WriteLine($line)}
+        $process.StandardInput.Write($privateInput)
         $process.StandardInput.Close()
         $stdoutTask=$process.StandardOutput.ReadToEndAsync();$stderrTask=$process.StandardError.ReadToEndAsync()
         if(-not $process.WaitForExit($ProcessTimeoutSeconds*1000)){

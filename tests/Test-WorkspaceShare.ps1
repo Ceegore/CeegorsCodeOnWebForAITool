@@ -241,6 +241,10 @@ try {
     Assert-True ($shareText -match 'Get-LiveDnsOverrideConfigLines') 'DNS-Override existiert nur als private frische Diagnosehilfe'
     Assert-True ($shareText -notmatch 'Get-CurlStatusViaCloudflareDns') 'Veralteter DNS-Fallback wurde entfernt'
     Assert-True ($shareText -notmatch 'Get-CloudflareDnsOverrideArguments') 'Veraltete DNS-Override-Hilfe wurde entfernt'
+    Assert-True ($shareText -match 'Test-ExactArchiveContents[^\r\n]+-RunSecretScan:\(-not \$UnsafeSkipSecretScan\)') 'Finale Archivrichtlinie läuft auch bei Test-Scan-Bypass'
+    Assert-True ($shareText -match 'Get-SourceConsistencyManifest[^\r\n]+-ExclusionPatterns') 'Quellkonsistenz berücksichtigt nur eingeschlossene Dateien'
+    Assert-True ($shareText -match 'archive-includes\.txt' -and $shareText -match 'IncludedRelativePaths') 'Eingeschlossene Dateiliste steuert und verifiziert das finale Archiv'
+    Assert-True ($shareText -notmatch '\[Environment\]::SetEnvironmentVariable\(') 'Launcher mutiert seine Prozessumgebung nicht für Kindprozesse'
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         Assert-True ($shareText -match [regex]::Escape("'$resolver'")) ("DNS-Fallback enthält Resolver: $resolver")
     }
@@ -250,6 +254,8 @@ try {
     $sourceErrors = $null
     $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($shareScript, [ref]$sourceTokens, [ref]$sourceErrors)
     $sanitizerAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Protect-DiagnosticText' }, $true) | Select-Object -First 1
+    $excludeAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-SourcePathExcluded' }, $true) | Select-Object -First 1
+    $manifestAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-SourceConsistencyManifest' }, $true) | Select-Object -First 1
     Assert-True ($null -ne $sanitizerAst) 'Zentraler Diagnosesanitizer ist vorhanden'
     if ($sanitizerAst) {
         Invoke-Expression $sanitizerAst.Extent.Text
@@ -273,6 +279,19 @@ try {
         Assert-True ($sanitized -notmatch 'unit-test\.trycloudflare\.com') 'Diagnosesanitizer entfernt Tunnel-Hostname'
         $hostnameOnlySanitized = Protect-DiagnosticText -Text 'Raw hostname: unit-test.trycloudflare.com'
         Assert-True ($hostnameOnlySanitized -notmatch 'unit-test\.trycloudflare\.com') 'Diagnosesanitizer entfernt auch hostname-only Felder'
+    }
+    if($excludeAst -and $manifestAst){
+        Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Path.psm1') -Force
+        Invoke-Expression $excludeAst.Extent.Text;Invoke-Expression $manifestAst.Extent.Text
+        $manifestRoot=Join-Path $temp 'manifest-fixture';New-Item -ItemType Directory -Path (Join-Path $manifestRoot 'node_modules') -Force|Out-Null
+        Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'one';Set-Content -LiteralPath (Join-Path $manifestRoot 'node_modules\cache.txt') -Value 'one'
+        $manifestOne=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
+        Set-Content -LiteralPath (Join-Path $manifestRoot 'node_modules\cache.txt') -Value 'two'
+        $manifestTwo=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
+        Assert-True (-not(Compare-Object $manifestOne $manifestTwo)) 'Änderungen an ausgeschlossenen Dateien ändern das Konsistenzmanifest nicht'
+        Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'two'
+        $manifestThree=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
+        Assert-True ([bool](Compare-Object $manifestTwo $manifestThree)) 'Änderungen an eingeschlossenen Dateien ändern das Konsistenzmanifest'
     }
 
     $token = New-Token
@@ -315,8 +334,8 @@ try {
     $resolveLine='resolve = "fake.example:{0}:127.0.0.1"' -f $port
     $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output','NUL') -PrivateConfigLines @($resolveLine)
     Assert-True ($resolvedResult.ExitCode -eq 0 -and $resolveLine -notmatch '\\"') 'Private resolve-Konfiguration ist syntaktisch gültig und bleibt aus argv'
-    Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/" -Extra @('--head')) -ne 200) 'Root ohne Token liefert nicht 200'
-    Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/d/$(New-Token)/" -Extra @('--head')) -ne 200) 'Falsches Token liefert nicht 200'
+    Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/" -Extra @('--head')) -in @(401,403,404)) 'Root ohne Token liefert eine explizite 4xx-Ablehnung'
+    Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/d/$(New-Token)/" -Extra @('--head')) -in @(401,403,404)) 'Falsches Token liefert eine explizite 4xx-Ablehnung'
 
     try {
         $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($server.Id)").CommandLine

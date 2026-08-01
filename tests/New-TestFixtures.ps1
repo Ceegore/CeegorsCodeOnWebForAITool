@@ -23,19 +23,30 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Path.psm1') -Force -ErrorAction Stop
 
 $resolvedOutput=[IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
 $safeBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
 if(-not $resolvedOutput.StartsWith($safeBase,[StringComparison]::OrdinalIgnoreCase)){throw 'Fixture output must be below the system temporary directory.'}
 if($resolvedOutput -eq $safeBase.TrimEnd('\') -or $resolvedOutput -eq [IO.Path]::GetPathRoot($resolvedOutput).TrimEnd('\')){throw 'Refusing unsafe fixture root.'}
 if (Test-Path -LiteralPath $resolvedOutput) {
+    $rootItem=Get-Item -LiteralPath $resolvedOutput -Force -ErrorAction Stop
+    if(($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Refusing to reset a fixture root that is a reparse point.'}
     $marker=Join-Path $resolvedOutput '.workspace-share-fixtures-root'
     if(-not $ForceReset -or -not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Existing fixture root may be deleted only with -ForceReset and its safety marker.'}
+    $identity=Resolve-WorkspaceDirectoryIdentity -Path $resolvedOutput
+    $tempIdentity=Resolve-WorkspaceDirectoryIdentity -Path ([IO.Path]::GetTempPath())
+    if(-not($identity.FinalPath+'\').StartsWith($tempIdentity.FinalPath.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Fixture root does not resolve below the canonical system temporary directory.'}
+    $markerData=Get-Content -LiteralPath $marker -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop
+    if([string]$markerData.magic -ne 'WorkspaceShareFixtures' -or [string]$markerData.identity -ne $identity.Identity -or [string]$markerData.finalPath -ne $identity.FinalPath){throw 'Fixture safety marker does not match the current canonical root identity.'}
     Remove-Item -LiteralPath $resolvedOutput -Recurse -Force
 }
 New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
 $OutputRoot=$resolvedOutput
-New-Item -ItemType File -Path (Join-Path $OutputRoot '.workspace-share-fixtures-root') -Force|Out-Null
+$createdIdentity=Resolve-WorkspaceDirectoryIdentity -Path $OutputRoot
+$canonicalTemp=Resolve-WorkspaceDirectoryIdentity -Path ([IO.Path]::GetTempPath())
+if(-not($createdIdentity.FinalPath+'\').StartsWith($canonicalTemp.FinalPath.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Created fixture root escaped the canonical system temporary directory.'}
+[ordered]@{magic='WorkspaceShareFixtures';schema=1;identity=$createdIdentity.Identity;finalPath=$createdIdentity.FinalPath}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $OutputRoot '.workspace-share-fixtures-root') -Encoding UTF8
 
 function New-Fixture {
     param([string]$Name)

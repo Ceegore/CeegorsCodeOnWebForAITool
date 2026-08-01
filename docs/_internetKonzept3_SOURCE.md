@@ -10,6 +10,14 @@
 **Cloud-Kosten:** 0 € bei Verwendung eines Cloudflare Quick Tunnels  
 **UX-Ziel:** ein Befehl erzeugt einen direkt aufrufbaren HTTPS-Link; keine Login-Maske
 
+> **Historischer Architekturstand:** Dieses Quelldokument enthält den ursprünglichen
+> Referenzcode vom 30.07.2026 und ist keine ausführbare Implementationsquelle. Der
+> aktuelle Stand scannt ausschließlich den exakt extrahierten finalen ZIP-Inhalt,
+> schützt alle nativen Kinder mit einem Windows Job Object, verwendet eine
+> Leser-/Schreiber-Lease für Dependencies und prüft nur tatsächlich eingeschlossene
+> Quelldateien vor/nach der Snapshot-Erstellung. Die aktuelle Betriebsbeschreibung
+> steht in `README.md` und `SECURITY.md`.
+
 ---
 
 # 1. Abschließendes Urteil
