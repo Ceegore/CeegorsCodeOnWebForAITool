@@ -54,7 +54,7 @@ namespace WorkspaceShare {
         environment=BuildEnvironment(environmentEntries);STARTUPINFO startup=new STARTUPINFO();startup.cb=Marshal.SizeOf(startup);startup.dwFlags=STARTF_USESTDHANDLES;startup.hStdInput=input;startup.hStdOutput=output;startup.hStdError=error;
         if(!CreateProcess(file,new StringBuilder("\""+file+"\" "+args),IntPtr.Zero,IntPtr.Zero,true,CREATE_SUSPENDED|CREATE_NO_WINDOW|CREATE_UNICODE_ENVIRONMENT,environment,cwd,ref startup,out pi))Fail("CreateProcess");created=true;
         if(!AssignProcessToJobObject(job,pi.hProcess))Fail("AssignProcessToJobObject");
-        if(forceResumeFailure)throw new InvalidOperationException("Injected ResumeThread failure.");
+        if(forceResumeFailure){InvalidOperationException injected=new InvalidOperationException("Injected ResumeThread failure.");injected.Data["ProcessId"]=(int)pi.dwProcessId;throw injected;}
         if(ResumeThread(pi.hThread)==0xFFFFFFFF)Fail("ResumeThread");
         if(inputWrite!=IntPtr.Zero){byte[] bytes=Encoding.UTF8.GetBytes(stdinText);uint written;if(bytes.Length>0&&(!WriteFile(inputWrite,bytes,(uint)bytes.Length,out written,IntPtr.Zero)||written!=(uint)bytes.Length))Fail("WriteFile stdin");CloseHandle(inputWrite);inputWrite=IntPtr.Zero;}
         return (int)pi.dwProcessId;
