@@ -44,7 +44,7 @@ try {
     $parentState=Get-State $ParentPid $ExpectedParentPath $ParentStartTicks
     $serverState=Get-State $MiniservePid $ExpectedMiniservePath $MiniserveStartTicks
     $cloudState=Get-State $CloudflaredPid $ExpectedCloudflaredPath $CloudflaredStartTicks
-    if($parentState.State -ne 'Match' -or $serverState.State -ne 'Match' -or $cloudState.State -ne 'Match'){throw 'Tracked process identity validation failed.'}
+    if($parentState.State -ne 'Match' -or $serverState.State -ne 'Match' -or $cloudState.State -ne 'Match'){throw ('Tracked process identity validation failed. parent={0} [{1}] miniserve={2} [{3}] cloudflared={4} [{5}]' -f $parentState.State,$parentState.Message,$serverState.State,$serverState.Message,$cloudState.State,$cloudState.Message)}
     $job=Open-WorkspaceJob -Name $JobName
     $archiveLock=New-Object IO.FileStream($ArchivePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     New-Item -ItemType File -Path $ReadyMarker -Force -ErrorAction Stop|Out-Null
