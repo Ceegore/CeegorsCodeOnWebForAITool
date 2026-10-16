@@ -60,6 +60,8 @@ try {
     Assert-True ($null -ne $ready) ('share became ready within ' + [int]$watch.Elapsed.TotalSeconds + ' s')
     if ($null -eq $ready) {
         Write-Host ('       last output: ' + (($lines | Select-Object -Last 15) -join "`n       "))
+        [void]$launcher.WaitForExit(20000)
+        [void]$errTask.Wait(5000)
         Write-Host ('       stderr: ' + $(if ($errTask.IsCompleted) { $errTask.Result } else { '(still running)' }))
     }
     else {

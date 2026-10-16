@@ -78,6 +78,8 @@ try {
 }
 catch {
     $exitCode=50
+    # Reason for the log of whoever started the watchdog (no secrets in these messages).
+    try { [Console]::Error.WriteLine('Watchdog: ' + $_.Exception.Message) } catch { }
 }
 finally {
     if(-not $normalCompletion -and $job -ne [IntPtr]::Zero){try{Stop-WorkspaceJob -Job $job}catch{}}
