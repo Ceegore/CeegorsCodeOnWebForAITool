@@ -4,13 +4,13 @@ function Get-WorkspaceDependencyLeasePath {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ToolRoot)
 
-    $normalized = [IO.Path]::GetFullPath($ToolRoot).TrimEnd('\').ToUpperInvariant()
+    $normalized = [IO.Path]::GetFullPath($ToolRoot).TrimEnd('\','/').ToUpperInvariant()
     $bytes = [Text.Encoding]::UTF8.GetBytes($normalized)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $key = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
     finally { $sha.Dispose() }
 
-    $base = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'WorkspaceShare\locks'
+    $base = Join-Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'WorkspaceShare') 'locks'
     New-Item -ItemType Directory -Path $base -Force -ErrorAction Stop | Out-Null
     return (Join-Path $base ($key + '.lease'))
 }

@@ -36,31 +36,46 @@ if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
     $ToolRoot = $PSScriptRoot
 }
 
-Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Dependency.psm1') -Force -ErrorAction Stop
-Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path $ToolRoot 'scripts') 'WorkspaceShare.Dependency.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path $ToolRoot 'scripts') 'WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Windows x64 (Windows PowerShell 5.1) is the product; Linux x64 (PowerShell 7) is experimental.
+$isWindowsHost = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+if (-not $isWindowsHost) {
+    $macVariable = Get-Variable -Name IsMacOS -ErrorAction SilentlyContinue
+    if ($null -ne $macVariable -and [bool]$macVariable.Value) { throw 'macOS wird nicht unterstützt.' }
+    if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
+        throw 'WorkspaceShare dependencies support only x64 on Linux.'
+    }
+}
+
+if ($isWindowsHost) { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 }
 Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
 if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {
     throw 'WorkspaceShare dependencies support only 64-bit Windows/x64 PowerShell.'
 }
 
-$installMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
+$installMutex = $null
 $installMutexHeld = $false
-try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
-catch [Threading.AbandonedMutexException] { $installMutexHeld = $true }
-catch { $installMutex.Dispose(); throw 'The dependency-install mutex could not be acquired.' }
-if (-not $installMutexHeld) { $installMutex.Dispose(); throw 'Another dependency installation or release build is active.' }
+if ($isWindowsHost) {
+    $installMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
+    try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
+    catch [Threading.AbandonedMutexException] { $installMutexHeld = $true }
+    catch { $installMutex.Dispose(); throw 'The dependency-install mutex could not be acquired.' }
+    if (-not $installMutexHeld) { $installMutex.Dispose(); throw 'Another dependency installation or release build is active.' }
+}
 $dependencyLease = $null
 try { $dependencyLease = Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Exclusive -TimeoutSeconds 30 }
 catch {
     if ($installMutexHeld) { try { $installMutex.ReleaseMutex() } catch {} }
-    $installMutex.Dispose()
+    if ($installMutex) { $installMutex.Dispose() }
     throw
 }
 $installJob=[IntPtr]::Zero
 
+# Windows: bin\ (as always). Linux: bin/linux-x64/ (lockfile platform linux-x64).
 $bin = Join-Path $ToolRoot 'bin'
+if (-not $isWindowsHost) { $bin = Join-Path $bin 'linux-x64' }
 $installId=[Guid]::NewGuid().ToString('N')
 $stage = Join-Path $ToolRoot ('.bin-stage-' + $installId)
 $backup = Join-Path $ToolRoot ('.bin-backup-' + $installId)
@@ -69,7 +84,7 @@ $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $transactionPath = Join-Path $ToolRoot '.dependencies.transaction.json'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Dependencies-' + [Guid]::NewGuid().ToString('N'))
 
-$assets = @(
+$windowsAssets = @(
     # 2026.7.2 ist bewusst gepinnt: 2026.7.3 verlor im Langzeittest den
     # trycloudflare.com-DNS-Eintrag, obwohl der Connector weiterlief.
     [ordered]@{
@@ -122,6 +137,61 @@ $assets = @(
         source = 'https://github.com/ip7z/7zip/releases/tag/26.02'
     }
 )
+
+# Linux x64: same pinned versions. SHA-256 values were computed from the official release assets and
+# cross-checked with the GitHub asset digests (and the upstream gitleaks_8.30.1_checksums.txt).
+$linuxAssets = @(
+    [ordered]@{
+        name = 'cloudflared'
+        version = '2026.7.2'
+        url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.7.2/cloudflared-linux-amd64'
+        sha256 = 'EC905EA7B7E327FF8ABDDE8CB64697A2152DE74DBCDBF6AEC9DB8364EB3886CD'
+        type = 'exe'
+        output = 'cloudflared'
+        license = 'Apache-2.0'
+        licenseUrl = 'https://raw.githubusercontent.com/cloudflare/cloudflared/2026.7.2/LICENSE'
+        licenseSha256 = '58D1E17FFE5109A7AE296CAAFCADFDBE6A7D176F0BC4AB01E12A689B0499D8BD'
+        source = 'https://github.com/cloudflare/cloudflared/releases/tag/2026.7.2'
+    },
+    [ordered]@{
+        name = 'miniserve'
+        version = '0.35.0'
+        url = 'https://github.com/svenstaro/miniserve/releases/download/v0.35.0/miniserve-0.35.0-x86_64-unknown-linux-musl'
+        sha256 = 'C630EE030D5D9D83C88C5CC72F43AE215B0C214D64FD7AFC92244FE369AF2964'
+        type = 'exe'
+        output = 'miniserve'
+        license = 'MIT'
+        licenseUrl = 'https://raw.githubusercontent.com/svenstaro/miniserve/v0.35.0/LICENSE'
+        licenseSha256 = 'BEDB87F0760796C7BE677651EB10AD949410E90C55BC7F607D848E8E9D65375A'
+        source = 'https://github.com/svenstaro/miniserve/releases/tag/v0.35.0'
+    },
+    [ordered]@{
+        name = 'Gitleaks'
+        version = '8.30.1'
+        url = 'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz'
+        sha256 = '551F6FC83EA457D62A0D98237CBAD105AF8D557003051F41F3E7CA7B3F2470EB'
+        type = 'tar.gz'
+        output = 'gitleaks'
+        license = 'MIT'
+        licenseUrl = 'https://raw.githubusercontent.com/gitleaks/gitleaks/v8.30.1/LICENSE'
+        licenseSha256 = 'E3884B252B3BFC045E55BE43A34D1E80DA070BC6F804AC95BF4660E97D62EBC6'
+        source = 'https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1'
+    },
+    [ordered]@{
+        name = '7-Zip'
+        version = '26.02'
+        url = 'https://github.com/ip7z/7zip/releases/download/26.02/7z2602-linux-x64.tar.xz'
+        sha256 = '41AABA7B1235304AB5AA0624530C67AE829496CD29E875925271EFDCCC28C03E'
+        type = 'tar.xz'
+        output = '7zz'
+        license = 'LGPL-2.1-or-later plus bundled notices/exceptions'
+        licenseUrl = ''
+        # License.txt inside the official Linux tarball.
+        licenseSha256 = '1790374E5352329CEDB46EE3808930A88E9CA2F08B82B10FCF5CF605D2C301B1'
+        source = 'https://github.com/ip7z/7zip/releases/tag/26.02'
+    }
+)
+$assets = if ($isWindowsHost) { $windowsAssets } else { $linuxAssets }
 
 function Write-Phase {
     param([int]$Number, [int]$Total, [string]$Text)
@@ -327,6 +397,8 @@ try {
             'exe' { '.exe' }
             'zip' { '.zip' }
             '7z'  { '.7z' }
+            'tar.gz' { '.tar.gz' }
+            'tar.xz' { '.tar.xz' }
             default { '.bin' }
         }
 
@@ -339,6 +411,27 @@ try {
 
     Write-Phase 2 5 'Archive sicher entpacken und Binärdateien bereitstellen ...'
 
+    if (-not $isWindowsHost) {
+        # Linux: raw binaries are copied; the two tarballs are unpacked with tar (named members only).
+        Copy-Item -LiteralPath $downloaded['cloudflared'] -Destination (Join-Path $stage 'cloudflared') -Force
+        Copy-Item -LiteralPath $downloaded['miniserve'] -Destination (Join-Path $stage 'miniserve') -Force
+        $tarCommand = Get-Command 'tar' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $tarCommand) { throw 'tar wurde nicht gefunden (wird zum Entpacken benötigt).' }
+        $gitleaksExtract = Join-Path $temp 'gitleaks'
+        $sevenZipExtract = Join-Path $temp '7zip-linux'
+        New-Item -ItemType Directory -Path $gitleaksExtract, $sevenZipExtract -Force | Out-Null
+        [void](Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $tarCommand.Source -Arguments @('-xzf', $downloaded['Gitleaks'], '-C', $gitleaksExtract, 'gitleaks', 'LICENSE') -WorkingDirectory $temp -TimeoutSeconds 120 -ExpectedExitCodes @(0))
+        [void](Invoke-WorkspaceNativeProcess -Job $installJob -FilePath $tarCommand.Source -Arguments @('-xJf', $downloaded['7-Zip'], '-C', $sevenZipExtract, '7zz', 'License.txt') -WorkingDirectory $temp -TimeoutSeconds 120 -ExpectedExitCodes @(0))
+        foreach ($member in @((Join-Path $gitleaksExtract 'gitleaks'), (Join-Path $sevenZipExtract '7zz'), (Join-Path $sevenZipExtract 'License.txt'))) {
+            if (-not (Test-Path -LiteralPath $member -PathType Leaf)) { throw "Im geprüften Archiv fehlt: $member" }
+        }
+        Copy-Item -LiteralPath (Join-Path $gitleaksExtract 'gitleaks') -Destination (Join-Path $stage 'gitleaks') -Force
+        Copy-Item -LiteralPath (Join-Path $sevenZipExtract '7zz') -Destination (Join-Path $stage '7zz') -Force
+        foreach ($executable in @('cloudflared', 'miniserve', 'gitleaks', '7zz')) {
+            [IO.File]::SetUnixFileMode((Join-Path $stage $executable), [IO.UnixFileMode]'UserRead,UserWrite,UserExecute,GroupRead,GroupExecute,OtherRead,OtherExecute')
+        }
+    }
+    else {
     Copy-Item -LiteralPath $downloaded['cloudflared'] -Destination (Join-Path $stage 'cloudflared.exe') -Force
     Copy-Item -LiteralPath $downloaded['miniserve'] -Destination (Join-Path $stage 'miniserve.exe') -Force
 
@@ -373,15 +466,26 @@ try {
         throw '7za.exe fehlt im geprüften 7-Zip-Extra-Paket.'
     }
     Copy-Item -LiteralPath $sevenZipExe.FullName -Destination (Join-Path $stage '7za.exe') -Force
+    }
 
     Write-Phase 3 5 'Versionen der ausführbaren Dateien prüfen ...'
 
-    $versionChecks = @(
-        @{ File = 'cloudflared.exe'; Args = @('--version'); Expected = '2026.7.2' },
-        @{ File = 'miniserve.exe'; Args = @('--version'); Expected = '0.35.0' },
-        @{ File = 'gitleaks.exe'; Args = @('version'); Expected = '8.30.1' },
-        @{ File = '7za.exe'; Args = @('i'); Expected = '26.02' }
-    )
+    if ($isWindowsHost) {
+        $versionChecks = @(
+            @{ File = 'cloudflared.exe'; Args = @('--version'); Expected = '2026.7.2' },
+            @{ File = 'miniserve.exe'; Args = @('--version'); Expected = '0.35.0' },
+            @{ File = 'gitleaks.exe'; Args = @('version'); Expected = '8.30.1' },
+            @{ File = '7za.exe'; Args = @('i'); Expected = '26.02' }
+        )
+    }
+    else {
+        $versionChecks = @(
+            @{ File = 'cloudflared'; Args = @('--version'); Expected = '2026.7.2' },
+            @{ File = 'miniserve'; Args = @('--version'); Expected = '0.35.0' },
+            @{ File = 'gitleaks'; Args = @('version'); Expected = '8.30.1' },
+            @{ File = '7zz'; Args = @('i'); Expected = '26.02' }
+        )
+    }
 
     foreach ($check in $versionChecks) {
         $path = Join-Path $stage $check.File
@@ -413,6 +517,7 @@ try {
     $sevenZipLicense = Get-ChildItem -LiteralPath $sevenZipExtract -File -Recurse |
         Where-Object { $_.Name -match '(?i)^(license|copying)(\..+)?$' } |
         Select-Object -First 1
+    if (-not $isWindowsHost -and -not $sevenZipLicense) { throw 'License.txt fehlt im geprüften 7-Zip-Linux-Archiv.' }
     if ($sevenZipLicense) {
         Copy-Item -LiteralPath $sevenZipLicense.FullName -Destination (Join-Path $licenses '7-Zip-LICENSE.txt') -Force
     }
@@ -429,11 +534,14 @@ Original-Lizenzpaket mitgeführt werden.
     Write-Phase 5 5 'Binärdateien atomar übernehmen und Lockfile erzeugen ...'
 
     $allowedStageFiles = @('cloudflared.exe','miniserve.exe','gitleaks.exe','7za.exe','licenses\cloudflared-LICENSE.txt','licenses\miniserve-LICENSE.txt','licenses\Gitleaks-LICENSE.txt','licenses\7-Zip-LICENSE.txt')
+    if (-not $isWindowsHost) { $allowedStageFiles = @('cloudflared','miniserve','gitleaks','7zz','licenses\cloudflared-LICENSE.txt','licenses\miniserve-LICENSE.txt','licenses\Gitleaks-LICENSE.txt','licenses\7-Zip-LICENSE.txt') }
     if(Test-Path -LiteralPath (Join-Path $bin 'README.md') -PathType Leaf){
         Copy-Item -LiteralPath (Join-Path $bin 'README.md') -Destination (Join-Path $stage 'README.md') -Force
         $allowedStageFiles += 'README.md'
     }
-    $actualStageFiles = @(Get-ChildItem -LiteralPath $stage -File -Recurse | ForEach-Object { $_.FullName.Substring($stage.Length).TrimStart('\') } | Sort-Object)
+    # Compare with '/' separators on every platform (the allowlist is written with '\').
+    $allowedStageFiles = @($allowedStageFiles | ForEach-Object { ([string]$_).Replace('\','/') })
+    $actualStageFiles = @(Get-ChildItem -LiteralPath $stage -File -Recurse | ForEach-Object { $_.FullName.Substring($stage.Length).TrimStart('\','/').Replace('\','/') } | Sort-Object)
     $stageDifference = @(Compare-Object ($allowedStageFiles | Sort-Object) $actualStageFiles)
     if ($stageDifference.Count -gt 0) { throw ('Staged dependency files do not match the exact allowlist: ' + (($stageDifference | ForEach-Object InputObject) -join ', ')) }
 
@@ -443,7 +551,7 @@ Original-Lizenzpaket mitgeführt werden.
         $installedPath = Join-Path $stage $fileName
         $lockDependencies += [ordered]@{
             name = [string]$asset.name
-            file = ('bin/' + $fileName)
+            file = $(if ($isWindowsHost) { 'bin/' + $fileName } else { 'bin/linux-x64/' + $fileName })
             version = [string]$asset.version
             sha256 = Get-Sha256 $installedPath
             license = [string]$asset.license
@@ -456,7 +564,7 @@ Original-Lizenzpaket mitgeführt werden.
         schema = 2
         installed = $true
         generatedUtc = [DateTime]::UtcNow.ToString('o')
-        platform = 'windows-x64'
+        platform = $(if ($isWindowsHost) { 'windows-x64' } else { 'linux-x64' })
         installerVersion = '3.1.0'
         dependencies = $lockDependencies
     }
@@ -479,6 +587,7 @@ Original-Lizenzpaket mitgeführt werden.
         if($oldBinExisted){Move-Item -LiteralPath $bin -Destination $backup -ErrorAction Stop}
         $journal.phase='OldBinMoved'; Write-JsonAtomic -Value $journal -Path $transactionPath
         Invoke-TestFailure 'OldBinMoved'
+        if(-not $isWindowsHost){[void][IO.Directory]::CreateDirectory((Split-Path $bin -Parent))}
         Move-Item -LiteralPath $stage -Destination $bin -ErrorAction Stop
         $journal.phase='NewBinInstalled'; Write-JsonAtomic -Value $journal -Path $transactionPath
         Invoke-TestFailure 'NewBinInstalled'
@@ -488,7 +597,7 @@ Original-Lizenzpaket mitgeführt werden.
 
         $installedLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
         foreach ($dependency in $installedLock.dependencies) {
-            $installedFile = Join-Path $ToolRoot ([string]$dependency.file).Replace('/','\')
+            $installedFile = Join-Path $ToolRoot ([string]$dependency.file).Replace('/',[string][IO.Path]::DirectorySeparatorChar)
             Assert-Hash -Path $installedFile -Expected ([string]$dependency.sha256) -Name ([string]$dependency.name)
         }
         $journal.phase='Reverified'; Write-JsonAtomic -Value $journal -Path $transactionPath
@@ -520,5 +629,5 @@ finally {
     if($installJob -ne [IntPtr]::Zero){try{Stop-WorkspaceJob -Job $installJob}catch{};try{Close-WorkspaceJob -Job $installJob}catch{};$installJob=[IntPtr]::Zero}
     if ($dependencyLease) { $dependencyLease.Dispose() }
     if ($installMutexHeld) { try { $installMutex.ReleaseMutex() } catch {} }
-    $installMutex.Dispose()
+    if ($installMutex) { $installMutex.Dispose() }
 }

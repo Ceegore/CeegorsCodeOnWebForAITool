@@ -25,8 +25,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Process.psm1') -Force -ErrorAction Stop
-Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts') 'WorkspaceShare.Process.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts') 'WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
 
 function Get-State([int]$Id,[string]$Path,[long]$Ticks){Get-ProcessIdentityState -ProcessId $Id -ExpectedPath $Path -ExpectedStartTicks $Ticks}
 function Test-Gone($State){$State.State -in @('Absent','Conflict')}
