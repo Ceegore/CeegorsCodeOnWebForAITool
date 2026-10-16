@@ -191,6 +191,33 @@ $src = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`n`r`n"
 $r = Read-WsHttpRequest -Stream $src -HeadersOnly
 Assert-True ((Get-CopyStatus $src $r (New-Object System.IO.MemoryStream)) -eq 400) 'Copy-WsHttpBody: request without Content-Length -> 400'
 
+# -OnChunk (GUI_CONTRACT 8.4): called after every chunk read from the stream; exceptions propagate
+$script:ChunkCalls = 0
+$script:ChunkDestLengths = New-Object System.Collections.Generic.List[int64]
+$payload = Get-RandomBytes 200000 99
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: $($payload.Length)`r`n`r`n" $payload
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$dst = New-Object System.IO.MemoryStream
+$expectedChunks = [int][Math]::Ceiling(($payload.Length - $r.BodyPrefix.Length) / 65536.0)
+$st = Get-CopyStatus $src $r $dst @{ OnChunk = { $script:ChunkCalls++; $script:ChunkDestLengths.Add($dst.Length) } }
+Assert-True ($st -eq 0 -and $script:ChunkCalls -eq $expectedChunks -and $expectedChunks -ge 3) "Copy-WsHttpBody -OnChunk: called once per 64 KiB chunk ($expectedChunks calls)"
+Assert-True ($dst.Length -eq $payload.Length -and (Get-Sha256Hex $dst.ToArray()) -ceq (Get-Sha256Hex $payload)) 'Copy-WsHttpBody -OnChunk: data is still copied exactly'
+Assert-True ($script:ChunkDestLengths[0] -gt $r.BodyPrefix.Length -and $script:ChunkDestLengths[$script:ChunkDestLengths.Count - 1] -eq $payload.Length) 'Copy-WsHttpBody -OnChunk: runs after the chunk was written to the destination'
+
+$script:ChunkCalls = 0
+$src = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 4`r`n`r`nWXYZ"
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$st = Get-CopyStatus $src $r (New-Object System.IO.MemoryStream) @{ OnChunk = { $script:ChunkCalls++ } }
+Assert-True ($st -eq 0 -and $script:ChunkCalls -eq 0) 'Copy-WsHttpBody -OnChunk: not called when the body is fully inside BodyPrefix'
+
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 200000`r`n`r`n" (Get-RandomBytes 200000 98)
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$script:ChunkCalls = 0
+$thrown = $null
+try { Copy-WsHttpBody -Stream $src -Request $r -Destination (New-Object System.IO.MemoryStream) -OnChunk { $script:ChunkCalls++; if ($script:ChunkCalls -eq 2) { throw 'chunk hook failed' } } }
+catch { $thrown = $_.Exception }
+Assert-True ($null -ne $thrown -and $thrown.Message -ceq 'chunk hook failed' -and $script:ChunkCalls -eq 2 -and -not $thrown.Data.Contains('WsHttpStatus')) 'Copy-WsHttpBody -OnChunk: an exception from the hook propagates unchanged and stops the copy'
+
 # ---- Test-WsRequestAllowed ----
 function New-FakeRequest {
     param([string]$Method = 'GET', [hashtable]$H = @{})

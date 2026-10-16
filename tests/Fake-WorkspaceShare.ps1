@@ -1,7 +1,12 @@
 ﻿#requires -Version 5.1
 # Fake Share-Workspace.ps1 for the GUI backend tests. Emits the GUI_CONTRACT section 2 event stream.
-# Scenario from env WS_FAKE_SCENARIO: success (default) | fail22 | parent | hang.
-# Optional env WS_FAKE_PIDFILE: file that receives this process id (and "<file>.session" the session path).
+# Scenario from env WS_FAKE_SCENARIO: success (default) | fail22 | parent | hang | chatty.
+#   chatty = writes ~200 KB of plain (non-event) stdout lines first, then behaves like success; the file
+#   "<pidfile>.noise" appears as soon as the last noise line has been written (proves the pipe is drained).
+# Optional env WS_FAKE_PIDFILE: file that receives this process id (and "<file>.session" the session path,
+#   "<file>.path" the -Path argument). If the value contains '{pid}' it is replaced by this process id, so
+#   several fake shares of one backend can run in parallel with their own files.
+# Every instance creates its own unique session folder below %TEMP%.
 [CmdletBinding()]
 param(
     [string]$Path,
@@ -20,7 +25,9 @@ $scenario = $env:WS_FAKE_SCENARIO
 if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = 'success' }
 $pidFile = $env:WS_FAKE_PIDFILE
 if (-not [string]::IsNullOrWhiteSpace($pidFile)) {
+    if ($pidFile.Contains('{pid}')) { $pidFile = $pidFile.Replace('{pid}', [string]$PID) }
     [IO.File]::WriteAllText($pidFile, [string]$PID, (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($pidFile + '.path', [string]$Path, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Send-Event {
@@ -66,6 +73,18 @@ if ($scenario -eq 'hang') {
     exit 0
 }
 
+if ($scenario -eq 'chatty') {
+    # 200 lines of 1000 characters, written as fast as the pipe takes them (blocks while nobody reads).
+    $noise = 'N' * 999
+    for ($i = 0; $i -lt 200; $i++) {
+        try { [Console]::Out.WriteLine($noise) } catch { }
+    }
+    try { [Console]::Out.Flush() } catch { }
+    if (-not [string]::IsNullOrWhiteSpace($pidFile)) {
+        [IO.File]::WriteAllText($pidFile + '.noise', 'done', (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+
 for ($n = 1; $n -le 8; $n++) {
     Send-Event 'step' ([ordered]@{ n = $n; total = 8; text = $stepTexts[$n - 1] })
     Start-Sleep -Milliseconds 100
@@ -78,7 +97,8 @@ if (-not [string]::IsNullOrWhiteSpace($pidFile)) {
 }
 Send-Event 'session' ([ordered]@{ path = $session })
 
-$url = 'https://fake-test.trycloudflare.com/d/' + ('a' * 43) + '/'
+# The link differs per fake process (43 chars after /d/), so parallel shares can be told apart.
+$url = 'https://fake-test.trycloudflare.com/d/' + ('p' + $PID.ToString('D10')).PadRight(43, 'q') + '/'
 Send-Event 'ready' ([ordered]@{
         url = $url
         expiresUtc = [DateTime]::UtcNow.AddMinutes(1).ToString('o')

@@ -251,3 +251,111 @@ after that share ends.
   path read-only plus a summary ("3 Dateien, 12,4 MB") and an "Entfernen" button (`discard`).
   Picking or typing another folder discards the drop.
 - Client-side pre-checks mirror the limits in `state.limits`; the backend stays authoritative.
+
+## 8. Several shares at the same time, with named tabs (contract v2)
+
+Supersedes the single-share parts of §5 and §7.2/§7.4 where they conflict. `Share-Workspace.ps1`
+is unchanged: every share is its own child process with its own session folder, ports, Job
+Object, watchdog and Quick Tunnel (verified: free ports are chosen dynamically, the dependency
+lease is shared, stale-session cleanup only touches dead sessions older than 48 h).
+
+### 8.1 Model
+
+- The backend keeps a list of **shares**. Each share has a `shareId` (8 lowercase hex chars,
+  random), a `name`, its own child process, event reader, log ring buffer and all per-share
+  fields of the v1 state object (`phase`, `step`, `total`, `stepText`, `steps`, `url`,
+  `expiresUtc`, `sizeBytes`, `sha256`, `remainingMinutes`, `health`, `exitCode`, `reason`,
+  `message`, `log`, `request`), plus `createdUtc`, `dropFiles` (number of dropped files or null).
+- Share phases: `starting`, `active`, `stopping`, `ended`, `error` (no `idle`; a share exists
+  only after a start).
+- **Draft**: the "new share" form owns at most one drop (§7). A start with the finished draft
+  drop moves that drop to the new share; it is deleted when that share ends (as in §7.1).
+  Drops, folder picking and starting are allowed **while other shares run**.
+- `-MaxShares` backend parameter, default **5**, range 1–10: number of shares in phase
+  `starting`/`active`/`stopping` at the same time (each opens its own Cloudflare Quick Tunnel,
+  and Cloudflare rate-limits their creation). Ended/error shares stay listed until dismissed;
+  at most 20 listed shares – the oldest ended/error share is dismissed automatically.
+- `-ParentProcessId` is passed to every child, so all shares stop if the backend disappears.
+
+### 8.2 Names
+
+- Default name, computed by the backend at start (the client may send one):
+  - finished draft drop with one top-level entry: that entry's name (a file name such as
+    `Bericht.pdf`, or a dropped folder's name);
+  - several top-level entries: first entry name + ` +N` (N = number of other top-level entries),
+    e.g. `Bericht.pdf +2`;
+  - a picked/typed folder: its leaf name.
+- `POST /api/shares/<shareId>/rename {"name":".."}` at any time. Name rules: trimmed, 1–60
+  characters, no control characters; otherwise 400. Names do not have to be unique. The name
+  is only a label: it does not change the ZIP or the link.
+
+### 8.3 API v2 (token required for all; per-share routes 404 for an unknown id)
+
+| Method + path | Body | 200 response |
+|---|---|---|
+| `GET /api/state` | – | state v2 (below) |
+| `POST /api/start` | `{"path":"..","minutes":240,"compression":"Fast","includeGenerated":false,"name":null}` | `{"ok":true,"shareId":".."}`; 400 invalid input; 409 `MaxShares` reached |
+| `POST /api/shares/<id>/stop` | `{}` | `{"ok":true}` (idempotent while stopping; 409 if ended/error) |
+| `POST /api/shares/<id>/copy` | `{}` | `{"ok":true}`; 409 if no link |
+| `POST /api/shares/<id>/rename` | `{"name":".."}` | `{"ok":true,"name":".."}` |
+| `POST /api/shares/<id>/dismiss` | `{}` | `{"ok":true}`; 409 unless ended/error |
+| `POST /api/pick-folder` | `{}` | as v1, but allowed in every situation (see 8.4); 409 only while another picker is open |
+| `POST /api/drop/*` | as §7.2 | as §7.2, but allowed while shares run; 409 while an upload into the draft is in progress from another request |
+| `POST /api/quit` | `{}` | `{"ok":true}`; stops **all** running shares first |
+
+The v1 endpoints `/api/stop` and `/api/copy` are removed (page and backend always come from the
+same build, §5).
+
+State v2:
+
+```json
+{
+  "v": 2, "build": "..", "platform": "windows",
+  "capabilities": {"folderPicker": true, "clipboard": true, "openBrowser": true},
+  "limits": {"maxDropBytes": 4294967296, "maxDropFiles": 10000, "maxShares": 5},
+  "running": 1,
+  "draft": {"drop": null},
+  "shares": [
+    {"id": "1a2b3c4d", "name": "Bericht.pdf +2", "createdUtc": "..", "phase": "active",
+     "step": 8, "total": 8, "stepText": "..", "steps": [], "url": "https://..", "expiresUtc": "..",
+     "sizeBytes": 1, "sha256": "..", "remainingMinutes": 12, "health": "ok", "exitCode": null,
+     "reason": null, "message": null, "log": [], "request": {"path": "..", "minutes": 15,
+     "compression": "Fast", "includeGenerated": false}, "dropFiles": 3}
+  ]
+}
+```
+
+`shares` is ordered by `createdUtc` ascending. `draft.drop` has the §7.4 drop shape.
+
+### 8.4 The backend loop must never stall running shares
+
+With several shares, a blocking call would starve the other children's stdout/stderr pipes
+(a full pipe blocks the launcher's health monitoring). Therefore:
+
+- **Folder picker** runs in a separate STA runspace (`[runspacefactory]::CreateRunspace()`,
+  `ApartmentState = 'STA'`, `BeginInvoke`); the HTTP request that opened it waits
+  *asynchronously*: the backend keeps the client socket, keeps serving other requests and
+  draining children, and answers the picker request when the runspace completes. Only one
+  picker at a time. (No compiled code; works on PowerShell 5.1.)
+- **Uploads**: `Copy-WsHttpBody` gets an optional `-OnChunk <scriptblock>` that the backend uses
+  to drain all children's output after every chunk.
+- All child output is drained in every loop iteration for every share.
+
+### 8.5 Front end
+
+- A tab bar (`role="tablist"`) above the card: one tab per share (label = name, plus a small
+  status dot: starting / active / stopping / ended / error) and a last tab **"+ Neue Freigabe"**
+  with the existing form (drop zone, folder, duration, Erweitert, Freigeben). The form shows
+  `limits.maxShares` and disables "Freigeben" with a hint when `running >= maxShares`.
+- After a successful start the new share's tab is selected. The selected tab survives page
+  reloads within the tab session (`sessionStorage`, key = build + shareId; never the token).
+- Renaming: a pencil button in the share view and double-click on the tab open an inline
+  text field; Enter/blur saves (`rename`), Escape cancels. Long names are truncated with an
+  ellipsis in the tab, full name in the `title`.
+- Per-share view = the v1 progress/active/stopping/ended/error views, using the share object.
+  Ended/error tabs get a "Tab schließen" button (`dismiss`); active tabs have "Freigabe beenden".
+- Header line: "N aktive Freigaben". "Beenden" asks for confirmation naming the number of
+  running shares that will be stopped.
+- Keyboard: tabs follow the ARIA tabs pattern (arrow keys move, Enter/Space selects).
+- Works at 360 px: the tab bar scrolls horizontally inside itself, no page-level horizontal scroll.
+- Token and reload: `app.js` stores the token from `location.hash` in `sessionStorage` (`ws.token`, this browser tab only, never `localStorage`/cookie/query string) before removing it from the address bar, so F5 keeps working; a hash token always replaces a stored one, and a 401 from `/api/state` deletes the stored token.

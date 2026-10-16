@@ -1,6 +1,7 @@
 ﻿#requires -Version 5.1
-# WorkspaceShare GUI backend (GUI_CONTRACT section 5): local HTTP server on 127.0.0.1 that serves gui\*
-# and starts/stops Share-Workspace.ps1 as a child process. Single-threaded loop, compile-free (no Add-Type).
+# WorkspaceShare GUI backend (GUI_CONTRACT sections 5, 7, 8): local HTTP server on 127.0.0.1 that serves gui\*
+# and runs several shares at once, each as its own Share-Workspace.ps1 child process. Single-threaded loop that
+# drains every child pipe in every iteration (also while an upload runs), compile-free (no Add-Type).
 [CmdletBinding()]
 param(
     [int]$Port = 0,
@@ -10,8 +11,10 @@ param(
     [string]$TestShareScript,
     [int64]$MaxDropBytes = 4GB,
     [int]$MaxDropFiles = 10000,
+    [int]$MaxShares = 5,
     [string]$DataRootOverride,
-    [string]$TestBuildId
+    [string]$TestBuildId,
+    [string]$TestPickerResult
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -34,6 +37,14 @@ if (-not [string]::IsNullOrEmpty($TestBuildId) -and $TestBuildId -cnotmatch '^[A
 }
 if ($MaxDropBytes -lt 1 -or $MaxDropFiles -lt 1) {
     [Console]::Error.WriteLine('Ungültige Drop-Limits.')
+    exit 10
+}
+if ($MaxShares -lt 1 -or $MaxShares -gt 10) {
+    [Console]::Error.WriteLine('Ungültiges -MaxShares (erlaubt: 1 bis 10).')
+    exit 10
+}
+if (-not [string]::IsNullOrEmpty($TestPickerResult) -and -not $TestMode) {
+    [Console]::Error.WriteLine('-TestPickerResult ist nur zusammen mit -TestMode erlaubt.')
     exit 10
 }
 if ($Port -lt 0 -or $Port -gt 65535) {
@@ -221,7 +232,15 @@ function Resolve-ExistingInstance {
     $phase = ''
     $resp = Invoke-LocalApi -Port ([int]$Inst.port) -Token ([string]$Inst.token) -Method 'GET' -Path '/api/state' -TimeoutMs 5000
     if ($null -ne $resp -and $resp.Status -eq 200) {
-        try { $phase = [string]((($resp.Body | ConvertFrom-Json)).phase) } catch { $phase = '' }
+        # v2 state: any share in starting/active/stopping counts as busy; v1 state: its single phase.
+        try {
+            $st = $resp.Body | ConvertFrom-Json
+            $runP = $st.PSObject.Properties['running']
+            $phaseP = $st.PSObject.Properties['phase']
+            if ($null -ne $runP) { if ([int]$runP.Value -gt 0) { $phase = 'active' } else { $phase = 'idle' } }
+            elseif ($null -ne $phaseP) { $phase = [string]$phaseP.Value }
+        }
+        catch { $phase = '' }
     }
     if ($phase -in @('idle', 'ended', 'error')) {
         # Nothing is shared: replace the old backend with this (newer) one.
@@ -257,20 +276,12 @@ function New-GuiToken {
     return ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
 }
 
-# ---------------------------------------------------------------- share state
+# ---------------------------------------------------------------- shares (GUI_CONTRACT section 8)
 
 $script:Platform = Get-WsPlatform
 $script:Caps = Get-WsCapabilities
-$script:Log = New-Object 'System.Collections.Generic.List[string]'
-$script:Proc = $null
-$script:Readers = @{ out = $null; err = $null }
-$script:Tasks = @{ out = $null; err = $null }
-$script:Eof = @{ out = $true; err = $true }
-$script:ExitSeen = $null
-$script:StopSw = $null
-$script:KillSent = $false
-$script:KnownUrl = $null
-$script:CopiedUrl = $null
+$script:Shares = New-Object 'System.Collections.Generic.List[object]'
+$script:ShareListCap = 20
 $script:LastPath = $null
 $script:QuitRequested = $false
 $script:QuitSw = $null
@@ -278,41 +289,79 @@ $script:QuitStopSent = $false
 $script:QuitKillSw = $null
 $script:Token = ''
 $script:BoundPort = 0
-$script:CurrentDrop = $null
+$script:CurrentDrop = $null      # draft drop of the "new share" form (no share owns it yet)
+$script:UploadBusy = $false
+$script:Picker = $null           # folder picker running in its own STA runspace (deferred HTTP answer)
+$script:ConnectionDeferred = $false
 $script:PendingDeletes = New-Object 'System.Collections.Generic.List[string]'
 $script:PendingSw = [Diagnostics.Stopwatch]::StartNew()
 $script:PathComparison = [StringComparison]::Ordinal
 if ($script:Platform -eq 'windows') { $script:PathComparison = [StringComparison]::OrdinalIgnoreCase }
 
-function New-ShareState {
+function New-Share {
+    param([string]$Id, [string]$Name, $Request, $Drop)
+    $dropFiles = $null
+    if ($null -ne $Drop) { $dropFiles = [int]$Drop.Files }
     return @{
-        phase = 'idle'; step = 0; total = 8; stepText = $null
+        id = $Id; name = $Name; createdUtc = [DateTime]::UtcNow.ToString('o')
+        phase = 'starting'; step = 0; total = 8; stepText = $null
         steps = (New-Object 'System.Collections.Generic.List[object]')
         url = $null; expiresUtc = $null; sizeBytes = $null; sha256 = $null
         remainingMinutes = $null; health = $null
         exitCode = $null; reason = $null; message = $null
-        request = $null; sessionPath = $null
-        stopRequested = $false; endedGot = $false
+        request = $Request; dropFiles = $dropFiles
+        log = (New-Object 'System.Collections.Generic.List[string]')
+        sessionPath = $null; stopRequested = $false; endedGot = $false
+        # runtime: child process, async line readers, timers
+        proc = $null
+        readers = @{ out = $null; err = $null }
+        tasks = @{ out = $null; err = $null }
+        eof = @{ out = $true; err = $true }
+        exitSeen = $null; stopSw = $null; killSent = $false
+        knownUrl = $null; copiedUrl = $null
+        drop = $Drop
     }
 }
-$script:Share = New-ShareState
+
+function Get-ShareById {
+    param([string]$Id)
+    foreach ($s in $script:Shares) { if ($s.id -ceq $Id) { return $s } }
+    return $null
+}
+
+function Test-ShareRunning {
+    param($Share)
+    return ($Share.phase -in @('starting', 'active', 'stopping'))
+}
+
+function Get-RunningCount {
+    $n = 0
+    foreach ($s in $script:Shares) { if (Test-ShareRunning $s) { $n++ } }
+    return $n
+}
+
+function Test-AnyChild {
+    foreach ($s in $script:Shares) { if ($null -ne $s.proc) { return $true } }
+    return $false
+}
 
 function Protect-Text {
+    # Redacts the links of every known share (and the GUI token) from a text.
     param([AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
     $urls = @()
-    if ($script:KnownUrl) { $urls = @([string]$script:KnownUrl) }
+    foreach ($s in $script:Shares) { if ($s.knownUrl) { $urls += [string]$s.knownUrl } }
     $safe = Protect-DiagnosticText -Text $Text -KnownSecretUrls $urls -SecretTokens @([string]$script:Token)
     if ($safe.Length -gt 2000) { $safe = $safe.Substring(0, 2000) }
     return $safe
 }
 
 function Add-LogLine {
-    param([AllowNull()][string]$Text)
+    param($Share, [AllowNull()][string]$Text)
     $safe = Protect-Text $Text
     if ($safe.Length -eq 0) { return }
-    $script:Log.Add($safe)
-    while ($script:Log.Count -gt 200) { $script:Log.RemoveAt(0) }
+    $Share.log.Add($safe)
+    while ($Share.log.Count -gt 200) { $Share.log.RemoveAt(0) }
 }
 
 function Write-ConsoleLog {
@@ -345,8 +394,8 @@ function ConvertTo-StrictInt {
 }
 
 function Set-ShareEvent {
-    param($Ev)
-    $s = $script:Share
+    param($Share, $Ev)
+    $s = $Share
     $type = [string](Get-EventProp $Ev 'type')
     switch ($type) {
         'start' { }
@@ -370,7 +419,7 @@ function Set-ShareEvent {
         }
         'ready' {
             $url = [string](Get-EventProp $Ev 'url')
-            if (-not [string]::IsNullOrEmpty($url)) { $script:KnownUrl = $url }
+            if (-not [string]::IsNullOrEmpty($url)) { $s.knownUrl = $url }
             if ($s.phase -eq 'stopping') { return }
             $s.url = $url
             $s.expiresUtc = ConvertTo-IsoText (Get-EventProp $Ev 'expiresUtc')
@@ -390,12 +439,12 @@ function Set-ShareEvent {
                 $previous = $s.health
                 $s.health = $state
                 $text = [string](Get-EventProp $Ev 'text')
-                if ($state -ne 'ok' -and $state -ne $previous -and $text) { Add-LogLine ('Verbindung: ' + $text) }
+                if ($state -ne 'ok' -and $state -ne $previous -and $text) { Add-LogLine $s ('Verbindung: ' + $text) }
             }
         }
         'warning' {
             $text = [string](Get-EventProp $Ev 'text')
-            if ($text) { Add-LogLine ('Warnung: ' + $text) }
+            if ($text) { Add-LogLine $s ('Warnung: ' + $text) }
         }
         'ended' {
             $s.endedGot = $true
@@ -411,23 +460,24 @@ function Set-ShareEvent {
 }
 
 function Receive-ChildLine {
-    param([string]$Line, [bool]$FromStdout)
+    param($Share, [string]$Line, [bool]$FromStdout)
     if ($Line.Length -eq 0) { return }
     if ($FromStdout -and $Line.StartsWith('@@WSEVENT@@ ', [StringComparison]::Ordinal)) {
         $ev = $null
         try { $ev = $Line.Substring(12) | ConvertFrom-Json } catch { $ev = $null }
         if ($null -ne $ev -and $null -ne $ev.PSObject.Properties['type']) {
-            try { Set-ShareEvent $ev } catch { Add-LogLine 'Ungültiges Ereignis vom Freigabeprozess ignoriert.' }
+            try { Set-ShareEvent $Share $ev } catch { Add-LogLine $Share 'Ungültiges Ereignis vom Freigabeprozess ignoriert.' }
             return
         }
     }
-    Add-LogLine $Line
+    Add-LogLine $Share $Line
 }
 
 function Stop-ChildTree {
-    $p = $script:Proc
+    param($Share)
+    $p = $Share.proc
     if ($null -eq $p) { return }
-    $script:KillSent = $true
+    $Share.killSent = $true
     if ($script:Platform -eq 'windows') {
         try {
             $tk = Join-Path $env:SystemRoot 'System32\taskkill.exe'
@@ -439,13 +489,15 @@ function Stop-ChildTree {
 }
 
 function Request-ShareStop {
-    if ($null -eq $script:Proc) { return }
-    $s = $script:Share
-    $s.stopRequested = $true
-    $s.phase = 'stopping'
-    if ($null -eq $script:StopSw) { $script:StopSw = [Diagnostics.Stopwatch]::StartNew() }
+    # Cooperative stop through stop.requested in the share's own session folder; before the session event
+    # there is no such folder yet, so the child tree is killed.
+    param($Share)
+    if ($null -eq $Share.proc) { return }
+    $Share.stopRequested = $true
+    $Share.phase = 'stopping'
+    if ($null -eq $Share.stopSw) { $Share.stopSw = [Diagnostics.Stopwatch]::StartNew() }
     $done = $false
-    $sp = $s.sessionPath
+    $sp = $Share.sessionPath
     if (-not [string]::IsNullOrWhiteSpace($sp) -and [IO.Path]::IsPathRooted($sp)) {
         try {
             if (Test-Path -LiteralPath $sp -PathType Container) {
@@ -455,12 +507,22 @@ function Request-ShareStop {
         }
         catch { $done = $false }
     }
-    if (-not $done) { Stop-ChildTree }
+    if (-not $done) { Stop-ChildTree $Share }
+}
+
+function Clear-ShareClipboard {
+    # Removes the copied link from the clipboard (only if it is still there).
+    param($Share)
+    $u = $Share.copiedUrl
+    if ([string]::IsNullOrEmpty([string]$u)) { return }
+    $Share.copiedUrl = $null
+    try { [void](Clear-WsClipboardText -Expected ([string]$u)) } catch { }
 }
 
 function Complete-Share {
-    $s = $script:Share
-    $proc = $script:Proc
+    param($Share)
+    $s = $Share
+    $proc = $s.proc
     $code = $null
     if ($s.endedGot -and $null -ne $s.exitCode) { $code = [int]$s.exitCode }
     else {
@@ -468,7 +530,7 @@ function Complete-Share {
         $s.exitCode = $code
     }
     $lastLog = $null
-    if ($script:Log.Count -gt 0) { $lastLog = $script:Log[$script:Log.Count - 1] }
+    if ($s.log.Count -gt 0) { $lastLog = $s.log[$s.log.Count - 1] }
     if ($code -eq 0) {
         $s.phase = 'ended'
     }
@@ -487,89 +549,127 @@ function Complete-Share {
     }
     $s.url = $null
     $s.remainingMinutes = $null
-    $script:KnownUrl = $null
+    $s.knownUrl = $null
     try { $proc.Dispose() } catch { }
-    $script:Proc = $null
-    $script:Tasks.out = $null; $script:Tasks.err = $null
-    $script:Readers.out = $null; $script:Readers.err = $null
-    $script:ExitSeen = $null
-    $script:StopSw = $null
-    $script:KillSent = $false
-    # The share is over: a drop folder that was shared is not needed any more.
-    if ($null -ne $script:CurrentDrop -and $script:CurrentDrop.InUse) { Remove-CurrentDrop }
+    $s.proc = $null
+    $s.tasks.out = $null; $s.tasks.err = $null
+    $s.readers.out = $null; $s.readers.err = $null
+    $s.exitSeen = $null
+    $s.stopSw = $null
+    $s.killSent = $false
+    Clear-ShareClipboard $s
+    # The share is over: the drop folder it owned is not needed any more.
+    if ($null -ne $s.drop) {
+        $d = $s.drop
+        $s.drop = $null
+        Remove-DropDirectory $d.Root
+    }
 }
 
-function Update-Child {
-    if ($null -eq $script:Proc) { return }
+function Update-ShareChild {
+    # Drains the stdout/stderr of one share (never blocks) and finalizes the share after the process exit.
+    param($Share)
+    $s = $Share
+    if ($null -eq $s.proc) { return }
     foreach ($which in @('out', 'err')) {
         $guard = 0
         while ($guard -lt 500) {
-            $task = $script:Tasks[$which]
+            $task = $s.tasks[$which]
             if ($null -eq $task -or -not $task.IsCompleted) { break }
             $guard++
             $line = $null
             if ($task.IsFaulted) { [void]$task.Exception }
             elseif (-not $task.IsCanceled) { $line = $task.Result }
             if ($null -eq $line) {
-                $script:Tasks[$which] = $null
-                $script:Eof[$which] = $true
+                $s.tasks[$which] = $null
+                $s.eof[$which] = $true
                 break
             }
-            Receive-ChildLine ([string]$line) ($which -eq 'out')
-            $script:Tasks[$which] = $script:Readers[$which].ReadLineAsync()
+            Receive-ChildLine $s ([string]$line) ($which -eq 'out')
+            $s.tasks[$which] = $s.readers[$which].ReadLineAsync()
         }
     }
-    if ($null -eq $script:Proc) { return }
+    if ($null -eq $s.proc) { return }
     $exited = $false
-    try { $exited = $script:Proc.HasExited } catch { $exited = $true }
+    try { $exited = $s.proc.HasExited } catch { $exited = $true }
     if ($exited) {
-        if ($null -eq $script:ExitSeen) { $script:ExitSeen = [Diagnostics.Stopwatch]::StartNew() }
+        if ($null -eq $s.exitSeen) { $s.exitSeen = [Diagnostics.Stopwatch]::StartNew() }
         # Grandchildren may keep the pipes open: give the streams a short grace period.
-        if (($script:Eof.out -and $script:Eof.err) -or $script:ExitSeen.ElapsedMilliseconds -gt 3000) {
-            Complete-Share
+        if (($s.eof.out -and $s.eof.err) -or $s.exitSeen.ElapsedMilliseconds -gt 3000) {
+            Complete-Share $s
         }
     }
-    elseif ($script:Share.phase -eq 'stopping' -and $null -ne $script:StopSw -and -not $script:KillSent -and $script:StopSw.Elapsed.TotalSeconds -gt 150) {
-        Add-LogLine 'Die Freigabe reagiert nicht auf die Stopp-Anforderung und wird beendet.'
-        Stop-ChildTree
+    elseif ($s.phase -eq 'stopping' -and $null -ne $s.stopSw -and -not $s.killSent -and $s.stopSw.Elapsed.TotalSeconds -gt 150) {
+        Add-LogLine $s 'Die Freigabe reagiert nicht auf die Stopp-Anforderung und wird beendet.'
+        Stop-ChildTree $s
     }
 }
 
-function Stop-ShareForShutdown {
-    # Blocking variant used on backend exit: cooperative stop, wait up to 120 s, then kill.
-    if ($null -eq $script:Proc) { return }
-    if (-not $script:Share.stopRequested) { try { Request-ShareStop } catch { } }
+function Update-AllChildren {
+    # Drains every share, every time. Never throws: it also runs as the upload hook and in wait loops.
+    foreach ($s in $script:Shares.ToArray()) {
+        if ($null -eq $s.proc) { continue }
+        try { Update-ShareChild $s }
+        catch { Write-ConsoleLog ('Freigabe ' + $s.id + ': ' + $_.Exception.Message) }
+    }
+}
+
+function Stop-SharesForShutdown {
+    # Blocking variant used on backend exit: cooperative stop of all shares, wait up to 120 s, then kill.
+    if (-not (Test-AnyChild)) { return }
+    foreach ($s in $script:Shares.ToArray()) {
+        if ($null -ne $s.proc -and -not $s.stopRequested) { try { Request-ShareStop $s } catch { } }
+    }
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($null -ne $script:Proc -and $sw.Elapsed.TotalSeconds -lt 120) {
-        Update-Child
-        if ($null -eq $script:Proc) { break }
+    while ((Test-AnyChild) -and $sw.Elapsed.TotalSeconds -lt 120) {
+        Update-AllChildren
+        if (-not (Test-AnyChild)) { break }
         Start-Sleep -Milliseconds 100
     }
-    if ($null -ne $script:Proc) {
-        Stop-ChildTree
+    if (Test-AnyChild) {
+        foreach ($s in $script:Shares.ToArray()) { if ($null -ne $s.proc) { Stop-ChildTree $s } }
         $sw2 = [Diagnostics.Stopwatch]::StartNew()
-        while ($null -ne $script:Proc -and $sw2.Elapsed.TotalSeconds -lt 10) {
-            Update-Child
-            if ($null -eq $script:Proc) { break }
+        while ((Test-AnyChild) -and $sw2.Elapsed.TotalSeconds -lt 10) {
+            Update-AllChildren
+            if (-not (Test-AnyChild)) { break }
             Start-Sleep -Milliseconds 100
         }
     }
 }
 
-function Get-StateObject {
-    $s = $script:Share
+function Remove-ShareFromList {
+    param($Share)
+    [void]$script:Shares.Remove($Share)
+    Clear-ShareClipboard $Share
+    if ($null -ne $Share.drop) {
+        $d = $Share.drop
+        $Share.drop = $null
+        Remove-DropDirectory $d.Root
+    }
+}
+
+function Invoke-ShareListCap {
+    # At most $ShareListCap listed shares: the oldest ended/error share is dismissed automatically.
+    while ($script:Shares.Count -ge $script:ShareListCap) {
+        $victim = $null
+        foreach ($s in $script:Shares) {
+            if ($s.phase -in @('ended', 'error')) { $victim = $s; break }
+        }
+        if ($null -eq $victim) { break }
+        Remove-ShareFromList $victim
+    }
+}
+
+function Get-ShareObject {
+    param($Share)
+    $s = $Share
     $steps = @()
     foreach ($st in $s.steps) { $steps += , ([ordered]@{ n = $st.n; text = $st.text }) }
     return [ordered]@{
-        v = 1
-        build = [string]$script:BuildId
+        id = $s.id
+        name = $s.name
+        createdUtc = $s.createdUtc
         phase = $s.phase
-        platform = $script:Platform
-        capabilities = [ordered]@{
-            folderPicker = [bool]$script:Caps.folderPicker
-            clipboard = [bool]$script:Caps.clipboard
-            openBrowser = [bool]$script:Caps.openBrowser
-        }
         step = $s.step
         total = $s.total
         stepText = $s.stepText
@@ -583,14 +683,73 @@ function Get-StateObject {
         exitCode = $s.exitCode
         reason = $s.reason
         message = $s.message
-        log = [string[]]$script:Log.ToArray()
+        log = [string[]]$s.log.ToArray()
         request = $s.request
-        drop = (Get-DropState)
-        limits = [ordered]@{ maxDropBytes = [int64]$MaxDropBytes; maxDropFiles = [int]$MaxDropFiles }
+        dropFiles = $s.dropFiles
     }
 }
 
-# ---------------------------------------------------------------- drop folder (GUI_CONTRACT section 7)
+function Get-StateObject {
+    $list = @()
+    foreach ($s in $script:Shares) { $list += , (Get-ShareObject $s) }
+    return [ordered]@{
+        v = 2
+        build = [string]$script:BuildId
+        platform = $script:Platform
+        capabilities = [ordered]@{
+            folderPicker = [bool]$script:Caps.folderPicker
+            clipboard = [bool]$script:Caps.clipboard
+            openBrowser = [bool]$script:Caps.openBrowser
+        }
+        limits = [ordered]@{ maxDropBytes = [int64]$MaxDropBytes; maxDropFiles = [int]$MaxDropFiles; maxShares = [int]$MaxShares }
+        running = [int](Get-RunningCount)
+        draft = [ordered]@{ drop = (Get-DropState) }
+        shares = $list
+    }
+}
+
+# ---------------------------------------------------------------- names (section 8.2)
+
+function ConvertTo-ShareName {
+    # Trimmed 1..60 characters without control characters; $null when invalid.
+    param($Value)
+    if ($Value -isnot [string]) { return $null }
+    foreach ($ch in $Value.ToCharArray()) { if ([char]::IsControl($ch)) { return $null } }
+    $t = $Value.Trim()
+    if ($t.Length -lt 1 -or $t.Length -gt 60) { return $null }
+    return $t
+}
+
+function Get-DefaultShareName {
+    # Dropped files: the single top-level entry, or "first +N"; a picked/typed folder: its leaf name.
+    param([string]$FullPath, $Drop)
+    $name = $null
+    if ($null -ne $Drop) {
+        $top = @($Drop.Top.ToArray())
+        if ($top.Count -eq 1) { $name = [string]$top[0] }
+        elseif ($top.Count -gt 1) {
+            $suffix = ' +' + ($top.Count - 1)
+            $first = [string]$top[0]
+            if ($first.Length + $suffix.Length -gt 60) { $first = $first.Substring(0, 60 - $suffix.Length) }
+            $name = $first + $suffix
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $trimmed = $FullPath.TrimEnd('\', '/')
+        $name = [IO.Path]::GetFileName($trimmed)
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = $FullPath }
+    }
+    $clean = New-Object System.Text.StringBuilder
+    foreach ($ch in $name.ToCharArray()) {
+        if ([char]::IsControl($ch)) { [void]$clean.Append('_') } else { [void]$clean.Append($ch) }
+    }
+    $name = $clean.ToString().Trim()
+    if ($name.Length -gt 60) { $name = $name.Substring(0, 60).Trim() }
+    if ($name.Length -eq 0) { $name = 'Freigabe' }
+    return $name
+}
+
+# ---------------------------------------------------------------- drop folder (GUI_CONTRACT sections 7 and 8)
 
 function Get-DropState {
     $d = $script:CurrentDrop
@@ -705,14 +864,27 @@ function New-ApiResult {
     return @{ Status = $Status; Body = $Body }
 }
 
-function Test-ShareBusyPhase {
-    return ($script:Share.phase -in @('starting', 'active', 'stopping'))
+function New-HexId {
+    param([int]$Bytes)
+    $b = New-Object byte[] $Bytes
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+    return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function New-ShareId {
+    $id = New-HexId 4
+    while ($null -ne (Get-ShareById $id)) { $id = New-HexId 4 }
+    return $id
 }
 
 function Invoke-ApiStart {
     param($Req)
-    if ($script:QuitRequested -or (Test-ShareBusyPhase)) {
-        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+    if ($script:QuitRequested) {
+        return (New-ApiResult 409 @{ error = 'WorkspaceShare wird gerade beendet.' })
+    }
+    if ((Get-RunningCount) -ge $MaxShares) {
+        return (New-ApiResult 409 @{ error = ('Es laufen bereits {0} Freigaben (Maximum). Bitte zuerst eine Freigabe beenden.' -f $MaxShares) })
     }
     $obj = $null
     try { $obj = $Req.Body | ConvertFrom-Json } catch { $obj = $null }
@@ -733,11 +905,11 @@ function Invoke-ApiStart {
     catch {
         return (New-ApiResult 400 @{ error = 'Der Ordner existiert nicht oder der Pfad ist ungültig.' })
     }
-    # Only the finished drop of this backend may be shared from inside the drops folder.
+    # Only the finished draft drop may be shared from inside the drops folder (shares own their drops).
     $useDrop = $false
     if (Test-IsInsidePath $fullPath $DropsRoot) {
         $d = $script:CurrentDrop
-        if ($null -ne $d -and $d.Finished -and -not $d.InUse -and (Test-SamePath $fullPath $d.Leaf)) { $useDrop = $true }
+        if ($null -ne $d -and $d.Finished -and -not $script:UploadBusy -and (Test-SamePath $fullPath $d.Leaf)) { $useDrop = $true }
         else { return (New-ApiResult 400 @{ error = 'Dieser Ordner ist nicht freigebbar.' }) }
     }
     $minutes = ConvertTo-StrictInt (Get-EventProp $obj 'minutes')
@@ -754,10 +926,23 @@ function Invoke-ApiStart {
     if ($include -isnot [bool]) {
         return (New-ApiResult 400 @{ error = 'Die Option "Build-Ordner einschließen" muss ein Ja/Nein-Wert sein.' })
     }
+    # Optional name chosen by the client; null/empty means "default name".
+    $name = $null
+    $nameValue = Get-EventProp $obj 'name'
+    if ($null -ne $nameValue -and -not ($nameValue -is [string] -and $nameValue.Trim().Length -eq 0)) {
+        $name = ConvertTo-ShareName $nameValue
+        if ($null -eq $name) {
+            return (New-ApiResult 400 @{ error = 'Der Name muss aus 1 bis 60 Zeichen ohne Steuerzeichen bestehen.' })
+        }
+    }
 
     if (-not (Test-Path -LiteralPath $ShareScript -PathType Leaf)) {
         return (New-ApiResult 500 @{ error = 'Share-Workspace.ps1 wurde nicht gefunden.' })
     }
+
+    $drop = $null
+    if ($useDrop) { $drop = $script:CurrentDrop }
+    if ($null -eq $name) { $name = Get-DefaultShareName $fullPath $drop }
 
     $argList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $ShareScript,
         '-Path', $fullPath, '-Minutes', [string]$minutes, '-Compression', [string]$compression)
@@ -779,20 +964,6 @@ function Invoke-ApiStart {
     $psi.StandardErrorEncoding = $encoding
     $psi.WorkingDirectory = $ToolRoot
 
-    # New share: reset every share field and the log.
-    $script:Share = New-ShareState
-    $script:Log.Clear()
-    $script:KnownUrl = $null
-    $script:KillSent = $false
-    $script:StopSw = $null
-    $script:ExitSeen = $null
-    $script:Share.request = [ordered]@{
-        path = $fullPath; minutes = [int]$minutes; compression = [string]$compression; includeGenerated = [bool]$include
-    }
-    $script:LastPath = $fullPath
-    $script:Share.phase = 'starting'
-    if ($useDrop) { $script:CurrentDrop.InUse = $true }
-
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     try {
@@ -802,32 +973,41 @@ function Invoke-ApiStart {
     }
     catch {
         try { $proc.Dispose() } catch { }
-        $script:Share.phase = 'error'
-        $script:Share.message = 'Der Freigabeprozess konnte nicht gestartet werden.'
-        if ($useDrop) { Remove-CurrentDrop }
         Write-ConsoleLog ('Start fehlgeschlagen: ' + $_.Exception.Message)
         return (New-ApiResult 500 @{ error = 'Der Freigabeprozess konnte nicht gestartet werden.' })
     }
-    $script:Proc = $proc
-    $script:Readers.out = $proc.StandardOutput
-    $script:Readers.err = $proc.StandardError
-    $script:Tasks.out = $proc.StandardOutput.ReadLineAsync()
-    $script:Tasks.err = $proc.StandardError.ReadLineAsync()
-    $script:Eof.out = $false
-    $script:Eof.err = $false
-    return (New-ApiResult 200 @{ ok = $true })
-}
 
-function Invoke-ApiStop {
-    if ($null -eq $script:Proc) {
-        return (New-ApiResult 409 @{ error = 'Es läuft keine Freigabe.' })
+    # The share now owns the drop; the draft form starts empty again.
+    if ($useDrop) { $script:CurrentDrop = $null }
+    else { $script:LastPath = $fullPath }
+    Invoke-ShareListCap
+    $request = [ordered]@{
+        path = $fullPath; minutes = [int]$minutes; compression = [string]$compression; includeGenerated = [bool]$include
     }
-    Request-ShareStop
+    $sh = New-Share (New-ShareId) $name $request $drop
+    $sh.proc = $proc
+    $sh.readers.out = $proc.StandardOutput
+    $sh.readers.err = $proc.StandardError
+    $sh.tasks.out = $proc.StandardOutput.ReadLineAsync()
+    $sh.tasks.err = $proc.StandardError.ReadLineAsync()
+    $sh.eof.out = $false
+    $sh.eof.err = $false
+    $script:Shares.Add($sh)
+    return (New-ApiResult 200 ([ordered]@{ ok = $true; shareId = $sh.id }))
+}
+
+function Invoke-ApiShareStop {
+    param($Share)
+    if ($Share.phase -in @('ended', 'error')) {
+        return (New-ApiResult 409 @{ error = 'Diese Freigabe ist bereits beendet.' })
+    }
+    if ($Share.phase -ne 'stopping' -and $null -ne $Share.proc) { Request-ShareStop $Share }
     return (New-ApiResult 200 @{ ok = $true })
 }
 
-function Invoke-ApiCopy {
-    $url = $script:Share.url
+function Invoke-ApiShareCopy {
+    param($Share)
+    $url = $Share.url
     if ([string]::IsNullOrEmpty([string]$url)) {
         return (New-ApiResult 409 @{ error = 'Es gibt keinen Link zum Kopieren.' })
     }
@@ -836,24 +1016,113 @@ function Invoke-ApiCopy {
     if (-not $ok) {
         return (New-ApiResult 500 @{ error = 'Der Link konnte nicht in die Zwischenablage kopiert werden.' })
     }
-    $script:CopiedUrl = [string]$url
+    $Share.copiedUrl = [string]$url
     return (New-ApiResult 200 @{ ok = $true })
 }
 
+function Invoke-ApiShareRename {
+    param($Share, $Req)
+    $obj = $null
+    try { $obj = $Req.Body | ConvertFrom-Json } catch { $obj = $null }
+    if ($null -eq $obj -or $obj -isnot [pscustomobject]) {
+        return (New-ApiResult 400 @{ error = 'Ungültige Anfrage (kein gültiges JSON-Objekt).' })
+    }
+    $name = ConvertTo-ShareName (Get-EventProp $obj 'name')
+    if ($null -eq $name) {
+        return (New-ApiResult 400 @{ error = 'Der Name muss aus 1 bis 60 Zeichen ohne Steuerzeichen bestehen.' })
+    }
+    $Share.name = $name
+    return (New-ApiResult 200 ([ordered]@{ ok = $true; name = $name }))
+}
+
+function Invoke-ApiShareDismiss {
+    param($Share)
+    if ($Share.phase -notin @('ended', 'error')) {
+        return (New-ApiResult 409 @{ error = 'Eine laufende Freigabe kann nicht geschlossen werden.' })
+    }
+    Remove-ShareFromList $Share
+    return (New-ApiResult 200 @{ ok = $true })
+}
+
+# The folder picker runs in its own STA runspace so the loop keeps draining the shares (section 8.4).
+# Test hook (-TestMode -TestPickerResult "<delayMs>:<path>"): wait and answer without opening a dialog.
+$script:PickerScript = @'
+param($Module, $Initial, $TestSpec)
+$ErrorActionPreference = 'Stop'
+if (-not [string]::IsNullOrEmpty($TestSpec)) {
+    $i = $TestSpec.IndexOf(':')
+    $delay = 0
+    $answer = ''
+    if ($i -ge 0) { [void][int]::TryParse($TestSpec.Substring(0, $i), [ref]$delay); $answer = $TestSpec.Substring($i + 1) }
+    Start-Sleep -Milliseconds $delay
+    return $answer
+}
+Import-Module $Module -Force
+Show-WsFolderPicker -InitialPath $Initial
+'@
+
 function Invoke-ApiPickFolder {
-    if (Test-ShareBusyPhase) {
-        return (New-ApiResult 409 @{ error = 'Während einer Freigabe kann kein Ordner gewählt werden.' })
+    # Returns an API result, or $null when the answer is deferred (the client socket now belongs to the picker).
+    param($Stream, $Client)
+    if ($script:QuitRequested) {
+        return (New-ApiResult 409 @{ error = 'WorkspaceShare wird gerade beendet.' })
     }
     if (-not $script:Caps.folderPicker) {
         return (New-ApiResult 501 @{ error = 'Die Ordnerauswahl wird auf diesem System nicht unterstützt.' })
     }
-    $picked = $null
-    try { $picked = Show-WsFolderPicker -InitialPath $script:LastPath } catch { $picked = $null }
-    if ([string]::IsNullOrWhiteSpace([string]$picked)) {
-        return (New-ApiResult 200 @{ cancelled = $true })
+    if ($null -ne $script:Picker) {
+        return (New-ApiResult 409 @{ error = 'Die Ordnerauswahl ist bereits geöffnet.' })
     }
-    $script:LastPath = [string]$picked
-    return (New-ApiResult 200 @{ path = [string]$picked })
+    $rs = $null
+    $ps = $null
+    $async = $null
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+        $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        $spec = ''
+        if ($TestMode -and -not [string]::IsNullOrEmpty($TestPickerResult)) { $spec = $TestPickerResult }
+        [void]$ps.AddScript($script:PickerScript).AddArgument((Join-Path $ScriptsDir 'WorkspaceShare.Platform.psm1')).AddArgument([string]$script:LastPath).AddArgument($spec)
+        $async = $ps.BeginInvoke()
+    }
+    catch {
+        Write-ConsoleLog ('Ordnerauswahl konnte nicht gestartet werden: ' + $_.Exception.Message)
+        if ($null -ne $ps) { try { $ps.Dispose() } catch { } }
+        if ($null -ne $rs) { try { $rs.Dispose() } catch { } }
+        return (New-ApiResult 500 @{ error = 'Die Ordnerauswahl konnte nicht geöffnet werden.' })
+    }
+    $script:Picker = @{ Rs = $rs; Ps = $ps; Async = $async; Stream = $Stream; Client = $Client }
+    $script:ConnectionDeferred = $true
+    return $null
+}
+
+function Update-Picker {
+    # Answers the waiting pick-folder request once the dialog runspace has finished.
+    $pk = $script:Picker
+    if ($null -eq $pk) { return }
+    if (-not $pk.Async.IsCompleted) { return }
+    $script:Picker = $null
+    $picked = $null
+    try {
+        $res = $pk.Ps.EndInvoke($pk.Async)
+        if ($null -ne $res -and $res.Count -gt 0) { $picked = [string]$res[$res.Count - 1] }
+    }
+    catch { $picked = $null }
+    try { $pk.Ps.Dispose() } catch { }
+    try { $pk.Rs.Close() } catch { }
+    try { $pk.Rs.Dispose() } catch { }
+    $body = $null
+    if ([string]::IsNullOrWhiteSpace($picked)) { $body = @{ cancelled = $true } }
+    else {
+        $script:LastPath = $picked
+        $body = @{ path = $picked }
+    }
+    try { Write-WsJsonResponse -Stream $pk.Stream -Status 200 -Object $body } catch { }
+    try { $pk.Stream.Dispose() } catch { }
+    try { $pk.Client.Close() } catch { }
 }
 
 function Invoke-ApiQuit {
@@ -862,14 +1131,12 @@ function Invoke-ApiQuit {
 }
 
 function Test-DropPhaseBusy {
-    return ($script:QuitRequested -or (Test-ShareBusyPhase))
+    # Drops work while shares run; only a backend that is shutting down, or an upload in progress, blocks them.
+    return ($script:QuitRequested -or $script:UploadBusy)
 }
 
 function New-DropId {
-    $bytes = New-Object byte[] 16
-    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    return (New-HexId 16)
 }
 
 function Get-RequestDropId {
@@ -885,7 +1152,7 @@ function Get-RequestDropId {
 
 function Invoke-ApiDropBegin {
     if (Test-DropPhaseBusy) {
-        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+        return (New-ApiResult 409 @{ error = 'Gerade läuft ein Upload oder WorkspaceShare wird beendet.' })
     }
     Remove-CurrentDrop
     $id = New-DropId
@@ -899,8 +1166,11 @@ function Invoke-ApiDropBegin {
     }
     $script:CurrentDrop = @{
         Id = $id; Root = $root; Leaf = [IO.Path]::GetFullPath($leaf)
-        Files = 0; Bytes = [int64]0; Finished = $false; InUse = $false
+        Files = 0; Bytes = [int64]0; Finished = $false
         Paths = (New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase))
+        # Top-level entries in upload order (first path segment), for the default share name.
+        Top = (New-Object 'System.Collections.Generic.List[string]')
+        TopSet = (New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase))
     }
     return (New-ApiResult 200 @{ dropId = $id })
 }
@@ -908,7 +1178,7 @@ function Invoke-ApiDropBegin {
 function Invoke-ApiDropFinish {
     param($Req)
     if (Test-DropPhaseBusy) {
-        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+        return (New-ApiResult 409 @{ error = 'Gerade läuft ein Upload oder WorkspaceShare wird beendet.' })
     }
     $id = Get-RequestDropId $Req
     $d = $script:CurrentDrop
@@ -925,7 +1195,7 @@ function Invoke-ApiDropFinish {
 function Invoke-ApiDropDiscard {
     param($Req)
     if (Test-DropPhaseBusy) {
-        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+        return (New-ApiResult 409 @{ error = 'Gerade läuft ein Upload oder WorkspaceShare wird beendet.' })
     }
     $id = Get-RequestDropId $Req
     $d = $script:CurrentDrop
@@ -967,6 +1237,7 @@ function Skip-RequestBody {
         $buf = New-Object byte[] 65536
         $sw = [Diagnostics.Stopwatch]::StartNew()
         while ($remaining -gt 0 -and $sw.Elapsed.TotalSeconds -lt 20) {
+            Update-AllChildren
             $Stream.ReadTimeout = 2000
             $want = $buf.Length
             if ($remaining -lt $want) { $want = [int]$remaining }
@@ -1035,7 +1306,7 @@ function Invoke-DropFileUpload {
         return
     }
     if (Test-DropPhaseBusy) {
-        Send-UploadReject $Stream $Client $Req 409 'Es läuft bereits eine Freigabe.'
+        Send-UploadReject $Stream $Client $Req 409 'Gerade läuft ein Upload oder WorkspaceShare wird beendet.'
         return
     }
     $q = Get-DropQueryValues $Req.Query
@@ -1119,9 +1390,11 @@ function Invoke-DropFileUpload {
 
     $failStatus = 0
     $failText = ''
+    $script:UploadBusy = $true
     try {
         try { $Client.ReceiveTimeout = 30000 } catch { }
-        Copy-WsHttpBody -Stream $Stream -Request $Req -Destination $fs -MaxBytes ([int64]$MaxDropBytes - [int64]$d.Bytes) -IdleTimeoutMs 30000
+        # OnChunk keeps every share's stdout/stderr pipe drained while the body streams in (section 8.4).
+        Copy-WsHttpBody -Stream $Stream -Request $Req -Destination $fs -MaxBytes ([int64]$MaxDropBytes - [int64]$d.Bytes) -IdleTimeoutMs 30000 -OnChunk $script:DrainChildren
         $fs.Flush()
     }
     catch {
@@ -1132,6 +1405,7 @@ function Invoke-DropFileUpload {
         Write-ConsoleLog ('Drop-Upload fehlgeschlagen (' + $failStatus + '): ' + $failText)
     }
     finally {
+        $script:UploadBusy = $false
         try { $fs.Dispose() } catch { if ($failStatus -eq 0) { $failStatus = 500 } }
     }
     if ($failStatus -ne 0) {
@@ -1145,6 +1419,8 @@ function Invoke-DropFileUpload {
     $d.Files = [int]$d.Files + 1
     $d.Bytes = [int64]$d.Bytes + $len
     [void]$d.Paths.Add($rel)
+    $topName = $segs[0]
+    if ($d.TopSet.Add($topName)) { $d.Top.Add($topName) }
     Write-WsJsonResponse -Stream $Stream -Status 200 -Object ([ordered]@{ ok = $true; bytes = $len })
 }
 
@@ -1175,8 +1451,26 @@ function Complete-RequestBody {
     return $Req
 }
 
+function Invoke-ShareRoute {
+    # /api/shares/<id>/<action>: unknown id -> 404, GET -> 405.
+    param($Req, $Stream, [string]$IdText, [string]$Action)
+    if ($Action -cnotin @('stop', 'copy', 'rename', 'dismiss')) { Send-ErrorJson $Stream 404; return }
+    if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
+    $sh = $null
+    if ($IdText -cmatch '^[0-9a-f]{8}$') { $sh = Get-ShareById $IdText }
+    if ($null -eq $sh) { Send-ErrorJson $Stream 404; return }
+    $result = $null
+    switch -CaseSensitive ($Action) {
+        'stop' { $result = Invoke-ApiShareStop $sh }
+        'copy' { $result = Invoke-ApiShareCopy $sh }
+        'rename' { $result = Invoke-ApiShareRename $sh $Req }
+        'dismiss' { $result = Invoke-ApiShareDismiss $sh }
+    }
+    Write-WsJsonResponse -Stream $Stream -Status $result.Status -Object $result.Body
+}
+
 function Invoke-Route {
-    param($Req, $Stream)
+    param($Req, $Stream, $Client)
     $isApi = $Req.Path.StartsWith('/api/', [StringComparison]::Ordinal)
     if ($isApi) {
         $chk = Test-WsRequestAllowed -Request $Req -Port $script:BoundPort -Token $script:Token -RequireToken
@@ -1202,6 +1496,11 @@ function Invoke-Route {
         return
     }
 
+    if ($Req.Path -cmatch '^/api/shares/([^/]+)/([^/]+)$') {
+        Invoke-ShareRoute $Req $Stream $Matches[1] $Matches[2]
+        return
+    }
+
     $result = $null
     switch -CaseSensitive ($Req.Path) {
         '/api/state' {
@@ -1210,19 +1509,13 @@ function Invoke-Route {
         }
         '/api/pick-folder' {
             if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
-            $result = Invoke-ApiPickFolder
+            $result = Invoke-ApiPickFolder $Stream $Client
+            # Deferred: the picker runspace answers on this socket later (Update-Picker).
+            if ($null -eq $result) { return }
         }
         '/api/start' {
             if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
             $result = Invoke-ApiStart $Req
-        }
-        '/api/stop' {
-            if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
-            $result = Invoke-ApiStop
-        }
-        '/api/copy' {
-            if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
-            $result = Invoke-ApiCopy
         }
         '/api/quit' {
             if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
@@ -1252,6 +1545,7 @@ function Invoke-Route {
 function Invoke-Connection {
     param($Client)
     $stream = $null
+    $script:ConnectionDeferred = $false
     try {
         $Client.ReceiveTimeout = 5000
         $Client.SendTimeout = 5000
@@ -1275,17 +1569,20 @@ function Invoke-Connection {
             }
             throw
         }
-        Invoke-Route $req $stream
+        Invoke-Route $req $stream $Client
     }
     catch {
         Write-ConsoleLog ('Anfrage fehlgeschlagen: ' + $_.Exception.Message)
-        if ($null -ne $stream) {
+        if ($null -ne $stream -and -not $script:ConnectionDeferred) {
             try { Send-ErrorJson $stream 500 } catch { }
         }
     }
     finally {
-        if ($null -ne $stream) { try { $stream.Dispose() } catch { } }
-        try { $Client.Close() } catch { }
+        # A deferred connection (folder picker) stays open; Update-Picker answers and closes it.
+        if (-not $script:ConnectionDeferred) {
+            if ($null -ne $stream) { try { $stream.Dispose() } catch { } }
+            try { $Client.Close() } catch { }
+        }
     }
 }
 
@@ -1301,6 +1598,7 @@ if ($TestMode) {
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 $script:BuildId = Get-BuildIdentity
 $script:Static = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+$script:DrainChildren = { Update-AllChildren }
 $ownsMutex = Enter-InstanceMutex $mutex 0
 if (-not $ownsMutex) {
     # A live instance of the same build -> only open it; an older idle one is replaced (Resolve-ExistingInstance).
@@ -1357,7 +1655,8 @@ try {
     while ($loopOn) {
         $busy = $false
         try {
-            Update-Child
+            Update-AllChildren
+            Update-Picker
             if ($script:PendingDeletes.Count -gt 0 -and $script:PendingSw.Elapsed.TotalSeconds -gt 5) {
                 $script:PendingSw.Restart()
                 Clear-PendingDeletes
@@ -1392,14 +1691,15 @@ try {
                 }
             }
             if ($script:QuitRequested) {
-                if ($null -eq $script:Proc) { $loopOn = $false }
+                if (-not (Test-AnyChild)) { $loopOn = $false }
                 elseif (-not $script:QuitStopSent) {
+                    # Quit stops every running share (cooperatively; killed when there is no session yet).
                     $script:QuitStopSent = $true
                     $script:QuitSw = [Diagnostics.Stopwatch]::StartNew()
-                    Request-ShareStop
+                    foreach ($qs in $script:Shares.ToArray()) { if ($null -ne $qs.proc) { Request-ShareStop $qs } }
                 }
                 elseif ($null -eq $script:QuitKillSw -and $script:QuitSw.Elapsed.TotalSeconds -gt 120) {
-                    Stop-ChildTree
+                    foreach ($qs in $script:Shares.ToArray()) { if ($null -ne $qs.proc) { Stop-ChildTree $qs } }
                     $script:QuitKillSw = [Diagnostics.Stopwatch]::StartNew()
                 }
                 elseif ($null -ne $script:QuitKillSw -and $script:QuitKillSw.Elapsed.TotalSeconds -gt 10) {
@@ -1420,9 +1720,20 @@ catch {
     $exitCode = 1
 }
 finally {
-    try { Stop-ShareForShutdown } catch { }
-    try { Remove-CurrentDrop; Clear-PendingDeletes } catch { }
-    if ($script:CopiedUrl) { try { [void](Clear-WsClipboardText -Expected $script:CopiedUrl) } catch { } }
+    try { Stop-SharesForShutdown } catch { }
+    try {
+        Remove-CurrentDrop
+        foreach ($fs1 in $script:Shares.ToArray()) {
+            if ($null -ne $fs1.drop) { $dd = $fs1.drop; $fs1.drop = $null; Remove-DropDirectory $dd.Root }
+            Clear-ShareClipboard $fs1
+        }
+        Clear-PendingDeletes
+    }
+    catch { }
+    if ($null -ne $script:Picker) {
+        try { $script:Picker.Stream.Dispose() } catch { }
+        try { $script:Picker.Client.Close() } catch { }
+    }
     if ($null -ne $listener) { try { $listener.Stop() } catch { } }
     if ($instanceWritten) {
         $inst = Read-InstanceFile $InstanceFile

@@ -13,10 +13,11 @@
 <main class="card" id="card">
   <header class="card-head">
     <img class="logo" src="favicon.svg" alt="" width="32" height="32">
-    <div>
+    <div class="head-title">
       <h1>WorkspaceShare</h1>
       <p class="sub">Ordner als ZIP über einen geheimen Link freigeben</p>
     </div>
+    <p id="head-count" class="head-count" hidden></p>
   </header>
 
   <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -39,147 +40,187 @@
     <p class="muted"><span class="spinner" aria-hidden="true"></span> Verbinde mit WorkspaceShare …</p>
   </section>
 
-  <!-- Form: idle / ended / error -->
-  <section id="view-form" class="view" hidden>
-    <div id="ended-box" class="box box-info" hidden>
-      <p class="box-title">Freigabe beendet</p>
-      <p id="ended-text" class="box-text"></p>
+  <!-- Tab bar: one tab per share plus "+ Neue Freigabe" (built by app.js) -->
+  <div id="tabbar" class="tabbar" hidden>
+    <div id="tablist" class="tablist" role="tablist" aria-label="Freigaben"></div>
+  </div>
+
+  <div id="panel" role="tabpanel" aria-labelledby="tab-new" hidden>
+
+    <!-- Name of the selected share, with inline rename -->
+    <div id="share-head" class="share-head" hidden>
+      <div id="name-view" class="name-view">
+        <h2 id="share-title" class="share-title"></h2>
+        <button type="button" id="btn-rename" class="iconbtn" aria-label="Umbenennen" title="Umbenennen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3z"/>
+            <path d="M14.5 7.5l3 3"/>
+          </svg>
+        </button>
+      </div>
+      <form id="rename-form" class="rename-form" novalidate autocomplete="off" hidden>
+        <label for="rename-input" class="sr-only">Name der Freigabe</label>
+        <input type="text" id="rename-input" maxlength="60" spellcheck="false" autocomplete="off">
+        <p class="rename-hint">Enter speichert, Esc bricht ab.</p>
+      </form>
+      <p id="rename-error" class="inline-error" role="alert" hidden></p>
     </div>
 
-    <div id="error-box" class="box box-error" role="alert" hidden>
-      <p id="error-title" class="box-title"></p>
-      <p id="error-hint" class="box-text"></p>
-      <p id="error-message" class="box-text"></p>
-      <details id="error-details" class="details" hidden>
-        <summary>Details</summary>
-        <pre id="error-log" class="log"></pre>
-      </details>
-    </div>
-
-    <!-- Drag & drop of files / folders -->
-    <div class="dropbox" role="group" aria-label="Dateien ablegen">
-      <div id="dropzone" class="dropzone">
-        <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-          <path d="M12 15V4"/>
-          <path d="M7.5 8.5 12 4l4.5 4.5"/>
-          <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
-        </svg>
-        <p class="dz-text">Dateien oder Ordner hierher ziehen</p>
-        <button type="button" id="btn-files" class="btn btn-secondary">Dateien auswählen…</button>
-        <input type="file" id="file-input" multiple hidden tabindex="-1">
-      </div>
-
-      <div id="upload" class="upload" hidden>
-        <p id="upload-title" class="upload-title">Dateien werden hochgeladen …</p>
-        <progress id="upload-progress" class="progress" max="1000" value="0" aria-labelledby="upload-title"></progress>
-        <p id="upload-file" class="upload-line"></p>
-        <p id="upload-bytes" class="upload-line muted"></p>
-        <div class="actions">
-          <button type="button" id="btn-upload-cancel" class="btn btn-secondary">Abbrechen</button>
+    <!-- New share: form with drop zone -->
+    <section id="view-form" class="view" hidden>
+      <!-- Drag & drop of files / folders -->
+      <div class="dropbox" role="group" aria-label="Dateien ablegen">
+        <div id="dropzone" class="dropzone">
+          <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M12 15V4"/>
+            <path d="M7.5 8.5 12 4l4.5 4.5"/>
+            <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
+          </svg>
+          <p class="dz-text">Dateien oder Ordner hierher ziehen</p>
+          <button type="button" id="btn-files" class="btn btn-secondary">Dateien auswählen…</button>
+          <input type="file" id="file-input" multiple hidden tabindex="-1">
         </div>
-      </div>
 
-      <p id="drop-status" class="dz-status" role="status" aria-live="polite" aria-atomic="true"></p>
-      <p id="drop-error" class="inline-error" role="alert" hidden></p>
-    </div>
-
-    <form id="form" novalidate autocomplete="off">
-      <div class="field">
-        <label for="folder">Ordner</label>
-        <div class="row">
-          <input type="text" id="folder" name="folder" class="grow" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="C:\Projekte\MeinOrdner">
-          <button type="button" id="btn-pick" class="btn btn-secondary" hidden>Ordner wählen…</button>
-        </div>
-        <div id="drop-info" class="drop-info" hidden>
-          <span id="drop-summary" class="drop-summary"></span>
-          <button type="button" id="btn-drop-remove" class="btn btn-secondary">Entfernen</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label for="minutes">Dauer der Freigabe</label>
-        <select id="minutes" name="minutes">
-          <option value="15">15 Min.</option>
-          <option value="30">30 Min.</option>
-          <option value="60">1 Std.</option>
-          <option value="120">2 Std.</option>
-          <option value="240" selected>4 Std.</option>
-          <option value="480">8 Std.</option>
-          <option value="1440">24 Std.</option>
-        </select>
-      </div>
-
-      <details class="details" id="advanced">
-        <summary>Erweitert</summary>
-        <div class="details-body">
-          <div class="field">
-            <label for="compression">Kompression</label>
-            <select id="compression" name="compression">
-              <option value="Fast" selected>Schnell (Standard)</option>
-              <option value="Store">Ohne Kompression</option>
-            </select>
-          </div>
-          <div class="check">
-            <input type="checkbox" id="include-generated" name="includeGenerated">
-            <label for="include-generated">Build-/Cache-Ordner einschließen</label>
+        <div id="upload" class="upload" hidden>
+          <p id="upload-title" class="upload-title">Dateien werden hochgeladen …</p>
+          <progress id="upload-progress" class="progress" max="1000" value="0" aria-labelledby="upload-title"></progress>
+          <p id="upload-file" class="upload-line"></p>
+          <p id="upload-bytes" class="upload-line muted"></p>
+          <div class="actions">
+            <button type="button" id="btn-upload-cancel" class="btn btn-secondary">Abbrechen</button>
           </div>
         </div>
+
+        <p id="drop-status" class="dz-status" role="status" aria-live="polite" aria-atomic="true"></p>
+        <p id="drop-error" class="inline-error" role="alert" hidden></p>
+      </div>
+
+      <form id="form" novalidate autocomplete="off">
+        <div class="field">
+          <label for="folder">Ordner</label>
+          <div class="row">
+            <input type="text" id="folder" name="folder" class="grow" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="C:\Projekte\MeinOrdner">
+            <button type="button" id="btn-pick" class="btn btn-secondary" hidden>Ordner wählen…</button>
+          </div>
+          <div id="drop-info" class="drop-info" hidden>
+            <span id="drop-summary" class="drop-summary"></span>
+            <button type="button" id="btn-drop-remove" class="btn btn-secondary">Entfernen</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="name-input">Name (optional)</label>
+          <input type="text" id="name-input" name="name" maxlength="60" spellcheck="false" autocomplete="off" placeholder="Wird automatisch vergeben">
+        </div>
+
+        <div class="field">
+          <label for="minutes">Dauer der Freigabe</label>
+          <select id="minutes" name="minutes">
+            <option value="15">15 Min.</option>
+            <option value="30">30 Min.</option>
+            <option value="60">1 Std.</option>
+            <option value="120">2 Std.</option>
+            <option value="240" selected>4 Std.</option>
+            <option value="480">8 Std.</option>
+            <option value="1440">24 Std.</option>
+          </select>
+        </div>
+
+        <details class="details" id="advanced">
+          <summary>Erweitert</summary>
+          <div class="details-body">
+            <div class="field">
+              <label for="compression">Kompression</label>
+              <select id="compression" name="compression">
+                <option value="Fast" selected>Schnell (Standard)</option>
+                <option value="Store">Ohne Kompression</option>
+              </select>
+            </div>
+            <div class="check">
+              <input type="checkbox" id="include-generated" name="includeGenerated">
+              <label for="include-generated">Build-/Cache-Ordner einschließen</label>
+            </div>
+          </div>
+        </details>
+
+        <p id="form-error" class="inline-error" role="alert" hidden></p>
+        <p id="limit-hint" class="hint" hidden></p>
+
+        <button type="submit" id="btn-start" class="btn btn-primary btn-block">Freigeben</button>
+      </form>
+    </section>
+
+    <!-- Share: starting -->
+    <section id="view-progress" class="view" hidden>
+      <h3 class="view-title">Freigabe wird vorbereitet</h3>
+      <ol id="steps" class="steps"></ol>
+      <p id="step-current" class="step-current"></p>
+      <div class="actions">
+        <button type="button" id="btn-cancel" class="btn btn-secondary">Abbrechen</button>
+      </div>
+    </section>
+
+    <!-- Share: active -->
+    <section id="view-active" class="view" hidden>
+      <h3 class="view-title">Freigabe aktiv</h3>
+      <p id="shared-from" class="shared-from" hidden></p>
+      <div class="field">
+        <label for="share-url">Download-Link</label>
+        <input type="text" id="share-url" class="url-input" readonly spellcheck="false">
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-copy" class="btn btn-primary">Link kopieren</button>
+      </div>
+      <p id="copy-error" class="inline-error" role="alert" hidden></p>
+      <p class="hint">Der Link ist geheim: Jeder, der ihn hat, kann die Datei herunterladen.</p>
+
+      <dl class="facts">
+        <div class="fact"><dt>Aktiv bis</dt><dd id="fact-until">–</dd></div>
+        <div class="fact"><dt>Verbleibend</dt><dd id="fact-remaining">–</dd></div>
+        <div class="fact"><dt>Archivgröße</dt><dd id="fact-size">–</dd></div>
+        <div class="fact"><dt>Verbindung</dt><dd><span id="health-dot" class="dot dot-none" aria-hidden="true"></span><span id="health-text">–</span></dd></div>
+      </dl>
+
+      <details class="details">
+        <summary>SHA-256</summary>
+        <p id="fact-sha" class="mono"></p>
       </details>
 
-      <p id="form-error" class="inline-error" role="alert" hidden></p>
+      <div class="actions">
+        <button type="button" id="btn-stop" class="btn btn-danger">Freigabe beenden</button>
+      </div>
+    </section>
 
-      <button type="submit" id="btn-start" class="btn btn-primary btn-block">Freigeben</button>
-    </form>
-  </section>
+    <!-- Share: stopping -->
+    <section id="view-stopping" class="view" hidden>
+      <p class="busy"><span class="spinner" aria-hidden="true"></span> Freigabe wird beendet …</p>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" disabled>Bitte warten …</button>
+      </div>
+    </section>
 
-  <!-- Progress: starting -->
-  <section id="view-progress" class="view" hidden>
-    <h2>Freigabe wird vorbereitet</h2>
-    <ol id="steps" class="steps"></ol>
-    <p id="step-current" class="step-current"></p>
-    <div class="actions">
-      <button type="button" id="btn-cancel" class="btn btn-secondary">Abbrechen</button>
-    </div>
-  </section>
+    <!-- Share: ended / error -->
+    <section id="view-done" class="view" hidden>
+      <div id="ended-box" class="box box-info" hidden>
+        <p class="box-title">Freigabe beendet</p>
+        <p id="ended-text" class="box-text"></p>
+      </div>
 
-  <!-- Share: active -->
-  <section id="view-active" class="view" hidden>
-    <h2>Freigabe aktiv</h2>
-    <p id="shared-from" class="shared-from" hidden></p>
-    <div class="field">
-      <label for="share-url">Download-Link</label>
-      <input type="text" id="share-url" class="url-input" readonly spellcheck="false">
-    </div>
-    <div class="actions">
-      <button type="button" id="btn-copy" class="btn btn-primary">Link kopieren</button>
-    </div>
-    <p id="copy-error" class="inline-error" role="alert" hidden></p>
-    <p class="hint">Der Link ist geheim: Jeder, der ihn hat, kann die Datei herunterladen.</p>
+      <div id="error-box" class="box box-error" role="alert" hidden>
+        <p id="error-title" class="box-title"></p>
+        <p id="error-hint" class="box-text"></p>
+        <p id="error-message" class="box-text"></p>
+        <details id="error-details" class="details" hidden>
+          <summary>Details</summary>
+          <pre id="error-log" class="log"></pre>
+        </details>
+      </div>
 
-    <dl class="facts">
-      <div class="fact"><dt>Aktiv bis</dt><dd id="fact-until">–</dd></div>
-      <div class="fact"><dt>Verbleibend</dt><dd id="fact-remaining">–</dd></div>
-      <div class="fact"><dt>Archivgröße</dt><dd id="fact-size">–</dd></div>
-      <div class="fact"><dt>Verbindung</dt><dd><span id="health-dot" class="dot dot-none" aria-hidden="true"></span><span id="health-text">–</span></dd></div>
-    </dl>
-
-    <details class="details">
-      <summary>SHA-256</summary>
-      <p id="fact-sha" class="mono"></p>
-    </details>
-
-    <div class="actions">
-      <button type="button" id="btn-stop" class="btn btn-danger">Freigabe beenden</button>
-    </div>
-  </section>
-
-  <!-- Stopping -->
-  <section id="view-stopping" class="view" hidden>
-    <p class="busy"><span class="spinner" aria-hidden="true"></span> Freigabe wird beendet …</p>
-    <div class="actions">
-      <button type="button" class="btn btn-secondary" disabled>Bitte warten …</button>
-    </div>
-  </section>
+      <div class="actions">
+        <button type="button" id="btn-dismiss" class="btn btn-primary">Tab schließen</button>
+      </div>
+    </section>
+  </div>
 
   <footer class="card-foot" id="foot">
     <button type="button" id="btn-quit" class="linkbtn">Beenden</button>

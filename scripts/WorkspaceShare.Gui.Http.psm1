@@ -10,6 +10,7 @@
 # With -HeadersOnly the body is left on the stream (ContentLength / BodyPrefix describe it) and
 # Copy-WsHttpBody streams it to a destination (GUI_CONTRACT section 7.3):
 #   400 stream ended early / no Content-Length, 408 idle timeout, 413 body above MaxBytes
+# Copy-WsHttpBody -OnChunk <scriptblock> is invoked after every chunk read from the stream (section 8.4).
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -168,14 +169,16 @@ function Read-WsHttpRequest {
 function Copy-WsHttpBody {
     # Copies exactly Request.ContentLength bytes (BodyPrefix first, then the stream, 64 KiB chunks) to Destination.
     # Never reads past ContentLength. Failures carry Data['WsHttpStatus']: 400 / 408 / 413. Errors of the
-    # destination stream are not translated.
+    # destination stream are not translated. OnChunk (GUI_CONTRACT 8.4) runs after every chunk that was read from
+    # the stream and written to the destination; an exception it throws propagates to the caller unchanged.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.IO.Stream]$Stream,
         [Parameter(Mandatory)]$Request,
         [Parameter(Mandatory)][System.IO.Stream]$Destination,
         [int64]$MaxBytes = [int64]::MaxValue,
-        [int]$IdleTimeoutMs = 30000
+        [int]$IdleTimeoutMs = 30000,
+        [scriptblock]$OnChunk
     )
     $total = [int64]$Request.ContentLength
     if ($total -lt 0) { throw (New-WsHttpError 400 'Content-Length is required.') }
@@ -200,6 +203,7 @@ function Copy-WsHttpBody {
         if ($n -le 0) { throw (New-WsHttpError 400 'Incomplete request body.') }
         $Destination.Write($buffer, 0, $n)
         $done += $n
+        if ($null -ne $OnChunk) { $null = & $OnChunk }
     }
 }
 

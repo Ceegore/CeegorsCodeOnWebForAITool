@@ -1,4 +1,4 @@
-# WorkspaceShare 3.2
+# WorkspaceShare 3.3
 
 Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüfter ZIP64-Snapshot über einen geheimen Cloudflare-Quick-Tunnel-Link.
 
@@ -8,10 +8,10 @@ Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüf
 
 Du hast zwei Möglichkeiten:
 
-**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.2.1.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
+**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.3.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
 
 ```powershell
-Get-FileHash .\WorkspaceShare-3.2.1.zip
+Get-FileHash .\WorkspaceShare-3.3.0.zip
 ```
 
 Entpacke das ZIP in einen lokalen Ordner, z. B. `C:\Tools\WorkspaceShare`. Es enthält bereits die geprüften Hilfsprogramme (cloudflared, miniserve, gitleaks, 7-Zip) und das Lockfile.
@@ -47,13 +47,16 @@ Das legt die Verknüpfung „WorkspaceShare“ auf dem Desktop und im Startmenü
 3. Dauer wählen und auf „Freigeben“ klicken.
 4. Nach etwa einer Minute erscheint der Link. Klicke auf „Link kopieren“ und schicke ihn an den Empfänger – oder füge ihn in den KI-Web-Chat ein.
 
+Mehrere Freigaben können gleichzeitig laufen (bis zu 5), jede mit eigenem Tab; über „+ Neue Freigabe“ startest du eine weitere. Der Tab-Name kommt standardmäßig von den geteilten Dateien (eine Datei: ihr Name; mehrere: z. B. „Bericht.pdf +2“; ein Ordner: sein Name) und lässt sich mit dem Stift-Symbol oder Doppelklick auf den Tab ändern – der Name ist nur eine Beschriftung, Link und ZIP ändern sich nicht. Im Formular kannst du optional das Feld „Name (optional)“ ausfüllen, um den Namen gleich festzulegen.
+
 Der Empfänger lädt über den Link eine ZIP-Datei herunter. Auf seiner Seite muss nichts installiert werden.
 
 ### 4. Beenden
 
-- „Freigabe beenden“ beendet die laufende Freigabe sofort.
+- „Freigabe beenden“ beendet nur die Freigabe des aktuellen Tabs sofort.
+- „Tab schließen“ entfernt eine beendete Freigabe aus der Liste.
 - Ohne Eingriff endet sie automatisch nach der gewählten Zeit.
-- „Beenden“ unten auf der Seite schließt WorkspaceShare.
+- „Beenden“ unten auf der Seite beendet nach Bestätigung alle laufenden Freigaben und schließt WorkspaceShare.
 - Per Drag & Drop übernommene Dateien werden in einen temporären, privaten Ordner kopiert und gelöscht, sobald die Freigabe endet.
 
 ### Was passiert im Hintergrund?
@@ -79,6 +82,7 @@ Parameter, Ablauf und Fehlercodes stehen in den Abschnitten „Workspace freigeb
 - Step 2: run `Install-GuiShortcut.ps1` once to create the "WorkspaceShare" shortcut.
 - Step 3: double-click the shortcut, drop files or folders in, choose the duration, click "Freigeben" and copy the link.
 - Step 4: the recipient downloads a ZIP from the link and installs nothing. The share ends automatically or with "Freigabe beenden".
+- Several shares can run at once (up to 5), each in its own tab that you can rename; reloading the page with F5 works.
 - Releases: https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases
 - The UI labels and the rest of this README are in German.
 
@@ -215,6 +219,8 @@ Direkter Start ohne Verknüpfung (öffnet den Browser automatisch):
 powershell.exe -NoProfile -STA -File .\Start-WorkspaceShareGui.ps1
 ```
 
+Nach einem Update ersetzt ein Start der Verknüpfung eine ungenutzte alte Instanz automatisch; läuft gerade eine Freigabe, läuft sie in der alten Version weiter, bis sie endet.
+
 Bedienung:
 
 1. Dateien oder Ordner per Drag & Drop in das Feld ziehen, „Dateien auswählen…“ klicken, „Ordner wählen…“ klicken oder den Pfad eintippen.
@@ -222,9 +228,9 @@ Bedienung:
 3. Optional „Erweitert“ öffnen (Kompression, Build-/Cache-Ordner).
 4. „Freigeben“ klicken. Der Fortschritt zeigt 8 Schritte.
 5. Danach den Link mit „Link kopieren“ übernehmen. Er wird ohne Windows-Zwischenablageverlauf und ohne Cloud-Zwischenablage kopiert.
-6. „Freigabe beenden“ beendet die laufende Freigabe.
+6. „Freigabe beenden“ beendet die Freigabe des aktuellen Tabs.
 
-„Beenden“ unten auf der Seite beendet eine laufende Freigabe und schließt den GUI-Dienst.
+„Beenden“ unten auf der Seite beendet nach Bestätigung alle laufenden Freigaben und schließt den GUI-Dienst.
 
 ### Dateien und Ordner per Drag & Drop
 
@@ -238,7 +244,11 @@ Sicherheitshinweise:
 
 - Die Seite ist nur vom eigenen PC aus erreichbar (`127.0.0.1`) und durch ein zufälliges Sitzungs-Token geschützt. Das Token steht in der Adresse und wird nach dem Laden aus der Adresszeile entfernt.
 - Das Schließen des Browser-Tabs beendet eine laufende Freigabe **nicht**. Über die Verknüpfung erneut öffnen; die GUI verbindet sich mit dem laufenden Dienst.
-- Endet der GUI-Dienst, wird eine laufende Freigabe automatisch gestoppt.
+- Endet der GUI-Dienst, werden alle laufenden Freigaben automatisch gestoppt.
+
+### Mehrere Freigaben und Tabs
+
+Jede Freigabe hat einen eigenen Tab; der letzte Tab „+ Neue Freigabe“ öffnet das Formular für eine weitere. Maximal 5 Freigaben laufen gleichzeitig, weil jede einen eigenen Cloudflare-Quick-Tunnel öffnet. Beendete Tabs bleiben sichtbar, bis du sie mit „Tab schließen“ entfernst; es werden höchstens 20 Einträge angezeigt, der älteste beendete Tab wird dann automatisch entfernt. Mit F5 lädst du die Seite jederzeit neu, ohne die Verknüpfung erneut zu öffnen; der Zugriffsschlüssel wird nur für diesen Browser-Tab gespeichert. Nach dem Schließen des Browser-Tabs öffnest du die Oberfläche über die Verknüpfung erneut.
 
 Tests (ohne Netzwerk):
 
@@ -395,8 +405,8 @@ Nach vollständig bestandener Abnahme:
 Ergebnis:
 
 ```text
-dist\WorkspaceShare-3.2.1.zip
-dist\WorkspaceShare-3.2.1.zip.sha256.txt
+dist\WorkspaceShare-3.3.0.zip
+dist\WorkspaceShare-3.3.0.zip.sha256.txt
 ```
 
 Das ZIP enthält außerdem die `LICENSE` des Projekts.

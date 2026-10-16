@@ -1,5 +1,6 @@
 ﻿#requires -Version 5.1
-# End-to-end tests of Start-WorkspaceShareGui.ps1 with tests\Fake-WorkspaceShare.ps1 (no network, no tunnel).
+# End-to-end tests of Start-WorkspaceShareGui.ps1 (contract v2: several shares at the same time) with
+# tests\Fake-WorkspaceShare.ps1 (no network, no tunnel).
 # Exit: 0 = all passed, 1 = failures, 42 = environment blocked (CodeIntegrity events 3033/3077).
 [CmdletBinding()]
 param([string]$ToolRoot)
@@ -111,13 +112,107 @@ function Test-PidAlive {
     return ($null -ne (Get-Process -Id ([int]$ProcessId) -ErrorAction SilentlyContinue))
 }
 
-function Get-FakePid {
+function Get-Fakes {
+    # All fake share processes a backend has started (the fake writes fake-<name>-<pid>.pid plus .session/.path).
     param($B)
-    if (-not (Test-Path -LiteralPath $B.PidFile)) { return $null }
-    $t = ([IO.File]::ReadAllText($B.PidFile)).Trim()
-    $n = 0
-    if ([int]::TryParse($t, [ref]$n)) { return $n }
+    $list = @()
+    $dir = Split-Path -Parent $B.PidFile
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter ('fake-' + $B.Name + '-*.pid') -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc, Name)
+    foreach ($f in $files) {
+        $n = 0
+        $text = ''
+        try { $text = ([IO.File]::ReadAllText($f.FullName)).Trim() } catch { continue }
+        if (-not [int]::TryParse($text, [ref]$n)) { continue }
+        $sessionFile = $f.FullName + '.session'
+        $pathFile = $f.FullName + '.path'
+        $session = $null
+        $sharePath = $null
+        if (Test-Path -LiteralPath $sessionFile) { $session = ([IO.File]::ReadAllText($sessionFile)).Trim() }
+        if (Test-Path -LiteralPath $pathFile) { $sharePath = ([IO.File]::ReadAllText($pathFile)).Trim() }
+        $list += , ([pscustomobject]@{ Pid = $n; Session = $session; Path = $sharePath; File = $f.FullName })
+    }
+    return $list
+}
+
+function Get-FakePid {
+    # Process id of the newest fake share of a backend.
+    param($B)
+    $all = @(Get-Fakes $B)
+    if ($all.Count -eq 0) { return $null }
+    return $all[$all.Count - 1].Pid
+}
+
+function Get-FakeByPath {
+    param($B, [string]$Path)
+    foreach ($f in @(Get-Fakes $B)) { if ($f.Path -ceq $Path) { return $f } }
     return $null
+}
+
+function Get-ShareFromState {
+    param($State, [string]$Id)
+    if ($null -eq $State) { return $null }
+    foreach ($sh in @($State.shares)) { if ($sh.id -ceq $Id) { return $sh } }
+    return $null
+}
+
+function Wait-ForShare {
+    # Polls /api/state until the share <Id> satisfies the test; returns the share object (or $null on timeout).
+    param($B, [string]$Id, [scriptblock]$Test, [int]$TimeoutSec = 20)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $last = $null
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $sh = Get-ShareFromState (Get-State $B) $Id
+        if ($null -ne $sh) {
+            $last = $sh
+            if (& $Test $sh) { return $sh }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($null -ne $last) { Write-Host ("       last phase of share {0}: {1}, step {2}, exit {3}" -f $Id, $last.phase, $last.step, $last.exitCode) }
+    return $null
+}
+
+function Start-Share {
+    # POST /api/start; returns Status, Id (shareId or $null) and the raw response.
+    param($B, [string]$Path, $Minutes = 5, $Compression = 'Fast', $Include = $false, $Name = $null)
+    $body = New-StartBody $Path $Minutes $Compression $Include
+    if ($null -ne $Name) { $body['name'] = $Name }
+    $r = Invoke-Post $B '/api/start' $body
+    $id = $null
+    if ($r.Status -eq 200 -and $null -ne $r.Json -and $r.Json.shareId) { $id = [string]$r.Json.shareId }
+    return [pscustomobject]@{ Status = $r.Status; Id = $id; R = $r }
+}
+
+function New-ShareDir {
+    # A small folder to share; returns its path.
+    param([string]$Name)
+    $d = Join-Path $tmp $Name
+    [void](New-Item -ItemType Directory -Path $d -Force)
+    [IO.File]::WriteAllText((Join-Path $d 'a.txt'), 'x', $utf8)
+    return $d
+}
+
+function Start-BackgroundCurl {
+    # Runs curl detached (so the test can keep talking to the backend meanwhile); returns the process and its files.
+    param([string[]]$CurlArgs, [string]$Tag)
+    $out = Join-Path $tmp ("bg-$Tag-" + [Guid]::NewGuid().ToString('N') + '.txt')
+    $all = @('-s', '--noproxy', '*', '--max-time', '120', '-o', $out, '-w', '%{http_code}') + $CurlArgs
+    $quoted = @($all | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_ + '"' } else { $_ } })
+    $codeF = $out + '.code'
+    $p = Start-Process -FilePath $curl -ArgumentList $quoted -PassThru -WindowStyle Hidden -RedirectStandardOutput $codeF -RedirectStandardError ($out + '.err')
+    $null = $p.Handle
+    return [pscustomobject]@{ Proc = $p; Body = $out; CodeFile = $codeF }
+}
+
+function Get-BackgroundCurlResult {
+    param($Bg)
+    $status = 0
+    if (Test-Path -LiteralPath $Bg.CodeFile) { [void][int]::TryParse(([IO.File]::ReadAllText($Bg.CodeFile)).Trim(), [ref]$status) }
+    $body = ''
+    if (Test-Path -LiteralPath $Bg.Body) { $body = [IO.File]::ReadAllText($Bg.Body, $utf8) }
+    $json = $null
+    if ($body.StartsWith('{')) { try { $json = $body | ConvertFrom-Json } catch { $json = $null } }
+    return [pscustomobject]@{ Status = $status; Body = $body; Json = $json }
 }
 
 function Start-TestBackend {
@@ -128,7 +223,8 @@ function Start-TestBackend {
     if (-not $StartScriptPath) { $StartScriptPath = $startScript }
     if (-not $InstanceFile) { $InstanceFile = Join-Path $tmp "gui-$Name.json" }
     if (-not $DataRoot) { $DataRoot = Join-Path $tmp "data-$Name" }
-    $pidFile = Join-Path $tmp "fake-$Name.pid"
+    # '{pid}' makes every fake share of this backend write its own files (several shares run in parallel).
+    $pidFile = Join-Path $tmp "fake-$Name-{pid}.pid"
     $outFile = Join-Path $tmp "backend-$Name.out"
     $errFile = Join-Path $tmp "backend-$Name.err"
     $env:WS_FAKE_SCENARIO = $Scenario
@@ -163,12 +259,9 @@ function Start-TestBackend {
 function Stop-TestBackendHard {
     param($B)
     if ($null -ne $B.Proc) { try { if (-not $B.Proc.HasExited) { Stop-Process -Id $B.Proc.Id -Force -ErrorAction SilentlyContinue } } catch { } }
-    $fakePid = Get-FakePid $B
-    if ($fakePid -and (Test-PidAlive $fakePid)) { Stop-Process -Id $fakePid -Force -ErrorAction SilentlyContinue }
-    $sessionFile = $B.PidFile + '.session'
-    if (Test-Path -LiteralPath $sessionFile) {
-        $sd = ([IO.File]::ReadAllText($sessionFile)).Trim()
-        if ($sd -and (Test-Path -LiteralPath $sd)) { Remove-Item -LiteralPath $sd -Recurse -Force -ErrorAction SilentlyContinue }
+    foreach ($f in @(Get-Fakes $B)) {
+        if ($f.Pid -and (Test-PidAlive $f.Pid)) { Stop-Process -Id $f.Pid -Force -ErrorAction SilentlyContinue }
+        if ($f.Session -and (Test-Path -LiteralPath $f.Session)) { Remove-Item -LiteralPath $f.Session -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -335,8 +428,8 @@ try {
     Assert-True ($r.Status -eq 401) '/api/state without token -> 401'
     $r = Invoke-Api -Path '/api/state' -B $A -Token ($A.Token + 'x')
     Assert-True ($r.Status -eq 401) '/api/state with wrong token -> 401'
-    $r = Invoke-Api -Method POST -Path '/api/stop' -B $A -BodyText '{}'
-    Assert-True ($r.Status -eq 401) 'POST /api/stop without token -> 401'
+    $r = Invoke-Api -Method POST -Path '/api/shares/deadbeef/stop' -B $A -BodyText '{}'
+    Assert-True ($r.Status -eq 401) 'POST /api/shares/<id>/stop without token -> 401'
     $r = Invoke-Api -Method OPTIONS -Path '/api/state' -B $A -Token $A.Token
     Assert-True ($r.Status -eq 405) 'OPTIONS /api/state -> 405'
     $r = Invoke-Api -Method GET -Path '/api/start' -B $A -Token $A.Token
@@ -345,18 +438,29 @@ try {
     Assert-True ($r.Status -eq 405) 'POST /api/state -> 405'
     $r = Invoke-Api -Method POST -Path '/api/nonexistent' -B $A -Token $A.Token -BodyText '{}'
     Assert-True ($r.Status -eq 404) 'unknown /api path with token -> 404'
+    $r = Invoke-Post $A '/api/stop' $null
+    Assert-True ($r.Status -eq 404) 'v1 endpoint POST /api/stop was removed -> 404'
+    $r = Invoke-Post $A '/api/copy' $null
+    Assert-True ($r.Status -eq 404) 'v1 endpoint POST /api/copy was removed -> 404'
+    foreach ($action in 'stop', 'copy', 'rename', 'dismiss') {
+        $r = Invoke-Post $A "/api/shares/deadbeef/$action" @{ name = 'x' }
+        Assert-True ($r.Status -eq 404) "POST /api/shares/<unknown id>/$action -> 404"
+    }
+    $r = Invoke-Post $A '/api/shares/ZZZZ/stop' $null
+    Assert-True ($r.Status -eq 404) 'malformed share id -> 404'
+    $r = Invoke-Post $A '/api/shares/deadbeef/explode' $null
+    Assert-True ($r.Status -eq 404) 'unknown share action -> 404'
+    $r = Invoke-Api -Method GET -Path '/api/shares/deadbeef/rename' -B $A -Token $A.Token
+    Assert-True ($r.Status -eq 405) 'GET on a share route -> 405'
 
-    # idle state
+    # idle state (v2)
     $r = Invoke-Api -Path '/api/state' -B $A -Token $A.Token
     $s = $r.Json
-    Assert-True ($r.Status -eq 200 -and $s.phase -eq 'idle' -and $s.v -eq 1 -and $s.platform -eq 'windows') '/api/state with token -> 200, phase idle'
+    Assert-True ($r.Status -eq 200 -and $s.v -eq 2 -and $s.platform -eq 'windows' -and $s.running -eq 0 -and @($s.shares).Count -eq 0) '/api/state with token -> 200, state v2, no shares, running 0'
+    Assert-True ($null -eq $s.PSObject.Properties['phase'] -and $null -eq $s.PSObject.Properties['url'] -and $null -eq $s.PSObject.Properties['drop']) 'state v2 has no top-level phase/url/drop (they live in shares[] and draft)'
     Assert-True ($null -ne $s.capabilities -and $null -ne $s.capabilities.folderPicker -and $null -ne $s.capabilities.clipboard -and $null -ne $s.capabilities.openBrowser) 'state has capabilities'
-    Assert-True ($s.total -eq 8 -and $s.step -eq 0 -and @($s.steps).Count -eq 0 -and @($s.log).Count -eq 0 -and $null -eq $s.url -and $null -eq $s.request) 'idle state: no steps, log, url or request'
-    Assert-True ($null -eq $s.drop -and $s.limits.maxDropBytes -eq 4GB -and $s.limits.maxDropFiles -eq 10000) 'idle state: drop is null, limits carry the defaults (4 GiB, 10000 files)'
-    $r = Invoke-Post $A '/api/stop' $null
-    Assert-True ($r.Status -eq 409) '/api/stop while idle -> 409'
-    $r = Invoke-Post $A '/api/copy' $null
-    Assert-True ($r.Status -eq 409) '/api/copy without link -> 409'
+    Assert-True ($null -ne $s.draft -and $null -eq $s.draft.drop -and $s.limits.maxDropBytes -eq 4GB -and $s.limits.maxDropFiles -eq 10000 -and $s.limits.maxShares -eq 5) 'idle state: draft.drop is null, limits carry the defaults (4 GiB, 10000 files, 5 shares)'
+    Assert-True ($s.build -match '^[0-9a-f]{16}$') 'state carries the build id'
 
     # invalid start input
     $bad = @(
@@ -367,7 +471,10 @@ try {
         @{ n = 'nonexistent path'; b = (New-StartBody (Join-Path $tmp 'gibt-es-nicht') 5) },
         @{ n = 'path is a file'; b = (New-StartBody (Join-Path $shareDir 'a.txt') 5) },
         @{ n = 'compression Zip'; b = (New-StartBody $shareDir 5 'Zip') },
-        @{ n = 'includeGenerated "yes"'; b = (New-StartBody $shareDir 5 'Fast' 'yes') }
+        @{ n = 'includeGenerated "yes"'; b = (New-StartBody $shareDir 5 'Fast' 'yes') },
+        @{ n = 'name of 61 characters'; b = ([ordered]@{ path = $shareDir; minutes = 5; compression = 'Fast'; includeGenerated = $false; name = ('n' * 61) }) },
+        @{ n = 'name with a control character'; b = ([ordered]@{ path = $shareDir; minutes = 5; compression = 'Fast'; includeGenerated = $false; name = ('a' + [char]7 + 'b') }) },
+        @{ n = 'name that is not a string'; b = ([ordered]@{ path = $shareDir; minutes = 5; compression = 'Fast'; includeGenerated = $false; name = 42 }) }
     )
     foreach ($case in $bad) {
         $r = Invoke-Post $A '/api/start' $case.b
@@ -375,50 +482,52 @@ try {
     }
     $r = Invoke-Api -Method POST -Path '/api/start' -B $A -Token $A.Token -BodyText 'kein json'
     Assert-True ($r.Status -eq 400) '/api/start with invalid JSON -> 400'
-    Assert-True ((Get-State $A).phase -eq 'idle') 'rejected starts leave the phase idle'
+    $s = Get-State $A
+    Assert-True ($s.running -eq 0 -and @($s.shares).Count -eq 0) 'rejected starts create no share'
 
     # valid start
-    $r = Invoke-Post $A '/api/start' (New-StartBody $shareDir 5 'Fast' $false)
-    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) '/api/start with valid input -> 200'
-    $r2 = Invoke-Post $A '/api/start' (New-StartBody $shareDir 5)
-    Assert-True ($r2.Status -eq 409) 'second /api/start while running -> 409'
-    $s = Wait-ForState $A { param($x) $x.phase -eq 'active' }
-    Assert-True ($null -ne $s) 'phase becomes active within 20 s'
-    if ($null -ne $s) {
-        Assert-True ($s.url -match '^https://fake-test\.trycloudflare\.com/d/a{43}/$') 'active state carries the link'
-        Assert-True (@($s.steps).Count -eq 8 -and $s.step -eq 8 -and $s.total -eq 8) 'state lists all 8 steps'
-        Assert-True ((@($s.steps) | Where-Object { $_.n -eq 3 }).text -eq 'Snapshot wird erstellt ...') 'step text with umlauts is decoded correctly'
-        Assert-True ($s.sizeBytes -eq 1234 -and $s.sha256 -eq ('A' * 64) -and $s.expiresUtc) 'ready fields: sizeBytes, sha256, expiresUtc'
-        Assert-True ($s.request.minutes -eq 5 -and $s.request.path -eq $shareDir -and $s.request.compression -eq 'Fast' -and $s.request.includeGenerated -eq $false) 'state echoes the request'
+    $st = Start-Share $A $shareDir 5 'Fast' $false
+    Assert-True ($st.Status -eq 200 -and $st.R.Json.ok -eq $true -and $st.Id -match '^[0-9a-f]{8}$') '/api/start with valid input -> 200 {ok, shareId (8 hex)}'
+    $idA1 = $st.Id
+    $s = Get-State $A
+    $shA1 = Get-ShareFromState $s $idA1
+    Assert-True ($null -ne $shA1 -and $shA1.phase -in @('starting', 'active') -and $s.running -eq 1) 'the new share is listed at once (starting/active), running 1'
+    $sh = Wait-ForShare $A $idA1 { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $sh) 'phase becomes active within 20 s'
+    if ($null -ne $sh) {
+        Assert-True ($sh.url -match '^https://fake-test\.trycloudflare\.com/d/[A-Za-z0-9]{43}/$') 'active share carries the link'
+        Assert-True (@($sh.steps).Count -eq 8 -and $sh.step -eq 8 -and $sh.total -eq 8) 'share lists all 8 steps'
+        Assert-True ((@($sh.steps) | Where-Object { $_.n -eq 3 }).text -eq 'Snapshot wird erstellt ...') 'step text with umlauts is decoded correctly'
+        Assert-True ($sh.sizeBytes -eq 1234 -and $sh.sha256 -eq ('A' * 64) -and $sh.expiresUtc) 'ready fields: sizeBytes, sha256, expiresUtc'
+        Assert-True ($sh.request.minutes -eq 5 -and $sh.request.path -eq $shareDir -and $sh.request.compression -eq 'Fast' -and $sh.request.includeGenerated -eq $false) 'share echoes the request'
+        Assert-True ($sh.name -ceq 'ws share ä' -and $null -eq $sh.dropFiles -and [datetime]::Parse([string]$sh.createdUtc).Year -ge 2026) 'default name is the folder leaf name; dropFiles null; createdUtc set'
         # The plain lines follow the ready event closely; wait until the last one is drained.
-        $s2 = Wait-ForState $A { param($x) @($x.log) -like 'Link-Test:*' } 8
-        if ($null -ne $s2) { $s = $s2 }
-        $logLines = @($s.log)
+        $sh2 = Wait-ForShare $A $idA1 { param($x) @($x.log) -like 'Link-Test:*' } 8
+        if ($null -ne $sh2) { $sh = $sh2 }
+        $logLines = @($sh.log)
         Assert-True ($logLines -ccontains 'Normale Ausgabe mit Umlauten: äöü') 'stdout log line with umlauts is decoded correctly'
         Assert-True ($logLines -ccontains 'Hinweis auf stderr: äöü') 'stderr line is logged'
         Assert-True ($logLines -ccontains ('Pfad=' + $shareDir)) 'path with spaces and umlaut reaches the child intact'
         $linkLine = @($logLines | Where-Object { $_ -like 'Link-Test:*' })
-        Assert-True ($linkLine.Count -eq 1 -and $linkLine[0] -notlike '*aaaaaaaaaa*' -and $linkLine[0] -like '*<redacted>*') 'log redacts the link'
+        Assert-True ($linkLine.Count -eq 1 -and $linkLine[0] -notlike '*qqqqqqqqqq*' -and $linkLine[0] -like '*<redacted>*') 'log redacts the link'
         Assert-True (@($logLines | Where-Object { $_ -like '*@@WSEVENT@@*' }).Count -eq 0) 'event lines are not part of the log'
     }
-    $r = Invoke-Post $A '/api/pick-folder' $null
-    if ($r.Status -ne 409) { Write-Host ("       pick-folder status: {0} body: {1}" -f $r.Status, $r.Body) }
-    Assert-True ($r.Status -eq 409) '/api/pick-folder while a share runs -> 409'
-    $s = Wait-ForState $A { param($x) $null -ne $x.remainingMinutes } 8
-    Assert-True ($null -ne $s) 'status event updates remainingMinutes'
+    $sh = Wait-ForShare $A $idA1 { param($x) $null -ne $x.remainingMinutes } 8
+    Assert-True ($null -ne $sh) 'status event updates remainingMinutes'
 
     $copyOk = $false
     $caps = (Get-State $A).capabilities
     if ($caps.clipboard) {
-        $r = Invoke-Post $A '/api/copy' $null
+        $r = Invoke-Post $A "/api/shares/$idA1/copy" $null
         $copyOk = ($r.Status -eq 200)
-        Assert-True $copyOk '/api/copy -> 200 while the link is available'
+        Assert-True $copyOk '/api/shares/<id>/copy -> 200 while the link is available'
     }
-    else { Write-Host '[NOTE] clipboard capability is false; /api/copy check skipped' }
+    else { Write-Host '[NOTE] clipboard capability is false; copy check skipped' }
 
-    $fakePidA = Get-FakePid $A
+    $fakeA = @(Get-Fakes $A)
+    $fakePidA = $null
     $sessionDirA = $null
-    if (Test-Path -LiteralPath ($A.PidFile + '.session')) { $sessionDirA = ([IO.File]::ReadAllText($A.PidFile + '.session')).Trim() }
+    if ($fakeA.Count -ge 1) { $fakePidA = $fakeA[0].Pid; $sessionDirA = $fakeA[0].Session }
     Assert-True ($fakePidA -and (Test-PidAlive $fakePidA) -and $sessionDirA -and (Test-Path -LiteralPath $sessionDirA)) 'fake share process and its session folder exist'
 
     # single instance: second backend with the same instance file exits 0 quickly, file unchanged
@@ -433,81 +542,99 @@ try {
     Assert-True (-not $A.Proc.HasExited) 'first backend is still running'
 
     # stop
-    $r = Invoke-Post $A '/api/stop' $null
-    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) '/api/stop -> 200'
-    $s = Wait-ForState $A { param($x) $x.phase -eq 'ended' }
-    Assert-True ($null -ne $s) 'phase becomes ended after stop'
-    if ($null -ne $s) {
-        Assert-True ($null -eq $s.url) 'link is gone after the share ended'
-        Assert-True ($s.reason -eq 'ManualStop' -and $s.exitCode -eq 0) 'ended with reason ManualStop and exit code 0'
+    $r = Invoke-Post $A "/api/shares/$idA1/stop" $null
+    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) '/api/shares/<id>/stop -> 200'
+    $r2 = Invoke-Post $A "/api/shares/$idA1/stop" $null
+    $shNow = Get-ShareFromState (Get-State $A) $idA1
+    Assert-True ($r2.Status -eq 200 -or ($r2.Status -eq 409 -and $shNow.phase -eq 'ended')) 'a second stop is idempotent while stopping (409 only once the share has ended)'
+    $sh = Wait-ForShare $A $idA1 { param($x) $x.phase -eq 'ended' }
+    Assert-True ($null -ne $sh) 'phase becomes ended after stop'
+    if ($null -ne $sh) {
+        Assert-True ($null -eq $sh.url) 'link is gone after the share ended'
+        Assert-True ($sh.reason -eq 'ManualStop' -and $sh.exitCode -eq 0) 'ended with reason ManualStop and exit code 0'
     }
     Assert-True ($sessionDirA -and -not (Test-Path -LiteralPath $sessionDirA)) 'stop.requested reached the session (fake cleaned its folder)'
     Assert-True (Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fakePidA) }) 'fake share process has exited'
-    $r = Invoke-Post $A '/api/stop' $null
-    Assert-True ($r.Status -eq 409) '/api/stop after the end -> 409'
-    $r = Invoke-Post $A '/api/copy' $null
-    Assert-True ($r.Status -eq 409) '/api/copy after the end -> 409'
+    $r = Invoke-Post $A "/api/shares/$idA1/stop" $null
+    Assert-True ($r.Status -eq 409) 'stop after the end -> 409'
+    $r = Invoke-Post $A "/api/shares/$idA1/copy" $null
+    Assert-True ($r.Status -eq 409) 'copy after the end -> 409'
+    Assert-True ((Get-State $A).running -eq 0 -and $null -ne (Get-ShareFromState (Get-State $A) $idA1)) 'an ended share stays listed until it is dismissed; running is 0'
 
-    # restart resets the share state; quit with a running share stops it first
-    $r = Invoke-Post $A '/api/start' (New-StartBody $shareDir 2 'Store' $true)
-    Assert-True ($r.Status -eq 200) 'restart after ended -> 200'
+    # a new start creates a new share (the ended one stays); quit with a running share stops it first
+    $st = Start-Share $A $shareDir 2 'Store' $true
+    Assert-True ($st.Status -eq 200 -and $st.Id -ne $idA1) 'new start after an ended share -> 200 with a new shareId'
+    $idA2 = $st.Id
     $s = Get-State $A
-    Assert-True ($s.phase -in @('starting', 'active') -and $null -eq $s.exitCode -and $null -eq $s.reason -and $s.request.compression -eq 'Store' -and $s.request.includeGenerated -eq $true) 'new start resets exit code and reason'
-    $s = Wait-ForState $A { param($x) $x.phase -eq 'active' }
-    Assert-True ($null -ne $s) 'second share becomes active'
+    $shA2 = Get-ShareFromState $s $idA2
+    Assert-True (@($s.shares).Count -eq 2 -and @($s.shares)[0].id -eq $idA1 -and @($s.shares)[1].id -eq $idA2) 'shares are ordered by creation (oldest first)'
+    Assert-True ($shA2.phase -in @('starting', 'active') -and $null -eq $shA2.exitCode -and $null -eq $shA2.reason -and $shA2.request.compression -eq 'Store' -and $shA2.request.includeGenerated -eq $true) 'the new share starts with a clean state and its own request'
+    $sh = Wait-ForShare $A $idA2 { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $sh) 'second share becomes active'
     $fakePidA2 = Get-FakePid $A
     Test-GuiQuit $A 'A (running share)'
     Assert-True (Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fakePidA2) }) 'quit stopped the running share (fake process gone)'
     if ($copyOk) {
         $clip = (& $psExe -NoLogo -NoProfile -STA -Command 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::GetText()') -join ''
-        Assert-True ($clip -notlike '*fake-test.trycloudflare.com*') 'backend exit cleared the copied link from the clipboard'
+        Assert-True ($clip -notlike '*fake-test.trycloudflare.com*') 'the copied link was cleared from the clipboard when its share ended'
     }
 
     # ================= backend B: fail22
     $B = Start-TestBackend -Scenario 'fail22' -Name 'B'
     if ($B.Port -le 0) { throw 'Backend B did not start.' }
-    $r = Invoke-Post $B '/api/start' (New-StartBody $shareDir 5)
-    Assert-True ($r.Status -eq 200) 'B: start -> 200'
-    $s = Wait-ForState $B { param($x) $x.phase -eq 'error' }
-    Assert-True ($null -ne $s) 'B: phase becomes error'
-    if ($null -ne $s) {
-        Assert-True ($s.exitCode -eq 22 -and $s.reason -eq 'Error') 'B: exit code 22 and reason Error'
-        Assert-True ($s.message -like '*.env*') 'B: message from the ended event'
-        Assert-True ($null -eq $s.url -and @($s.steps).Count -eq 2) 'B: no link, 2 steps'
+    $st = Start-Share $B $shareDir 5
+    Assert-True ($st.Status -eq 200) 'B: start -> 200'
+    $idB1 = $st.Id
+    $sh = Wait-ForShare $B $idB1 { param($x) $x.phase -eq 'error' }
+    Assert-True ($null -ne $sh) 'B: phase becomes error'
+    if ($null -ne $sh) {
+        Assert-True ($sh.exitCode -eq 22 -and $sh.reason -eq 'Error') 'B: exit code 22 and reason Error'
+        Assert-True ($sh.message -like '*.env*') 'B: message from the ended event'
+        Assert-True ($null -eq $sh.url -and @($sh.steps).Count -eq 2) 'B: no link, 2 steps'
     }
-    $r = Invoke-Post $B '/api/start' (New-StartBody $shareDir 5)
-    Assert-True ($r.Status -eq 200) 'B: restart after an error -> 200'
-    $s = Wait-ForState $B { param($x) $x.phase -eq 'error' }
-    Assert-True ($null -ne $s -and $s.exitCode -eq 22) 'B: second run fails with 22 again'
-    Test-GuiQuit $B 'B (idle after error)'
+    $st = Start-Share $B $shareDir 5
+    Assert-True ($st.Status -eq 200 -and $st.Id -ne $idB1) 'B: a new start after an error -> 200 with a new share'
+    $idB2 = $st.Id
+    $sh = Wait-ForShare $B $idB2 { param($x) $x.phase -eq 'error' }
+    Assert-True ($null -ne $sh -and $sh.exitCode -eq 22) 'B: second run fails with 22 again'
+    Assert-True (@((Get-State $B).shares).Count -eq 2) 'B: both failed shares stay listed'
+    $r = Invoke-Post $B "/api/shares/$idB1/dismiss" $null
+    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) 'B: dismiss of an error share -> 200'
+    $s = Get-State $B
+    Assert-True ($null -eq (Get-ShareFromState $s $idB1) -and $null -ne (Get-ShareFromState $s $idB2) -and @($s.shares).Count -eq 1) 'B: the dismissed share is gone from the list, the other one stays'
+    Test-GuiQuit $B 'B (no running share)'
 
     # ================= backend C: hang (no session -> kill path)
     $C = Start-TestBackend -Scenario 'hang' -Name 'C'
     if ($C.Port -le 0) { throw 'Backend C did not start.' }
-    $r = Invoke-Post $C '/api/start' (New-StartBody $shareDir 5)
-    Assert-True ($r.Status -eq 200) 'C: start -> 200'
-    $s = Wait-ForState $C { param($x) @($x.steps).Count -ge 1 }
-    $fakePidC = $null
-    Assert-True ($null -ne $s -and $s.phase -eq 'starting') 'C: first step arrived, still starting'
+    $st = Start-Share $C $shareDir 5
+    Assert-True ($st.Status -eq 200) 'C: start -> 200'
+    $idC1 = $st.Id
+    $sh = Wait-ForShare $C $idC1 { param($x) @($x.steps).Count -ge 1 }
+    Assert-True ($null -ne $sh -and $sh.phase -eq 'starting') 'C: first step arrived, still starting'
     $fakePidC = Get-FakePid $C
     Assert-True ($fakePidC -and (Test-PidAlive $fakePidC)) 'C: fake process is running'
-    $r = Invoke-Post $C '/api/stop' $null
-    Assert-True ($r.Status -eq 200) 'C: /api/stop before the session event -> 200'
-    $s = Wait-ForState $C { param($x) $x.phase -in @('ended', 'error') }
-    Assert-True ($null -ne $s -and $s.phase -eq 'ended' -and $s.reason -eq 'ManualStop') 'C: killed share ends as ManualStop'
+    $r = Invoke-Post $C "/api/shares/$idC1/stop" $null
+    Assert-True ($r.Status -eq 200) 'C: stop before the session event -> 200'
+    $sh = Wait-ForShare $C $idC1 { param($x) $x.phase -in @('ended', 'error') }
+    Assert-True ($null -ne $sh -and $sh.phase -eq 'ended' -and $sh.reason -eq 'ManualStop') 'C: killed share ends as ManualStop'
     Assert-True (Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fakePidC) }) 'C: process was killed'
     Test-GuiQuit $C 'C'
 
-    # ================= backend D: backend crash -> child notices the missing parent
+    # ================= backend D: backend crash -> both children notice the missing parent
     $D = Start-TestBackend -Scenario 'parent' -Name 'D'
     if ($D.Port -le 0) { throw 'Backend D did not start.' }
-    $r = Invoke-Post $D '/api/start' (New-StartBody $shareDir 5)
-    Assert-True ($r.Status -eq 200) 'D: start -> 200'
-    $s = Wait-ForState $D { param($x) $x.phase -eq 'active' }
-    $fakePidD = Get-FakePid $D
-    Assert-True ($null -ne $s -and $fakePidD -and (Test-PidAlive $fakePidD)) 'D: share active, fake process running'
+    $dirD1 = New-ShareDir 'share-d1'
+    $dirD2 = New-ShareDir 'share-d2'
+    $stD1 = Start-Share $D $dirD1 5
+    $stD2 = Start-Share $D $dirD2 5
+    Assert-True ($stD1.Status -eq 200 -and $stD2.Status -eq 200 -and $stD1.Id -ne $stD2.Id) 'D: two shares start -> 200'
+    $shD1 = Wait-ForShare $D $stD1.Id { param($x) $x.phase -eq 'active' }
+    $shD2 = Wait-ForShare $D $stD2.Id { param($x) $x.phase -eq 'active' }
+    $fakesD = @(Get-Fakes $D)
+    Assert-True ($null -ne $shD1 -and $null -ne $shD2 -and $fakesD.Count -eq 2 -and (Test-PidAlive $fakesD[0].Pid) -and (Test-PidAlive $fakesD[1].Pid)) 'D: both shares active, two fake processes running'
     Stop-Process -Id $D.Proc.Id -Force
-    Assert-True (Wait-Until -TimeoutSec 10 -Condition { -not (Test-PidAlive $fakePidD) }) 'D: fake share exits within 10 s after the backend was killed'
+    Assert-True (Wait-Until -TimeoutSec 15 -Condition { -not (Test-PidAlive $fakesD[0].Pid) -and -not (Test-PidAlive $fakesD[1].Pid) }) 'D: both fake shares exit within 15 s after the backend was killed'
 
     # ================= -DataRootOverride is a test-only parameter
     $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -DataRootOverride "{1}" -NoBrowser' -f $startScript, (Join-Path $tmp 'data-x')) -PassThru -WindowStyle Hidden -Wait
@@ -523,7 +650,7 @@ try {
     if ($E.Port -le 0) { throw 'Backend E did not start.' }
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $dropsE ('deadbeef' * 4)))) 'E: stale drop folder from an earlier run is removed at backend start'
     $s = Get-State $E
-    Assert-True ($s.phase -eq 'idle' -and $null -eq $s.drop -and $s.limits.maxDropBytes -eq 4GB) 'E: idle, no drop'
+    Assert-True ($s.running -eq 0 -and $null -eq $s.draft.drop -and $s.limits.maxDropBytes -eq 4GB) 'E: idle, no drop'
 
     $srcBig = Join-Path $tmp 'src-big.bin'; New-RandomFile $srcBig 5242880 11
     $srcC = Join-Path $tmp 'src-c.bin'; New-RandomFile $srcC 1234 12
@@ -546,7 +673,7 @@ try {
     Assert-True ($leafDirs.Count -eq 1 -and $leafDirs[0].Name -match '^Dateien-\d{8}-\d{6}$') 'E: drop folder <DataRoot>\drops\<id>\Dateien-yyyyMMdd-HHmmss exists'
     $leaf1 = $leafDirs[0].FullName
     $s = Get-State $E
-    Assert-True ($null -ne $s.drop -and $s.drop.id -eq $drop1 -and $s.drop.path -eq $leaf1 -and $s.drop.files -eq 0 -and $s.drop.finished -eq $false) 'E: state.drop after begin (unfinished, 0 files)'
+    Assert-True ($null -ne $s.draft.drop -and $s.draft.drop.id -eq $drop1 -and $s.draft.drop.path -eq $leaf1 -and $s.draft.drop.files -eq 0 -and $s.draft.drop.finished -eq $false) 'E: state.draft.drop after begin (unfinished, 0 files)'
     $r = Invoke-Post $E '/api/drop/finish' @{ dropId = $drop1 }
     Assert-True ($r.Status -eq 400) 'E: drop/finish without any file -> 400'
 
@@ -560,7 +687,7 @@ try {
     Assert-True ($r.Status -eq 200 -and $r.Json.bytes -eq 5242880) 'E: upload of a 5 MB random file -> 200'
     Write-Host ("       5 MB upload took {0:N1} s" -f $sw5.Elapsed.TotalSeconds)
     $s = Get-State $E
-    Assert-True ($s.drop.files -eq 3 -and $s.drop.finished -eq $false -and $s.drop.totalBytes -eq (1234 + ([IO.FileInfo]$srcUml).Length + 5242880)) 'E: state.drop counts files and bytes while unfinished'
+    Assert-True ($s.draft.drop.files -eq 3 -and $s.draft.drop.finished -eq $false -and $s.draft.drop.totalBytes -eq (1234 + ([IO.FileInfo]$srcUml).Length + 5242880)) 'E: state.draft.drop counts files and bytes while unfinished'
     $r = Invoke-Post $E '/api/drop/finish' @{ dropId = $drop1 }
     $expectedTotal = 1234 + ([IO.FileInfo]$srcUml).Length + 5242880
     Assert-True ($r.Status -eq 200 -and $r.Json.path -eq $leaf1 -and $r.Json.files -eq 3 -and $r.Json.totalBytes -eq $expectedTotal) 'E: drop/finish -> path, files 3, totalBytes'
@@ -568,7 +695,7 @@ try {
     Assert-True ((Get-FileSha (Join-Path $leaf1 'big.bin')) -eq (Get-FileSha $srcBig) -and (Get-FileSha (Join-Path $leaf1 'sub\ordner\c.bin')) -eq (Get-FileSha $srcC) -and (Get-FileSha (Join-Path $leaf1 'Bericht ä.txt')) -eq (Get-FileSha $srcUml)) 'E: uploaded files are bit-identical (SHA-256)'
     Assert-True ((Get-FileCount $dropsE) -eq 3) 'E: exactly three files below drops'
     $s = Get-State $E
-    Assert-True ($s.drop.finished -eq $true -and $s.drop.files -eq 3 -and $s.drop.totalBytes -eq $expectedTotal -and $s.drop.path -eq $leaf1) 'E: state.drop finished with path, files, totalBytes'
+    Assert-True ($s.draft.drop.finished -eq $true -and $s.draft.drop.files -eq 3 -and $s.draft.drop.totalBytes -eq $expectedTotal -and $s.draft.drop.path -eq $leaf1) 'E: state.draft.drop finished with path, files, totalBytes'
     $r = Invoke-Upload $E $drop1 'late.txt' $srcTiny
     Assert-True ($r.Status -eq 409 -and -not (Test-Path -LiteralPath (Join-Path $leaf1 'late.txt'))) 'E: upload into a finished drop -> 409'
 
@@ -579,37 +706,47 @@ try {
     Assert-True ($r.Status -eq 400) 'E: /api/start with a sub folder of the drop -> 400'
     $r = Invoke-Post $E '/api/start' (New-StartBody $drop1Root 5)
     Assert-True ($r.Status -eq 400) 'E: /api/start with the drop id folder (not the leaf) -> 400'
-    Assert-True ((Get-State $E).phase -eq 'idle') 'E: rejected drop starts leave the phase idle'
+    Assert-True ((Get-State $E).running -eq 0 -and @((Get-State $E).shares).Count -eq 0) 'E: rejected drop starts create no share'
 
     # share the drop: active -> stop -> ended -> drop deleted
-    $r = Invoke-Post $E '/api/start' (New-StartBody $leaf1 5)
-    Assert-True ($r.Status -eq 200) 'E: /api/start with the finished drop path -> 200'
-    $s = Wait-ForState $E { param($x) $x.phase -eq 'active' }
-    Assert-True ($null -ne $s) 'E: share of the drop becomes active'
-    if ($null -ne $s) {
-        Assert-True ($null -ne $s.drop -and $s.drop.path -eq $leaf1 -and (Test-Path -LiteralPath (Join-Path $leaf1 'big.bin'))) 'E: drop folder stays in place while its share runs'
-        $s2 = Wait-ForState $E { param($x) @($x.log) -like 'Pfad=*' } 8
-        Assert-True ($null -ne $s2 -and @($s2.log) -ccontains ('Pfad=' + $leaf1)) 'E: the share process received the drop folder as -Path'
+    $stE = Start-Share $E $leaf1 5
+    Assert-True ($stE.Status -eq 200) 'E: /api/start with the finished drop path -> 200'
+    $idE1 = $stE.Id
+    $sh = Wait-ForShare $E $idE1 { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $sh) 'E: share of the drop becomes active'
+    if ($null -ne $sh) {
+        $s = Get-State $E
+        Assert-True ($null -eq $s.draft.drop -and $sh.dropFiles -eq 3 -and $sh.name -ceq 'sub +2' -and (Test-Path -LiteralPath (Join-Path $leaf1 'big.bin'))) 'E: the drop moved from the draft to the share (name "sub +2", dropFiles 3) and stays in place while it runs'
+        $sh2 = Wait-ForShare $E $idE1 { param($x) @($x.log) -like 'Pfad=*' } 8
+        Assert-True ($null -ne $sh2 -and @($sh2.log) -ccontains ('Pfad=' + $leaf1)) 'E: the share process received the drop folder as -Path'
     }
-    $r = Invoke-Post $E '/api/drop/begin' $null
-    Assert-True ($r.Status -eq 409) 'E: drop/begin while a share runs -> 409'
+    $r = Invoke-Post $E '/api/start' (New-StartBody $leaf1 5)
+    Assert-True ($r.Status -eq 400) 'E: the drop folder of a running share cannot be started again -> 400'
+    # drops are allowed while a share runs; the running share's drop is no draft any more
     $r = Invoke-Upload $E $drop1 'x.txt' $srcTiny
-    Assert-True ($r.Status -eq 409) 'E: upload while a share runs -> 409'
+    Assert-True ($r.Status -eq 400 -and -not (Test-Path -LiteralPath (Join-Path $leaf1 'x.txt'))) 'E: upload into the drop of a running share -> 400'
     $r = Invoke-Post $E '/api/drop/discard' @{ dropId = $drop1 }
-    Assert-True ($r.Status -eq 409 -and (Test-Path -LiteralPath $leaf1)) 'E: drop/discard while a share runs -> 409, folder stays'
-    $r = Invoke-Post $E '/api/stop' $null
+    Assert-True ($r.Status -eq 400 -and (Test-Path -LiteralPath $leaf1)) 'E: drop/discard of a running share''s drop -> 400, folder stays'
+    $r = Invoke-Post $E '/api/drop/begin' $null
+    Assert-True ($r.Status -eq 200) 'E: drop/begin while a share runs -> 200'
+    $dropWhile = [string]$r.Json.dropId
+    $r = Invoke-Upload $E $dropWhile 'while.txt' $srcTiny
+    Assert-True ($r.Status -eq 200) 'E: upload while a share runs -> 200'
+    $r = Invoke-Post $E '/api/drop/discard' @{ dropId = $dropWhile }
+    Assert-True ($r.Status -eq 200 -and (Test-Path -LiteralPath $leaf1) -and -not (Test-Path -LiteralPath (Join-Path $dropsE $dropWhile))) 'E: discarding the draft leaves the drop of the running share alone'
+    $r = Invoke-Post $E "/api/shares/$idE1/stop" $null
     Assert-True ($r.Status -eq 200) 'E: stop the drop share'
-    $s = Wait-ForState $E { param($x) $x.phase -eq 'ended' }
-    Assert-True ($null -ne $s) 'E: drop share ends'
+    $sh = Wait-ForShare $E $idE1 { param($x) $x.phase -eq 'ended' }
+    Assert-True ($null -ne $sh) 'E: drop share ends'
     Assert-True (Wait-Until -TimeoutSec 10 -Condition { -not (Test-Path -LiteralPath $drop1Root) }) 'E: drop folder is deleted after the share ended'
     $s = Get-State $E
-    Assert-True ($null -eq $s.drop) 'E: state.drop is null after the share ended'
+    Assert-True ($null -eq $s.draft.drop) 'E: draft.drop is null after the share ended'
 
     # path validation on an unfinished drop
     $r = Invoke-Post $E '/api/drop/begin' $null
     $drop2 = [string]$r.Json.dropId
     $drop2Root = Join-Path $dropsE $drop2
-    $leaf2 = [string](Get-State $E).drop.path
+    $leaf2 = [string](Get-State $E).draft.drop.path
     $badPaths = [ordered]@{
         'dot-dot'            = '../x'
         'dot-dot in middle'  = 'a/../b'
@@ -691,7 +828,7 @@ try {
     Assert-True ($r.Status -eq 200 -and $drop3 -ne $drop2) 'E: second drop/begin -> new drop id'
     Assert-True (-not (Test-Path -LiteralPath $drop2Root)) 'E: a new begin discards the previous unfinished drop'
     $s = Get-State $E
-    Assert-True ($s.drop.id -eq $drop3 -and $s.drop.files -eq 0) 'E: state.drop describes the new drop'
+    Assert-True ($s.draft.drop.id -eq $drop3 -and $s.draft.drop.files -eq 0) 'E: state.draft.drop describes the new drop'
     $r = Invoke-Upload $E $drop2 'old.txt' $srcTiny
     Assert-True ($r.Status -eq 400) 'E: upload into the discarded drop id -> 400'
 
@@ -701,7 +838,7 @@ try {
     Assert-True ($r.Status -eq 200 -and (Get-FileCount $drop3Root) -eq 1) 'E: upload into drop 3'
     $r = Invoke-Post $E '/api/drop/discard' @{ dropId = $drop3 }
     Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) 'E: drop/discard -> 200'
-    Assert-True (-not (Test-Path -LiteralPath $drop3Root) -and $null -eq (Get-State $E).drop) 'E: discard deletes the folder and clears state.drop'
+    Assert-True (-not (Test-Path -LiteralPath $drop3Root) -and $null -eq (Get-State $E).draft.drop) 'E: discard deletes the folder and clears state.draft.drop'
     $r = Invoke-Post $E '/api/drop/discard' @{ dropId = $drop3 }
     Assert-True ($r.Status -eq 400) 'E: discarding an unknown drop -> 400'
 
@@ -720,7 +857,7 @@ try {
     if ($F.Port -le 0) { throw 'Backend F did not start.' }
     $dropsF = Join-Path $F.DataRoot 'drops'
     $s = Get-State $F
-    Assert-True ($s.limits.maxDropBytes -eq 1048576 -and $s.limits.maxDropFiles -eq 2) 'F: state.limits reflect the parameters'
+    Assert-True ($s.limits.maxDropBytes -eq 1048576 -and $s.limits.maxDropFiles -eq 2 -and $s.limits.maxShares -eq 5) 'F: state.limits reflect the parameters'
     $r = Invoke-Post $F '/api/drop/begin' $null
     $dropF = [string]$r.Json.dropId
     $src2m = Join-Path $tmp 'src-2m.bin'; New-RandomFile $src2m 2097152 21
@@ -783,7 +920,7 @@ try {
     $TA = Start-TestBackend -Scenario 'success' -Name 'TA' -InstanceFile $instTk -DataRoot $dataTk -ExtraArgs '-TestBuildId aaaa'
     if ($TA.Port -le 0) { throw 'Backend TA did not start.' }
     $instTA = [IO.File]::ReadAllText($instTk) | ConvertFrom-Json
-    Assert-True ([string]$instTA.build -ceq 'aaaa' -and (Get-State $TA).build -ceq 'aaaa' -and (Get-State $TA).phase -eq 'idle') 'takeover: backend A (build aaaa) is idle and reports its build'
+    Assert-True ([string]$instTA.build -ceq 'aaaa' -and (Get-State $TA).build -ceq 'aaaa' -and (Get-State $TA).running -eq 0) 'takeover: backend A (build aaaa) is idle and reports its build'
     $TB = Start-TestBackend -Scenario 'success' -Name 'TB' -InstanceFile $instTk -DataRoot $dataTk -ExtraArgs '-TestBuildId bbbb' -NoWait
     $aGone = $TA.Proc.WaitForExit(20000)
     Assert-True $aGone 'takeover: idle backend A exits within 20 s after the start of build bbbb'
@@ -802,7 +939,7 @@ try {
     Assert-True ($null -ne $instTB -and [int]$instTB.pid -eq $TB.Proc.Id -and [string]$instTB.build -ceq 'bbbb') 'takeover: instance file now holds backend B (pid, build bbbb)'
     if ($null -ne $instTB) {
         $sTB = Get-State $TB
-        Assert-True ($null -ne $sTB -and $sTB.build -ceq 'bbbb' -and $sTB.phase -eq 'idle') 'takeover: B serves /api/state with build bbbb'
+        Assert-True ($null -ne $sTB -and $sTB.build -ceq 'bbbb' -and $sTB.running -eq 0) 'takeover: B serves /api/state with build bbbb'
         Test-GuiQuit $TB 'takeover B'
     }
 
@@ -811,15 +948,15 @@ try {
     $dataBz = Join-Path $tmp 'data-busy'
     $BA = Start-TestBackend -Scenario 'success' -Name 'BA' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId aaaa'
     if ($BA.Port -le 0) { throw 'Backend BA did not start.' }
-    $r = Invoke-Post $BA '/api/start' (New-StartBody $shareDir 5)
-    $s = Wait-ForState $BA { param($x) $x.phase -eq 'active' }
-    Assert-True ($r.Status -eq 200 -and $null -ne $s) 'busy: backend A (build aaaa) has an active share'
+    $stBA = Start-Share $BA $shareDir 5
+    $s = Wait-ForShare $BA $stBA.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($stBA.Status -eq 200 -and $null -ne $s) 'busy: backend A (build aaaa) has an active share'
     $beforeBz = [IO.File]::ReadAllText($instBz)
     $BC = Start-TestBackend -Scenario 'success' -Name 'BC' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId aaaa' -NoWait
     $cExit = $BC.Proc.WaitForExit(10000)
     Assert-True ($cExit -and $BC.Proc.ExitCode -eq 0) 'same build: second start exits 0 within 10 s'
     if (-not $cExit) { try { $BC.Proc.Kill() } catch { } }
-    Assert-True (([IO.File]::ReadAllText($instBz)) -ceq $beforeBz -and -not $BA.Proc.HasExited -and (Get-State $BA).phase -eq 'active') 'same build: instance file unchanged, A keeps running its share'
+    Assert-True (([IO.File]::ReadAllText($instBz)) -ceq $beforeBz -and -not $BA.Proc.HasExited -and (Get-ShareFromState (Get-State $BA) $stBA.Id).phase -eq 'active') 'same build: instance file unchanged, A keeps running its share'
     $BB = Start-TestBackend -Scenario 'success' -Name 'BB' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId bbbb' -NoWait
     $bExit = $BB.Proc.WaitForExit(15000)
     Assert-True ($bExit -and $BB.Proc.ExitCode -eq 0) 'busy: newer start while a share is active exits 0 within 15 s'
@@ -828,9 +965,303 @@ try {
     if (Test-Path -LiteralPath $BB.Out) { $bbOut = [IO.File]::ReadAllText($BB.Out) }
     Assert-True ($bbOut -like '*nutzt noch die vorherige Version*') 'busy: console tells that the running share still uses the previous version'
     $sBz = Get-State $BA
-    Assert-True (-not $BA.Proc.HasExited -and $null -ne $sBz -and $sBz.phase -eq 'active' -and $sBz.build -ceq 'aaaa') 'busy: backend A is still alive and its share still active'
+    Assert-True (-not $BA.Proc.HasExited -and $null -ne $sBz -and $sBz.running -eq 1 -and (Get-ShareFromState $sBz $stBA.Id).phase -eq 'active' -and $sBz.build -ceq 'aaaa') 'busy: backend A is still alive and its share still active'
     Assert-True (([IO.File]::ReadAllText($instBz)) -ceq $beforeBz) 'busy: instance file unchanged'
     Test-GuiQuit $BA 'busy A'
+
+    # ================= several shares at the same time (GUI_CONTRACT section 8)
+    foreach ($mx in @('0', '11', '-3')) {
+        $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestMode -NoBrowser -MaxShares {1}' -f $startScript, $mx) -PassThru -WindowStyle Hidden -Wait
+        Assert-True ($p.ExitCode -eq 10) "-MaxShares $mx exits with 10 (allowed range 1..10)"
+    }
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestPickerResult "0:" -NoBrowser' -f $startScript) -PassThru -WindowStyle Hidden -Wait
+    Assert-True ($p.ExitCode -eq 10) '-TestPickerResult without -TestMode exits with 10'
+
+    $srcTinyN = Join-Path $tmp 'src-tiny-n.txt'
+    [IO.File]::WriteAllText($srcTinyN, 'tiny', $utf8)
+
+    function New-DropShare {
+        # begin -> upload tiny files for the given relative paths -> finish -> start a share from the drop folder.
+        param($B, [string[]]$RelPaths, $Name = $null)
+        $r = Invoke-Post $B '/api/drop/begin' $null
+        $dropId = [string]$r.Json.dropId
+        $allOk = ($r.Status -eq 200)
+        foreach ($rel in $RelPaths) {
+            $u = Invoke-Upload $B $dropId $rel $srcTinyN
+            if ($u.Status -ne 200) { $allOk = $false }
+        }
+        $f = Invoke-Post $B '/api/drop/finish' @{ dropId = $dropId }
+        $leaf = [string]$f.Json.path
+        $st = Start-Share $B $leaf 5 'Fast' $false $Name
+        return [pscustomobject]@{ Id = $st.Id; Status = $st.Status; UploadsOk = $allOk -and ($f.Status -eq 200); DropId = $dropId; Leaf = $leaf; Root = (Split-Path -Parent $leaf) }
+    }
+
+    # ---- backend N: default names, drops that belong to shares, 5 shares in parallel
+    $N = Start-TestBackend -Scenario 'success' -Name 'N'
+    if ($N.Port -le 0) { throw 'Backend N did not start.' }
+    $dropsN = Join-Path $N.DataRoot 'drops'
+    $dirN = New-ShareDir 'Mein Projekt'
+
+    $n1 = New-DropShare $N @('Bericht.pdf')
+    Assert-True ($n1.UploadsOk -and $n1.Status -eq 200 -and $n1.Id) 'N: a single dropped file starts a share'
+    $shN1 = Wait-ForShare $N $n1.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shN1 -and $shN1.name -ceq 'Bericht.pdf' -and $shN1.dropFiles -eq 1) 'N: default name of a single dropped file is the file name (dropFiles 1)'
+    $sN = Get-State $N
+    Assert-True ($null -eq $sN.draft.drop -and (Test-Path -LiteralPath $n1.Leaf)) 'N: the draft is empty after the start and the drop folder now belongs to the share'
+
+    # a drop while another share is active works, and the new share owns its drop
+    $n2 = New-DropShare $N @('a.txt', 'b.txt', 'c.txt')
+    Assert-True ($n2.UploadsOk -and $n2.Status -eq 200 -and $n2.Id) 'N: drop + start while another share is active works'
+    $shN2 = Wait-ForShare $N $n2.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shN2 -and $shN2.name -ceq 'a.txt +2' -and $shN2.dropFiles -eq 3) 'N: 3 dropped files -> default name "a.txt +2" (dropFiles 3)'
+    Assert-True ((Test-Path -LiteralPath $n1.Leaf) -and (Test-Path -LiteralPath $n2.Leaf) -and $n1.Root -ne $n2.Root) 'N: both shares own their own drop folder'
+
+    $n3 = New-DropShare $N @('Projekt/x.txt', 'Projekt/sub/y.txt')
+    $shN3 = Wait-ForShare $N $n3.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shN3 -and $shN3.name -ceq 'Projekt' -and $shN3.dropFiles -eq 2) 'N: a dropped folder -> default name is the folder name'
+
+    $n4 = New-DropShare $N @('p.txt', 'q.txt') '  Eigener Name  '
+    $shN4 = Wait-ForShare $N $n4.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shN4 -and $shN4.name -ceq 'Eigener Name') 'N: a name sent by the client wins (and is trimmed)'
+
+    $stN5 = Start-Share $N $dirN 5
+    $shN5 = Wait-ForShare $N $stN5.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shN5 -and $shN5.name -ceq 'Mein Projekt' -and $null -eq $shN5.dropFiles) 'N: a picked/typed folder -> default name is its leaf name'
+
+    $sN = Get-State $N
+    $ids = @($sN.shares | ForEach-Object { $_.id })
+    $urls = @($sN.shares | ForEach-Object { $_.url })
+    Assert-True ($sN.running -eq 5 -and @($sN.shares).Count -eq 5 -and @($ids | Select-Object -Unique).Count -eq 5 -and @($urls | Select-Object -Unique).Count -eq 5) 'N: five shares run in parallel with distinct shareIds and links'
+    $stN6 = Start-Share $N $dirN 5
+    Assert-True ($stN6.Status -eq 409 -and [string]$stN6.R.Json.error) 'N: the sixth start with the default -MaxShares 5 -> 409'
+    $fakesN = @(Get-Fakes $N)
+    Assert-True ($fakesN.Count -eq 5 -and @($fakesN | Where-Object { Test-PidAlive $_.Pid }).Count -eq 5) 'N: five fake share processes are running'
+
+    # the drop of share 1 is deleted when share 1 ends while the other shares keep running
+    $r = Invoke-Post $N "/api/shares/$($n1.Id)/stop" $null
+    Assert-True ($r.Status -eq 200) 'N: stop share 1'
+    $shN1 = Wait-ForShare $N $n1.Id { param($x) $x.phase -eq 'ended' }
+    Assert-True ($null -ne $shN1) 'N: share 1 ends'
+    Assert-True (Wait-Until -TimeoutSec 10 -Condition { -not (Test-Path -LiteralPath $n1.Root) }) 'N: the drop folder of share 1 is deleted when it ends'
+    $sN = Get-State $N
+    Assert-True ((Get-ShareFromState $sN $n2.Id).phase -eq 'active' -and (Get-ShareFromState $sN $n3.Id).phase -eq 'active' -and $sN.running -eq 4) 'N: the other shares are still active'
+    Assert-True ((Test-Path -LiteralPath $n2.Leaf) -and (Test-Path -LiteralPath (Join-Path $n2.Leaf 'c.txt')) -and (Test-Path -LiteralPath $n3.Leaf)) 'N: the drop folders of the running shares are untouched'
+    $f2 = Get-FakeByPath $N $n2.Leaf
+    Assert-True ($null -ne $f2 -and (Test-PidAlive $f2.Pid)) 'N: the process of share 2 is still alive'
+    # a finished drop path cannot be shared a second time, and a share's drop cannot be touched through the draft
+    $stDup = Start-Share $N $n2.Leaf 5
+    Assert-True ($stDup.Status -eq 400) 'N: the drop folder of a running share cannot be started again -> 400'
+    $r = Invoke-Post $N '/api/drop/discard' @{ dropId = $n2.DropId }
+    Assert-True ($r.Status -eq 400 -and (Test-Path -LiteralPath $n2.Leaf)) 'N: a share''s drop cannot be discarded through the draft (400, folder stays)'
+    $r = Invoke-Upload $N $n2.DropId 'late.txt' $srcTinyN
+    Assert-True ($r.Status -eq 400 -and -not (Test-Path -LiteralPath (Join-Path $n2.Leaf 'late.txt'))) 'N: no upload into a share''s drop (400)'
+    # the draft: begin works while shares run; a start frees the slot of share 1 again
+    $r = Invoke-Post $N '/api/drop/begin' $null
+    $draftN = [string]$r.Json.dropId
+    $u = Invoke-Upload $N $draftN 'draft.txt' $srcTinyN
+    $sN = Get-State $N
+    Assert-True ($r.Status -eq 200 -and $u.Status -eq 200 -and $sN.draft.drop.id -eq $draftN -and $sN.draft.drop.files -eq 1 -and $sN.draft.drop.finished -eq $false) 'N: the draft collects files while four shares run (state.draft.drop)'
+    $draftRoot = Join-Path $dropsN $draftN
+    Test-GuiQuit $N 'N (4 active shares + a draft drop)'
+    Assert-True (@(Get-Fakes $N | Where-Object { Test-PidAlive $_.Pid }).Count -eq 0) 'N: quit stopped all four running shares'
+    Assert-True ((Get-FileCount $dropsN) -eq 0 -and -not (Test-Path -LiteralPath $draftRoot)) 'N: quit removed the draft drop and the drops of all shares'
+
+    # ---- backend M: -MaxShares 2, rename, dismiss, quit with two active shares
+    $M = Start-TestBackend -Scenario 'success' -Name 'M' -ExtraArgs '-MaxShares 2'
+    if ($M.Port -le 0) { throw 'Backend M did not start.' }
+    Assert-True ((Get-State $M).limits.maxShares -eq 2) 'M: state.limits.maxShares reflects -MaxShares 2'
+    $dirM1 = New-ShareDir 'one'
+    $dirM2 = New-ShareDir 'two'
+    $dirM3 = New-ShareDir 'three'
+    $stM1 = Start-Share $M $dirM1 5
+    $stM2 = Start-Share $M $dirM2 5
+    Assert-True ($stM1.Status -eq 200 -and $stM2.Status -eq 200 -and $stM1.Id -ne $stM2.Id) 'M: two shares started in parallel -> 200 with distinct shareIds'
+    $stM3 = Start-Share $M $dirM3 5
+    Assert-True ($stM3.Status -eq 409 -and [string]$stM3.R.Json.error) 'M: a third start with -MaxShares 2 -> 409'
+    $shM1 = Wait-ForShare $M $stM1.Id { param($x) $x.phase -eq 'active' }
+    $shM2 = Wait-ForShare $M $stM2.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shM1 -and $null -ne $shM2) 'M: both shares reach active'
+    if ($null -ne $shM1 -and $null -ne $shM2) {
+        Assert-True ($shM1.url -ne $shM2.url -and $shM1.url -match '^https://' -and $shM2.url -match '^https://') 'M: the two shares have distinct links'
+        Assert-True ($shM1.name -ceq 'one' -and $shM2.name -ceq 'two') 'M: default names are the folder leaf names'
+    }
+    $sM = Get-State $M
+    Assert-True ($sM.running -eq 2 -and @($sM.shares).Count -eq 2 -and [datetime]::Parse([string]@($sM.shares)[0].createdUtc) -le [datetime]::Parse([string]@($sM.shares)[1].createdUtc) -and @($sM.shares)[0].id -eq $stM1.Id) 'M: running 2, shares ordered by creation time'
+    $fM1 = Get-FakeByPath $M $dirM1
+    $fM2 = Get-FakeByPath $M $dirM2
+    Assert-True ($null -ne $fM1 -and $null -ne $fM2 -and $fM1.Pid -ne $fM2.Pid -and $fM1.Session -ne $fM2.Session) 'M: two fake processes with their own session folders'
+
+    # dismiss is refused while a share runs
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/dismiss" $null
+    Assert-True ($r.Status -eq 409) 'M: dismiss of an active share -> 409'
+
+    # stop one share: the other one stays active
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/stop" $null
+    Assert-True ($r.Status -eq 200) 'M: stop share one'
+    $shM1 = Wait-ForShare $M $stM1.Id { param($x) $x.phase -eq 'ended' }
+    Assert-True ($null -ne $shM1 -and $shM1.reason -eq 'ManualStop') 'M: share one ends'
+    Assert-True ((Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fM1.Pid) }) -and (Test-PidAlive $fM2.Pid) -and (Test-Path -LiteralPath $fM2.Session)) 'M: only the process of share one exited; share two keeps running'
+    $sM = Get-State $M
+    Assert-True ((Get-ShareFromState $sM $stM2.Id).phase -eq 'active' -and $sM.running -eq 1) 'M: share two stays active, running 1'
+
+    # a slot is free again
+    $stM3 = Start-Share $M $dirM3 5
+    Assert-True ($stM3.Status -eq 200) 'M: after one share ended a new start works'
+    $shM3 = Wait-ForShare $M $stM3.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shM3 -and @((Get-State $M).shares).Count -eq 3) 'M: the third share becomes active; the ended one is still listed'
+    $stM4 = Start-Share $M $dirM3 5
+    Assert-True ($stM4.Status -eq 409) 'M: two running again -> the next start is 409'
+
+    # rename
+    $idR = $stM2.Id
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = '  Neuer Name ä  ' }
+    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true -and $r.Json.name -ceq 'Neuer Name ä') 'M: rename -> 200 {ok, name} (trimmed, umlaut kept)'
+    Assert-True ((Get-ShareFromState (Get-State $M) $idR).name -ceq 'Neuer Name ä') 'M: the new name shows in the state'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = '' }
+    Assert-True ($r.Status -eq 400) 'M: rename to an empty name -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = '    ' }
+    Assert-True ($r.Status -eq 400) 'M: rename to blanks only -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = ('x' * 61) }
+    Assert-True ($r.Status -eq 400) 'M: rename to 61 characters -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = ('y' * 60) }
+    Assert-True ($r.Status -eq 200 -and $r.Json.name.Length -eq 60) 'M: rename to exactly 60 characters -> 200'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = ('a' + [char]1 + 'b') }
+    Assert-True ($r.Status -eq 400) 'M: rename with a control character -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = ('a' + [char]10) }
+    Assert-True ($r.Status -eq 400) 'M: rename with a line break -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ nom = 'x' }
+    Assert-True ($r.Status -eq 400) 'M: rename without a name field -> 400'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = 123 }
+    Assert-True ($r.Status -eq 400) 'M: rename with a non-string name -> 400'
+    $r = Invoke-Api -Method POST -Path "/api/shares/$idR/rename" -B $M -Token $M.Token -BodyText 'kein json'
+    Assert-True ($r.Status -eq 400) 'M: rename with invalid JSON -> 400'
+    Assert-True ((Get-ShareFromState (Get-State $M) $idR).name -ceq ('y' * 60)) 'M: rejected renames leave the name unchanged'
+    $r = Invoke-Post $M "/api/shares/$idR/rename" @{ name = 'three' }
+    Assert-True ($r.Status -eq 200) 'M: names do not have to be unique'
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/rename" @{ name = 'beendet' }
+    Assert-True ($r.Status -eq 200 -and (Get-ShareFromState (Get-State $M) $stM1.Id).name -ceq 'beendet') 'M: an ended share can be renamed too'
+
+    # dismiss
+    $r = Invoke-Post $M "/api/shares/$idR/dismiss" $null
+    Assert-True ($r.Status -eq 409) 'M: dismiss of an active (renamed) share -> 409'
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/dismiss" $null
+    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true) 'M: dismiss of an ended share -> 200'
+    $sM = Get-State $M
+    Assert-True ($null -eq (Get-ShareFromState $sM $stM1.Id) -and @($sM.shares).Count -eq 2) 'M: the dismissed share is gone from the list'
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/dismiss" $null
+    Assert-True ($r.Status -eq 404) 'M: dismissing it again -> 404'
+    $r = Invoke-Post $M "/api/shares/$($stM1.Id)/stop" $null
+    Assert-True ($r.Status -eq 404) 'M: a dismissed share id is unknown -> 404'
+
+    # quit with two active shares stops both
+    $fM3 = Get-FakeByPath $M $dirM3
+    Test-GuiQuit $M 'M (2 active shares)'
+    Assert-True ((Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fM2.Pid) -and -not (Test-PidAlive $fM3.Pid) })) 'M: quit stopped both running shares (both fakes exited)'
+
+    # ---- backend L: the list holds at most 20 shares (the oldest ended/error one is dismissed automatically)
+    $L = Start-TestBackend -Scenario 'fail22' -Name 'L'
+    if ($L.Port -le 0) { throw 'Backend L did not start.' }
+    $firstId = $null
+    $lastId = $null
+    $started = 0
+    while ($started -lt 22) {
+        $batch = @()
+        for ($i = 0; $i -lt 5 -and $started -lt 22; $i++) {
+            $st = Start-Share $L $shareDir 5
+            if ($st.Status -ne 200) { Write-Host ("       start #{0} -> {1} {2}" -f ($started + 1), $st.Status, $st.R.Body) }
+            if ($null -eq $firstId) { $firstId = $st.Id }
+            $lastId = $st.Id
+            $batch += $st.Id
+            $started++
+        }
+        $null = Wait-Until -TimeoutSec 30 -Condition {
+            $cur = Get-State $L
+            foreach ($bid in $batch) { $x = Get-ShareFromState $cur $bid; if ($null -ne $x -and $x.phase -notin @('error', 'ended')) { return $false } }
+            return $true
+        }
+    }
+    $sL = Get-State $L
+    Assert-True (@($sL.shares).Count -eq 20 -and $null -eq (Get-ShareFromState $sL $firstId) -and $null -ne (Get-ShareFromState $sL $lastId) -and $sL.running -eq 0) 'L: 22 starts -> at most 20 shares are listed; the oldest ended/error ones were dismissed automatically'
+    Test-GuiQuit $L 'L'
+
+    # ---- backend P: the folder picker runs in its own runspace and answers asynchronously (GUI_CONTRACT 8.4)
+    $dirP = New-ShareDir 'picker-target'
+    $dirPS = New-ShareDir 'picker-share'
+    $P = Start-TestBackend -Scenario 'success' -Name 'P' -ExtraArgs ('-TestPickerResult "7000:{0}"' -f $dirP)
+    if ($P.Port -le 0) { throw 'Backend P did not start.' }
+    $swPick = [Diagnostics.Stopwatch]::StartNew()
+    $bgPick = Start-BackgroundCurl -Tag 'pick' -CurlArgs @('-X', 'POST', '-H', "X-WS-Token: $($P.Token)", '-H', 'Content-Type: application/json', '--data-binary', '{}', ('http://127.0.0.1:{0}/api/pick-folder' -f $P.Port))
+    Start-Sleep -Milliseconds 1200
+    Assert-True (-not $bgPick.Proc.HasExited) 'P: the pick-folder request stays open while the dialog is "open"'
+    $r = Invoke-Post $P '/api/pick-folder' $null
+    Assert-True ($r.Status -eq 409) 'P: a second pick-folder while one is open -> 409'
+    $sP = Get-State $P
+    Assert-True ($null -ne $sP -and -not $bgPick.Proc.HasExited) 'P: /api/state is answered while the picker is open'
+    $stP = Start-Share $P $dirPS 5
+    $shP = Wait-ForShare $P $stP.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($stP.Status -eq 200 -and $null -ne $shP -and -not $bgPick.Proc.HasExited) 'P: a share starts and reaches active while the picker is still open (loop and pipes keep running)'
+    $null = $bgPick.Proc.WaitForExit(20000)
+    $resP = Get-BackgroundCurlResult $bgPick
+    Assert-True ($resP.Status -eq 200 -and $resP.Json.path -ceq $dirP) 'P: the deferred answer carries the picked path'
+    Assert-True ($swPick.Elapsed.TotalSeconds -ge 6.5) 'P: the answer came after the dialog delay, not before'
+    # a picker that is still open when the backend quits must not keep it alive
+    $bgPick2 = Start-BackgroundCurl -Tag 'pick2' -CurlArgs @('-X', 'POST', '-H', "X-WS-Token: $($P.Token)", '-H', 'Content-Type: application/json', '--data-binary', '{}', ('http://127.0.0.1:{0}/api/pick-folder' -f $P.Port))
+    Start-Sleep -Milliseconds 500
+    $r = Invoke-Post $P '/api/pick-folder' $null
+    Assert-True ($r.Status -eq 409) 'P: after the first answer a new picker can be opened (and is open now)'
+    Test-GuiQuit $P 'P (picker open, 1 share)'
+    try { if (-not $bgPick2.Proc.HasExited) { $bgPick2.Proc.Kill() } } catch { }
+
+    $P2 = Start-TestBackend -Scenario 'success' -Name 'P2' -ExtraArgs '-TestPickerResult "0:"'
+    if ($P2.Port -le 0) { throw 'Backend P2 did not start.' }
+    $r = Invoke-Post $P2 '/api/pick-folder' $null
+    Assert-True ($r.Status -eq 200 -and $r.Json.cancelled -eq $true) 'P2: a cancelled dialog -> {cancelled:true}'
+    $r = Invoke-Post $P2 '/api/pick-folder' $null
+    Assert-True ($r.Status -eq 200 -and $r.Json.cancelled -eq $true) 'P2: the picker can be used again after it finished'
+    Test-GuiQuit $P2 'P2'
+
+    # ---- backend X: a chatty share must not stall while a big upload blocks the request (pipes are drained)
+    $X = Start-TestBackend -Scenario 'chatty' -Name 'X'
+    if ($X.Port -le 0) { throw 'Backend X did not start.' }
+    $big = Join-Path $tmp 'src-20m.bin'
+    New-RandomFile $big 20971520 31
+    $r = Invoke-Post $X '/api/drop/begin' $null
+    $dropX = [string]$r.Json.dropId
+    $dirX = New-ShareDir 'chatty-share'
+    $stX = Start-Share $X $dirX 5
+    Assert-True ($stX.Status -eq 200) 'X: chatty share starts'
+    $upUrl = 'http://127.0.0.1:{0}/api/drop/file?drop={1}&path={2}' -f $X.Port, $dropX, [Uri]::EscapeDataString('big20.bin')
+    $swUp = [Diagnostics.Stopwatch]::StartNew()
+    $bgUp = Start-BackgroundCurl -Tag 'up' -CurlArgs @('--limit-rate', '4M', '-X', 'POST', '-H', "X-WS-Token: $($X.Token)", '-H', 'Content-Type: application/octet-stream', '--data-binary', "@$big", $upUrl)
+    # While the backend is busy with the upload it cannot answer HTTP; the fake reports when its last noise line went through the pipe.
+    $noiseFile = $null
+    $gotNoise = Wait-Until -TimeoutSec 20 -IntervalMs 100 -Condition {
+        if ($bgUp.Proc.HasExited) { return $true }
+        foreach ($f in @(Get-Fakes $X)) { if (Test-Path -LiteralPath ($f.File + '.noise')) { return $true } }
+        return $false
+    }
+    $noiseDuringUpload = $false
+    foreach ($f in @(Get-Fakes $X)) { if (Test-Path -LiteralPath ($f.File + '.noise')) { $noiseDuringUpload = $true } }
+    $uploadStillRunning = -not $bgUp.Proc.HasExited
+    Write-Host ("       noise written after {0:N1} s, upload still running: {1}" -f $swUp.Elapsed.TotalSeconds, $uploadStillRunning)
+    Assert-True ($gotNoise -and $noiseDuringUpload -and $uploadStillRunning) 'X: the chatty share wrote its 200 KB of output while the 20 MB upload was still in progress (children are drained during the upload)'
+    $null = $bgUp.Proc.WaitForExit(60000)
+    $resUp = Get-BackgroundCurlResult $bgUp
+    Assert-True ($resUp.Status -eq 200 -and $resUp.Json.bytes -eq 20971520) 'X: the 20 MB upload succeeds'
+    $shX = Wait-ForShare $X $stX.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shX) 'X: the chatty share reaches active'
+    if ($null -ne $shX) {
+        $noiseLines = @($shX.log | Where-Object { $_ -match '^N{50,}$' })
+        Assert-True ($noiseLines.Count -ge 100) "X: the noise lines were captured in the share's log ring buffer ($($noiseLines.Count) lines, max 200 kept)"
+        Assert-True (@($shX.log).Count -le 200) 'X: the log ring buffer keeps at most 200 lines'
+    }
+    $r = Invoke-Post $X '/api/drop/finish' @{ dropId = $dropX }
+    $dropFileX = Join-Path (Join-Path $X.DataRoot 'drops') $dropX
+    $leafX = [string]$r.Json.path
+    Assert-True ($r.Status -eq 200 -and $r.Json.files -eq 1 -and (Get-FileSha (Join-Path $leafX 'big20.bin')) -eq (Get-FileSha $big)) 'X: the uploaded 20 MB file is bit-identical'
+    Test-GuiQuit $X 'X'
+    Assert-True (@(Get-Fakes $X | Where-Object { Test-PidAlive $_.Pid }).Count -eq 0) 'X: the chatty share is gone after quit'
+
 }
 catch {
     $script:Fail++

@@ -5,6 +5,10 @@
   var POLL_MS = 1000;
   var MAX_FAILS = 5;
   var TOTAL_STEPS = 8;
+  var NAME_MAX = 60;
+  var NEW_TAB = 'new';
+  var TOKEN_KEY = 'ws.token';
+  var TAB_KEY_PREFIX = 'ws.tab.';
 
   var MSG_NO_TOKEN = 'Bitte die GUI über die Verknüpfung öffnen.';
   var MSG_LOST = 'Verbindung zum WorkspaceShare-Dienst verloren. Fenster schließen und über die Verknüpfung neu starten.';
@@ -42,12 +46,23 @@
     TestSnapshotOnly: 'Testlauf: nur Snapshot erstellt.'
   };
 
+  // Screen-reader text for the status dot of a tab.
+  var PHASE_LABELS = {
+    starting: 'wird vorbereitet',
+    active: 'aktiv',
+    stopping: 'wird beendet',
+    ended: 'beendet',
+    error: 'Fehler'
+  };
+
   // ---------------------------------------------------------------- helpers
   function $(id) { return document.getElementById(id); }
 
   var els = {
     live: $('live'),
     foot: $('foot'),
+    headCount: $('head-count'),
+    tabbar: $('tabbar'), tablist: $('tablist'), panel: $('panel'),
     views: {
       fatal: $('view-fatal'),
       quit: $('view-quit'),
@@ -55,15 +70,20 @@
       form: $('view-form'),
       progress: $('view-progress'),
       active: $('view-active'),
-      stopping: $('view-stopping')
+      stopping: $('view-stopping'),
+      done: $('view-done')
     },
     fatalText: $('fatal-text'),
+    shareHead: $('share-head'), nameView: $('name-view'), shareTitle: $('share-title'),
+    btnRename: $('btn-rename'), renameForm: $('rename-form'), renameInput: $('rename-input'),
+    renameError: $('rename-error'),
     endedBox: $('ended-box'), endedText: $('ended-text'),
     errorBox: $('error-box'), errorTitle: $('error-title'), errorHint: $('error-hint'),
     errorMessage: $('error-message'), errorDetails: $('error-details'), errorLog: $('error-log'),
-    form: $('form'), folder: $('folder'), btnPick: $('btn-pick'), minutes: $('minutes'),
-    compression: $('compression'), includeGenerated: $('include-generated'),
-    advanced: $('advanced'), formError: $('form-error'), btnStart: $('btn-start'),
+    btnDismiss: $('btn-dismiss'),
+    form: $('form'), folder: $('folder'), btnPick: $('btn-pick'), nameInput: $('name-input'),
+    minutes: $('minutes'), compression: $('compression'), includeGenerated: $('include-generated'),
+    advanced: $('advanced'), formError: $('form-error'), limitHint: $('limit-hint'), btnStart: $('btn-start'),
     steps: $('steps'), stepCurrent: $('step-current'), btnCancel: $('btn-cancel'),
     shareUrl: $('share-url'), btnCopy: $('btn-copy'), copyError: $('copy-error'),
     factUntil: $('fact-until'), factRemaining: $('fact-remaining'), factSize: $('fact-size'),
@@ -76,6 +96,9 @@
     dropStatus: $('drop-status'), dropError: $('drop-error'),
     dropInfo: $('drop-info'), dropSummary: $('drop-summary'), btnDropRemove: $('btn-drop-remove')
   };
+
+  var SHARE_VIEWS = { progress: true, active: true, stopping: true, done: true };
+  var BARE_VIEWS = { fatal: true, quit: true, loading: true };
 
   function setText(el, text) {
     var t = text == null ? '' : String(text);
@@ -120,6 +143,19 @@
     return d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit' }) + ', ' + time + ' Uhr';
   }
 
+  function num(v) { return typeof v === 'number' && isFinite(v) && v >= 0 ? v : 0; }
+  function posNum(v) { return typeof v === 'number' && isFinite(v) && v > 0 ? v : 0; }
+
+  function isRunningPhase(p) { return p === 'starting' || p === 'active' || p === 'stopping'; }
+
+  // Last path segment of a typed folder (display only; the backend computes the real default).
+  function leafOf(p) {
+    var parts = String(p).split(/[\\\/]+/).filter(function (x) { return x; });
+    return parts.length ? parts[parts.length - 1] : '';
+  }
+
+  function clipName(s) { return s.length > NAME_MAX ? s.slice(0, NAME_MAX) : s; }
+
   // ---------------------------------------------------------------- mock API (file: + ?mock=1 only)
   function createMockApi() {
     var STEP_TEXTS = [
@@ -132,16 +168,11 @@
       'Tunnel wird aufgebaut ...',
       'Öffentlicher Link wird geprüft ...'
     ];
-    var s = {
-      phase: 'idle', step: 0, steps: [], url: null, expiresUtc: null, sizeBytes: null, sha256: null,
-      health: null, exitCode: null, reason: null, message: null, log: [], request: null,
-      drop: null, dropPaths: {}, dropInUse: false
-    };
-    var MOCK_LIMITS = { maxDropBytes: 4294967296, maxDropFiles: 10000 };
-    var timer = null;
-    var failAt = 0;
-
-    function clear() { if (timer) { window.clearInterval(timer); window.clearTimeout(timer); timer = null; } }
+    var MOCK_LIMITS = { maxDropBytes: 4294967296, maxDropFiles: 10000, maxShares: 3 };
+    var PICKS = ['C:\\Projekte\\Beispiel-Workspace', 'C:\\Projekte\\Webseite', 'C:\\Projekte\\Berichte 2026'];
+    var shares = [];
+    var draft = null;       // { id, path, files, totalBytes, finished, paths, tops }
+    var pickIndex = 0;
 
     function randomHex(n) {
       var out = '';
@@ -158,11 +189,6 @@
       return 'C:\\Users\\Beispiel\\AppData\\Local\\WorkspaceShare\\drops\\' + id + '\\Dateien-' + stamp;
     }
 
-    // The backend deletes the drop folder once its share has ended.
-    function releaseDropAfterShare() {
-      if (s.dropInUse) { s.drop = null; s.dropPaths = {}; s.dropInUse = false; }
-    }
-
     function parseQuery(q) {
       var out = {};
       (q || '').split('&').forEach(function (kv) {
@@ -175,102 +201,168 @@
       return out;
     }
 
-    function snapshot() {
+    function runningCount() {
+      return shares.filter(function (x) { return isRunningPhase(x.phase); }).length;
+    }
+
+    function findShare(id) {
+      for (var i = 0; i < shares.length; i++) { if (shares[i].id === id) { return shares[i]; } }
+      return null;
+    }
+
+    function clearTimers(sh) {
+      if (sh.timer) { window.clearInterval(sh.timer); window.clearTimeout(sh.timer); sh.timer = null; }
+      if (sh.healthTimer) { window.clearTimeout(sh.healthTimer); sh.healthTimer = null; }
+    }
+
+    // Mirrors contract 8.2.
+    function defaultName(path) {
+      if (draft && draft.finished && draft.path === path && draft.tops.length) {
+        return draft.tops.length === 1 ? draft.tops[0] : draft.tops[0] + ' +' + (draft.tops.length - 1);
+      }
+      return leafOf(path) || 'Freigabe';
+    }
+
+    // Name rules of the backend: trimmed, 1-60 chars, no control characters ("fehler" is a mock-only rejection).
+    function nameProblem(raw) {
+      var n = typeof raw === 'string' ? raw.trim() : '';
+      if (!n || n.length > NAME_MAX || /[\u0000-\u001f\u007f]/.test(n)) {
+        return 'Der Name muss 1 bis 60 Zeichen lang sein und darf keine Steuerzeichen enthalten.';
+      }
+      if (/fehler/i.test(n)) { return 'Dieser Name wurde vom Mock abgelehnt.'; }
+      return '';
+    }
+
+    function shareSnap(sh) {
       var rem = null;
-      if (s.expiresUtc) { rem = Math.max(0, Math.ceil((Date.parse(s.expiresUtc) - Date.now()) / 60000)); }
+      if (sh.expiresUtc) { rem = Math.max(0, Math.ceil((Date.parse(sh.expiresUtc) - Date.now()) / 60000)); }
       return {
-        v: 1, phase: s.phase, platform: 'windows',
-        capabilities: { folderPicker: true, clipboard: true, openBrowser: true },
-        step: s.step, total: TOTAL_STEPS, stepText: s.step ? STEP_TEXTS[s.step - 1] : null,
-        steps: s.steps.slice(), url: s.url, expiresUtc: s.expiresUtc, sizeBytes: s.sizeBytes, sha256: s.sha256,
-        remainingMinutes: rem, health: s.health, exitCode: s.exitCode, reason: s.reason, message: s.message,
-        log: s.log.slice(), request: s.request,
-        drop: s.drop ? {
-          id: s.drop.id, path: s.drop.path, files: s.drop.files,
-          totalBytes: s.drop.totalBytes, finished: s.drop.finished
-        } : null,
-        limits: MOCK_LIMITS
+        id: sh.id, name: sh.name, createdUtc: sh.createdUtc, phase: sh.phase,
+        step: sh.step, total: TOTAL_STEPS, stepText: sh.step ? STEP_TEXTS[sh.step - 1] : null,
+        steps: sh.steps.slice(), url: sh.url, expiresUtc: sh.expiresUtc, sizeBytes: sh.sizeBytes, sha256: sh.sha256,
+        remainingMinutes: rem, health: sh.health, exitCode: sh.exitCode, reason: sh.reason, message: sh.message,
+        log: sh.log.slice(), request: sh.request, dropFiles: sh.dropFiles
       };
     }
 
-    function beginEnd(reason, message) {
-      clear();
-      s.phase = 'stopping';
-      timer = window.setTimeout(function () {
-        s.phase = 'ended'; s.exitCode = 0; s.reason = reason; s.message = message;
-        s.url = null; s.expiresUtc = null; timer = null;
-        releaseDropAfterShare();
+    function snapshot() {
+      return {
+        v: 2, build: 'mock', platform: 'windows',
+        capabilities: { folderPicker: true, clipboard: true, openBrowser: true },
+        limits: MOCK_LIMITS,
+        running: runningCount(),
+        draft: {
+          drop: draft ? { id: draft.id, path: draft.path, files: draft.files, totalBytes: draft.totalBytes, finished: draft.finished } : null
+        },
+        shares: shares.map(shareSnap)
+      };
+    }
+
+    function beginEnd(sh, reason, message) {
+      clearTimers(sh);
+      sh.phase = 'stopping';
+      sh.timer = window.setTimeout(function () {
+        sh.phase = 'ended'; sh.exitCode = 0; sh.reason = reason; sh.message = message;
+        sh.url = null; sh.expiresUtc = null; sh.timer = null;
       }, 1500);
     }
 
-    function startRun(req) {
-      clear();
-      s.request = req;
-      s.dropInUse = !!(s.drop && s.drop.finished && s.drop.path === req.path);
-      s.phase = 'starting'; s.step = 0; s.steps = []; s.url = null; s.health = null;
-      s.exitCode = null; s.reason = null; s.message = null;
-      s.log = ['[mock] Start: ' + req.path];
-      failAt = /fehler/i.test(req.path) ? 4 : 0;
-      timer = window.setInterval(function () {
-        s.step += 1;
-        s.steps.push({ n: s.step, text: STEP_TEXTS[s.step - 1] });
-        s.log.push('[mock] Schritt ' + s.step + '/' + TOTAL_STEPS);
-        if (failAt && s.step === failAt) {
-          clear();
-          s.phase = 'error'; s.exitCode = 22; s.reason = 'SecretScan';
-          s.message = 'Verbotene Datei gefunden: .env (Mock)';
-          s.log.push('[mock] FEHLER: Verbotene Datei gefunden');
-          releaseDropAfterShare();
+    function startRun(req, name, dropFiles) {
+      var sh = {
+        id: randomHex(8), name: name, createdUtc: new Date().toISOString(), phase: 'starting',
+        step: 0, steps: [], url: null, expiresUtc: null, sizeBytes: null, sha256: null, health: null,
+        exitCode: null, reason: null, message: null, log: ['[mock] Start: ' + req.path],
+        request: req, dropFiles: dropFiles, timer: null, healthTimer: null
+      };
+      var failAt = /fehler/i.test(req.path) ? 4 : 0;
+      shares.push(sh);
+      sh.timer = window.setInterval(function () {
+        sh.step += 1;
+        sh.steps.push({ n: sh.step, text: STEP_TEXTS[sh.step - 1] });
+        sh.log.push('[mock] Schritt ' + sh.step + '/' + TOTAL_STEPS);
+        if (failAt && sh.step === failAt) {
+          clearTimers(sh);
+          sh.phase = 'error'; sh.exitCode = 22; sh.reason = 'SecretScan';
+          sh.message = 'Verbotene Datei gefunden: .env (Mock)';
+          sh.log.push('[mock] FEHLER: Verbotene Datei gefunden');
           return;
         }
-        if (s.step >= TOTAL_STEPS) {
-          clear();
-          s.phase = 'active';
-          s.url = 'https://mock-demo-share-abc123.trycloudflare.com/workspace-8f3c2a91.zip';
-          s.expiresUtc = new Date(Date.now() + req.minutes * 60000).toISOString();
-          s.sizeBytes = 48234496;
-          s.sha256 = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
-          s.health = 'ok';
-          timer = window.setTimeout(function () { s.health = 'degraded'; timer = window.setTimeout(function () { s.health = 'recovered'; timer = null; }, 6000); }, 12000);
+        if (sh.step >= TOTAL_STEPS) {
+          clearTimers(sh);
+          sh.phase = 'active';
+          sh.url = 'https://mock-' + sh.id + '.trycloudflare.com/workspace-' + sh.id + '.zip';
+          sh.expiresUtc = new Date(Date.now() + req.minutes * 60000).toISOString();
+          sh.sizeBytes = 48234496;
+          sh.sha256 = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+          sh.health = 'ok';
+          sh.healthTimer = window.setTimeout(function () {
+            sh.health = 'degraded';
+            sh.healthTimer = window.setTimeout(function () { sh.health = 'recovered'; sh.healthTimer = null; }, 6000);
+          }, 12000);
         }
       }, 700);
+      return sh;
     }
 
-    function dropPhaseOk() { return s.phase === 'idle' || s.phase === 'ended' || s.phase === 'error'; }
-
-    // Mock of the /api/drop/* endpoints (body of /api/drop/file is the File).
+    // Mock of the /api/drop/* endpoints (body of /api/drop/file is the File). Allowed while shares run.
     function mockDrop(p, query, body) {
-      if (!dropPhaseOk()) { return { status: 409, data: { error: 'Im aktuellen Zustand nicht möglich.' } }; }
       if (p === '/api/drop/begin') {
         var id = randomHex(32);
-        s.drop = { id: id, path: newDropPath(id), files: 0, totalBytes: 0, finished: false };
-        s.dropPaths = {};
-        s.dropInUse = false;
+        draft = { id: id, path: newDropPath(id), files: 0, totalBytes: 0, finished: false, paths: {}, tops: [] };
         return { status: 200, data: { dropId: id } };
       }
       var q = parseQuery(query);
       var b = body || {};
       if (p === '/api/drop/file') {
-        if (!s.drop || s.drop.finished || q.drop !== s.drop.id) { return { status: 400, data: { error: 'Unbekannte Ablage.' } }; }
+        if (!draft || draft.finished || q.drop !== draft.id) { return { status: 400, data: { error: 'Unbekannte Ablage.' } }; }
         var rel = q.path || '';
         if (/fehler/i.test(rel)) { return { status: 400, data: { error: 'Ungültiger Dateiname: ' + rel + ' (Mock)' } }; }
         if (/voll/i.test(rel)) { return { status: 507, data: {} }; }
         var key = rel.toLowerCase();
-        if (s.dropPaths[key]) { return { status: 409, data: { error: 'Datei doppelt: ' + rel } }; }
-        s.dropPaths[key] = true;
+        if (draft.paths[key]) { return { status: 409, data: { error: 'Datei doppelt: ' + rel } }; }
+        draft.paths[key] = true;
+        var top = rel.split('/')[0];
+        if (draft.tops.indexOf(top) < 0) { draft.tops.push(top); }
         var size = typeof b.size === 'number' ? b.size : 0;
-        s.drop.files += 1;
-        s.drop.totalBytes += size;
+        draft.files += 1;
+        draft.totalBytes += size;
         return { status: 200, data: { ok: true, bytes: size } };
       }
       if (p === '/api/drop/finish' || p === '/api/drop/discard') {
-        if (!s.drop || b.dropId !== s.drop.id) {
+        if (!draft || b.dropId !== draft.id) {
           return { status: p === '/api/drop/discard' ? 200 : 400, data: p === '/api/drop/discard' ? { ok: true } : { error: 'Unbekannte Ablage.' } };
         }
-        if (p === '/api/drop/discard') { s.drop = null; s.dropPaths = {}; return { status: 200, data: { ok: true } }; }
-        if (s.drop.files < 1) { return { status: 400, data: { error: 'Es wurde keine Datei empfangen.' } }; }
-        s.drop.finished = true;
-        return { status: 200, data: { path: s.drop.path, files: s.drop.files, totalBytes: s.drop.totalBytes } };
+        if (p === '/api/drop/discard') { draft = null; return { status: 200, data: { ok: true } }; }
+        if (draft.files < 1) { return { status: 400, data: { error: 'Es wurde keine Datei empfangen.' } }; }
+        draft.finished = true;
+        return { status: 200, data: { path: draft.path, files: draft.files, totalBytes: draft.totalBytes } };
+      }
+      return { status: 404, data: { error: 'Unbekannt' } };
+    }
+
+    function mockShareAction(id, act, body) {
+      var sh = findShare(id);
+      if (!sh) { return { status: 404, data: { error: 'Unbekannte Freigabe.' } }; }
+      var b = body || {};
+      if (act === 'stop') {
+        if (sh.phase === 'starting' || sh.phase === 'active') { beginEnd(sh, 'ManualStop', 'Freigabe wurde beendet.'); }
+        else if (sh.phase !== 'stopping') { return { status: 409, data: { error: 'Die Freigabe ist bereits beendet.' } }; }
+        return { status: 200, data: { ok: true } };
+      }
+      if (act === 'copy') {
+        return sh.url ? { status: 200, data: { ok: true } } : { status: 409, data: { error: 'Kein Link vorhanden.' } };
+      }
+      if (act === 'rename') {
+        var prob = nameProblem(b.name);
+        if (prob) { return { status: 400, data: { error: prob } }; }
+        sh.name = b.name.trim();
+        return { status: 200, data: { ok: true, name: sh.name } };
+      }
+      if (act === 'dismiss') {
+        if (sh.phase !== 'ended' && sh.phase !== 'error') { return { status: 409, data: { error: 'Die Freigabe läuft noch.' } }; }
+        clearTimers(sh);
+        shares.splice(shares.indexOf(sh), 1);
+        return { status: 200, data: { ok: true } };
       }
       return { status: 404, data: { error: 'Unbekannt' } };
     }
@@ -283,29 +375,32 @@
         // ~300 ms per uploaded file
         window.setTimeout(function () {
           var r = { status: 200, data: {} };
+          var m = /^\/api\/shares\/([0-9a-f]{8})\/(stop|copy|rename|dismiss)$/.exec(path);
           if (path.indexOf('/api/drop/') === 0) {
             r = mockDrop(path, query, body);
+          } else if (m) {
+            r = mockShareAction(m[1], m[2], body);
           } else if (path === '/api/state') {
             r.data = snapshot();
           } else if (path === '/api/pick-folder') {
-            r.data = { path: 'C:\\Projekte\\Beispiel-Workspace' };
+            r.data = { path: PICKS[pickIndex++ % PICKS.length] };
           } else if (path === '/api/start') {
-            if (s.phase === 'starting' || s.phase === 'active' || s.phase === 'stopping') {
-              r = { status: 409, data: { error: 'Es läuft bereits eine Freigabe.' } };
+            if (runningCount() >= MOCK_LIMITS.maxShares) {
+              r = { status: 409, data: { error: 'Maximal ' + MOCK_LIMITS.maxShares + ' Freigaben gleichzeitig.' } };
             } else if (!body || !body.path) {
               r = { status: 400, data: { error: 'Der Ordner existiert nicht.' } };
+            } else if (typeof body.name === 'string' && body.name.trim() && nameProblem(body.name)) {
+              r = { status: 400, data: { error: nameProblem(body.name) } };
             } else {
-              startRun({ path: body.path, minutes: body.minutes, compression: body.compression, includeGenerated: !!body.includeGenerated });
-              r.data = { ok: true };
+              var nm = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : defaultName(body.path);
+              var dropFiles = null;
+              if (draft && draft.finished && draft.path === body.path) { dropFiles = draft.files; draft = null; }
+              var sh = startRun({ path: body.path, minutes: body.minutes, compression: body.compression, includeGenerated: !!body.includeGenerated }, nm, dropFiles);
+              r.data = { ok: true, shareId: sh.id };
             }
-          } else if (path === '/api/stop') {
-            if (s.phase === 'starting' || s.phase === 'active') { beginEnd('UserStop', 'Freigabe wurde beendet.'); }
-            r.data = { ok: true };
-          } else if (path === '/api/copy') {
-            r = s.url ? { status: 200, data: { ok: true } } : { status: 409, data: { error: 'Kein Link vorhanden.' } };
           } else if (path === '/api/quit') {
-            clear();
-            s.drop = null;
+            shares.forEach(clearTimers);
+            draft = null;
             r.data = { ok: true };
           } else {
             r = { status: 404, data: { error: 'Unbekannt' } };
@@ -341,6 +436,21 @@
     });
   }
 
+  function shareApi(id, act) { return '/api/shares/' + encodeURIComponent(id) + '/' + act; }
+
+  // ---------------------------------------------------------------- session storage (per browser tab, never the URL)
+  function storageGet(key) {
+    try { return window.sessionStorage.getItem(key); } catch (e) { return null; }
+  }
+
+  function storageSet(key, value) {
+    try { window.sessionStorage.setItem(key, value); } catch (e) { /* ignore */ }
+  }
+
+  function storageRemove(key) {
+    try { window.sessionStorage.removeItem(key); } catch (e) { /* ignore */ }
+  }
+
   // ---------------------------------------------------------------- view switching
   var currentView = '';
 
@@ -348,6 +458,11 @@
     if (currentView === name) { return; }
     currentView = name;
     Object.keys(els.views).forEach(function (k) { setHidden(els.views[k], k !== name); });
+    var bare = !!BARE_VIEWS[name];
+    setHidden(els.tabbar, bare);
+    setHidden(els.panel, bare);
+    setHidden(els.headCount, bare);
+    setHidden(els.shareHead, !SHARE_VIEWS[name]);
   }
 
   function showFatal(text, keepFooter) {
@@ -363,7 +478,8 @@
   var stopped = false;
   var fails = 0;
   var lastState = null;
-  var lastAnnounce = '';
+  var lastRenderable = false;   // lastState is a usable state v2
+  var outdatedShown = false;
   var knownBuild = null;        // build id of the backend seen on the first poll
 
   function stopPolling() {
@@ -385,14 +501,16 @@
     api('GET', '/api/state').then(function (r) {
       if (stopped) { return; }
       if (r.status === 401 || r.status === 403) {
+        // The backend was restarted (new token): the stored one is useless now.
+        storageRemove(TOKEN_KEY);
         stopPolling();
         showFatal(MSG_UNAUTH, false);
         return;
       }
-      if (r.status !== 200 || !r.data || typeof r.data.phase !== 'string') {
+      if (r.status !== 200 || !r.data || typeof r.data !== 'object') {
         throw new Error('bad state');
       }
-      // Backend replaced while this page is open: the token in the URL is gone, so reloading cannot help.
+      // Backend replaced while this page is open: reloading cannot help, the page must be opened again.
       if (typeof r.data.build === 'string') {
         if (knownBuild === null) { knownBuild = r.data.build; }
         else if (knownBuild !== r.data.build) {
@@ -403,9 +521,22 @@
       }
       fails = 0;
       lastState = r.data;
-      // An older backend answers the state without drop limits (and has no /api/drop/*).
+      // An older backend answers a state without the v2 share list.
+      if (r.data.v !== 2 || !Array.isArray(r.data.shares)) {
+        lastRenderable = false;
+        if (!outdatedShown) {
+          outdatedShown = true;
+          showFatal(MSG_OUTDATED, true);
+        }
+        return;
+      }
+      lastRenderable = true;
       if (!r.data.limits || typeof r.data.limits !== 'object') { markOutdated(); }
-      render(r.data, epoch !== dropEpoch);
+      try {
+        render(r.data, epoch !== dropEpoch);
+      } catch (e) {
+        if (window.console && console.error) { console.error(e); }
+      }
     }).catch(function () {
       if (stopped) { return; }
       fails++;
@@ -436,57 +567,346 @@
     });
   }
 
-  // ---------------------------------------------------------------- rendering
-  var formDirty = false;
-  var formPrefilled = false;
+  // ---------------------------------------------------------------- selection / tabs
+  var selected = null;            // shareId, NEW_TAB, or null before the first state
+  var tabStop = null;             // tab key holding tabindex 0 (roving)
+  var selectionInit = false;
+  var storageKey = null;
+  var pendingSelect = null;       // freshly started share that the state does not list yet
+  var pendingUntil = 0;
+  var lastIds = [];
+  var seenPhases = null;          // shareId -> last seen phase (null before the first state)
+  var tabEls = {};                // key -> { btn, dot, label, sr }
+  var renameOverrides = {};       // shareId -> { name, until }; hides a stale poll right after a rename
+  var editingId = null;
+  var renameBusy = false;
+  var shareUiKey = '';
+  var lastTabScroll = null;
   var stepsSig = '';
-  var DROP_PATH_RE = /[\\\/]drops[\\\/][0-9a-f]{32}(?:[\\\/]|$)/i;
+  var announceKey = '';
 
-  function prefillForm(req) {
-    if (formDirty || formPrefilled || !req) { return; }
-    formPrefilled = true;
-    // A path inside the drop area belongs to a drop that is gone by now.
-    if (typeof req.path === 'string' && !DROP_PATH_RE.test(req.path)) { els.folder.value = req.path; }
-    if (req.minutes != null && els.minutes.querySelector('option[value="' + String(req.minutes).replace(/[^0-9]/g, '') + '"]')) {
-      els.minutes.value = String(req.minutes);
-    }
-    if (req.compression === 'Fast' || req.compression === 'Store') { els.compression.value = req.compression; }
-    els.includeGenerated.checked = !!req.includeGenerated;
-    if (req.compression === 'Store' || req.includeGenerated) { els.advanced.open = true; }
+  function findShare(id) {
+    var list = lastState && Array.isArray(lastState.shares) ? lastState.shares : [];
+    for (var i = 0; i < list.length; i++) { if (list[i] && list[i].id === id) { return list[i]; } }
+    return null;
   }
 
-  function renderForm(st) {
-    setHidden(els.btnPick, !(st.capabilities && st.capabilities.folderPicker));
-    prefillForm(st.request);
+  function shareName(sh) {
+    var o = renameOverrides[sh.id];
+    if (o) {
+      if (o.name === sh.name || Date.now() > o.until) { delete renameOverrides[sh.id]; }
+      else { return o.name; }
+    }
+    return typeof sh.name === 'string' && sh.name ? sh.name : 'Freigabe';
+  }
 
-    var ended = st.phase === 'ended';
-    var failed = st.phase === 'error';
+  function runningOf(st) {
+    if (!st) { return 0; }
+    if (Array.isArray(st.shares)) {
+      if (typeof st.running === 'number' && isFinite(st.running)) { return st.running; }
+      return st.shares.filter(function (s) { return s && isRunningPhase(s.phase); }).length;
+    }
+    return isRunningPhase(st.phase) ? 1 : 0;
+  }
+
+  function storeSelection() {
+    if (storageKey && selected) { storageSet(storageKey, selected); }
+  }
+
+  function chooseInitialSelection(shares) {
+    var stored = storageKey ? storageGet(storageKey) : null;
+    if (stored === NEW_TAB) { return NEW_TAB; }
+    if (stored) {
+      for (var i = 0; i < shares.length; i++) { if (shares[i].id === stored) { return stored; } }
+    }
+    for (var j = shares.length - 1; j >= 0; j--) {
+      if (isRunningPhase(shares[j].phase)) { return shares[j].id; }
+    }
+    return NEW_TAB;
+  }
+
+  function makeTab(key) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'tab-' + key;
+    btn.className = 'tab' + (key === NEW_TAB ? ' tab-new' : '');
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-controls', 'panel');
+    btn.setAttribute('data-key', key);
+    var dot = null;
+    if (key !== NEW_TAB) {
+      dot = document.createElement('span');
+      dot.setAttribute('aria-hidden', 'true');
+      dot.className = 'tdot';
+      btn.appendChild(dot);
+    }
+    var label = document.createElement('span');
+    label.className = 'tab-label';
+    btn.appendChild(label);
+    var sr = null;
+    if (key !== NEW_TAB) {
+      sr = document.createElement('span');
+      sr.className = 'sr-only';
+      btn.appendChild(sr);
+    }
+    return { btn: btn, dot: dot, label: label, sr: sr };
+  }
+
+  function tabKeys() {
+    return Array.prototype.map.call(els.tablist.children, function (c) { return c.getAttribute('data-key'); });
+  }
+
+  function updateTabIndexes() {
+    var stop = tabEls[tabStop] ? tabStop : (tabEls[selected] ? selected : NEW_TAB);
+    Object.keys(tabEls).forEach(function (k) {
+      var t = tabEls[k];
+      t.btn.setAttribute('tabindex', k === stop ? '0' : '-1');
+    });
+  }
+
+  function scrollTabIntoView(key) {
+    var t = tabEls[key];
+    if (!t) { return; }
+    var bar = els.tabbar;
+    var left = t.btn.offsetLeft;
+    var right = left + t.btn.offsetWidth;
+    if (left < bar.scrollLeft) { bar.scrollLeft = Math.max(0, left - 8); }
+    else if (right > bar.scrollLeft + bar.clientWidth) { bar.scrollLeft = right - bar.clientWidth + 8; }
+  }
+
+  function renderTabs(shares) {
+    var focusedKey = null;
+    var ae = document.activeElement;
+    if (ae && ae.getAttribute && els.tablist.contains(ae)) { focusedKey = ae.getAttribute('data-key'); }
+
+    var wanted = shares.map(function (s) { return s.id; });
+    wanted.push(NEW_TAB);
+    Object.keys(tabEls).forEach(function (k) {
+      if (wanted.indexOf(k) < 0) {
+        if (tabEls[k].btn.parentNode) { tabEls[k].btn.parentNode.removeChild(tabEls[k].btn); }
+        delete tabEls[k];
+        if (tabStop === k) { tabStop = null; }
+      }
+    });
+    wanted.forEach(function (k, i) {
+      var t = tabEls[k];
+      if (!t) { t = makeTab(k); tabEls[k] = t; }
+      if (els.tablist.children[i] !== t.btn) { els.tablist.insertBefore(t.btn, els.tablist.children[i] || null); }
+      t.btn.setAttribute('aria-selected', k === selected ? 'true' : 'false');
+      if (k === NEW_TAB) {
+        setText(t.label, '+ Neue Freigabe');
+      } else {
+        var sh = null;
+        for (var n = 0; n < shares.length; n++) { if (shares[n].id === k) { sh = shares[n]; break; } }
+        var name = shareName(sh);
+        setText(t.label, name);
+        if (t.btn.title !== name) { t.btn.title = name; }
+        var cls = 'tdot tdot-' + (PHASE_LABELS[sh.phase] ? sh.phase : 'ended');
+        if (t.dot.className !== cls) { t.dot.className = cls; }
+        setText(t.sr, ' (' + (PHASE_LABELS[sh.phase] || sh.phase) + ')');
+      }
+    });
+    updateTabIndexes();
+    if (focusedKey && tabEls[focusedKey] && document.activeElement !== tabEls[focusedKey].btn) { tabEls[focusedKey].btn.focus(); }
+    if (lastTabScroll !== selected) {
+      lastTabScroll = selected;
+      scrollTabIntoView(selected);
+    }
+  }
+
+  function selectTab(key) {
+    if (key === selected) { return; }
+    if (editingId) { endEdit(false); }
+    selected = key;
+    tabStop = key;
+    storeSelection();
+    renderCurrent();
+  }
+
+  function renderCurrent() {
+    if (lastState && lastRenderable) {
+      try { render(lastState, true); } catch (e) { if (window.console && console.error) { console.error(e); } }
+    }
+  }
+
+  els.tablist.addEventListener('click', function (e) {
+    var tab = e.target instanceof Element ? e.target.closest('[role="tab"]') : null;
+    if (!tab) { return; }
+    selectTab(tab.getAttribute('data-key'));
+  });
+
+  els.tablist.addEventListener('dblclick', function (e) {
+    var tab = e.target instanceof Element ? e.target.closest('[role="tab"]') : null;
+    if (!tab) { return; }
+    var key = tab.getAttribute('data-key');
+    if (key === NEW_TAB) { return; }
+    selectTab(key);
+    startEdit(key);
+  });
+
+  els.tablist.addEventListener('keydown', function (e) {
+    var tab = e.target instanceof Element ? e.target.closest('[role="tab"]') : null;
+    if (!tab) { return; }
+    var keys = tabKeys();
+    var i = keys.indexOf(tab.getAttribute('data-key'));
+    var next = -1;
+    if (e.key === 'ArrowRight') { next = (i + 1) % keys.length; }
+    else if (e.key === 'ArrowLeft') { next = (i - 1 + keys.length) % keys.length; }
+    else if (e.key === 'Home') { next = 0; }
+    else if (e.key === 'End') { next = keys.length - 1; }
+    if (next < 0) { return; }
+    e.preventDefault();
+    tabStop = keys[next];
+    updateTabIndexes();
+    tabEls[tabStop].btn.focus();
+  });
+
+  // ---------------------------------------------------------------- rename
+  function showRenameError(text) {
+    setText(els.renameError, text);
+    setHidden(els.renameError, !text);
+  }
+
+  function startEdit(id) {
+    var sh = findShare(id);
+    if (!sh || selected !== id || !SHARE_VIEWS[currentView]) { return; }
+    editingId = id;
+    renameBusy = false;
+    els.renameInput.value = shareName(sh);
+    els.renameInput.readOnly = false;
+    showRenameError('');
+    setHidden(els.nameView, true);
+    setHidden(els.renameForm, false);
+    els.renameInput.focus();
+    els.renameInput.select();
+  }
+
+  function endEdit(refocus) {
+    var had = editingId;
+    editingId = null;
+    renameBusy = false;
+    els.renameInput.readOnly = false;
+    setHidden(els.renameForm, true);
+    setHidden(els.nameView, false);
+    showRenameError('');
+    if (refocus && had && !els.shareHead.hidden) { els.btnRename.focus(); }
+  }
+
+  function commitRename(fromBlur) {
+    if (!editingId || renameBusy) { return; }
+    var id = editingId;
+    var sh = findShare(id);
+    if (!sh) { endEdit(false); return; }
+    var val = els.renameInput.value.trim();
+    if (val === shareName(sh)) { endEdit(!fromBlur); return; }
+    if (!val) {
+      if (fromBlur) { endEdit(false); } else { showRenameError('Der Name darf nicht leer sein.'); }
+      return;
+    }
+    renameBusy = true;
+    els.renameInput.readOnly = true;
+    showRenameError('');
+    action(shareApi(id, 'rename'), { name: val }).then(function (r) {
+      renameBusy = false;
+      els.renameInput.readOnly = false;
+      if (r.status === 200 && r.data && r.data.ok) {
+        var nm = typeof r.data.name === 'string' && r.data.name ? r.data.name : val;
+        renameOverrides[id] = { name: nm, until: Date.now() + 3000 };
+        if (selected === id) { setText(els.shareTitle, nm); }
+        if (editingId === id) { endEdit(!fromBlur); }
+        renderCurrent();
+        refreshSoon();
+      } else if (editingId === id) {
+        showRenameError(errorFromResponse(r, 'Der Name konnte nicht geändert werden.'));
+        if (!fromBlur) { els.renameInput.focus(); }
+      }
+    }).catch(function () { renameBusy = false; });
+  }
+
+  els.btnRename.addEventListener('click', function () { if (selected && selected !== NEW_TAB) { startEdit(selected); } });
+
+  els.renameForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    commitRename(false);
+  });
+
+  els.renameInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      endEdit(true);
+    }
+  });
+
+  els.renameInput.addEventListener('blur', function () { commitRename(true); });
+
+  // ---------------------------------------------------------------- rendering
+  var DROP_PATH_RE = /[\\\/]drops[\\\/][0-9a-f]{32}(?:[\\\/]|$)/i;
+
+  function updateStartButton() {
+    var lim = lastState && lastState.limits ? lastState.limits : null;
+    var max = lim ? posNum(lim.maxShares) : 0;
+    var full = !!max && runningOf(lastState) >= max;
+    els.btnStart.disabled = uploading || startPending || full;
+    if (full) {
+      setText(els.limitHint, 'Maximal ' + max + (max === 1 ? ' Freigabe' : ' Freigaben') + ' gleichzeitig. Bitte erst eine beenden.');
+    }
+    setHidden(els.limitHint, !full);
+  }
+
+  function renderNewTab(st) {
+    setHidden(els.btnPick, !(st.capabilities && st.capabilities.folderPicker));
+    updateStartButton();
+    updateNamePreview();
+  }
+
+  function renderShareHead(sh) {
+    if (editingId && editingId !== sh.id) { endEdit(false); }
+    if (editingId !== sh.id) { setText(els.shareTitle, shareName(sh)); }
+  }
+
+  function resetShareUi(sh) {
+    var key = sh.id + '|' + sh.phase;
+    if (key === shareUiKey) { return; }
+    shareUiKey = key;
+    els.btnCancel.disabled = false;
+    els.btnStop.disabled = false;
+    els.btnDismiss.disabled = false;
+    els.btnCopy.disabled = false;
+    showCopyError('');
+    if (copyTimer) { window.clearTimeout(copyTimer); copyTimer = null; }
+    setText(els.btnCopy, 'Link kopieren');
+  }
+
+  function renderDone(sh) {
+    var ended = sh.phase === 'ended';
+    var failed = sh.phase === 'error';
 
     setHidden(els.endedBox, !ended);
     if (ended) {
-      setText(els.endedText, REASON_TEXTS[st.reason] || st.message || st.reason || '');
+      setText(els.endedText, REASON_TEXTS[sh.reason] || sh.message || sh.reason || '');
     }
 
     setHidden(els.errorBox, !failed);
     if (failed) {
-      var code = st.exitCode;
+      var code = sh.exitCode;
       setText(els.errorTitle, 'Freigabe fehlgeschlagen' + (code != null ? ' (Exit-Code ' + code + ')' : ''));
       setText(els.errorHint, EXIT_TEXTS[code] || '');
-      setText(els.errorMessage, st.message || '');
-      var log = Array.isArray(st.log) ? st.log : [];
+      setText(els.errorMessage, sh.message || '');
+      var log = Array.isArray(sh.log) ? sh.log : [];
       setHidden(els.errorDetails, log.length === 0);
       setText(els.errorLog, log.join('\n'));
     }
-    return failed ? 'Freigabe fehlgeschlagen. ' + (EXIT_TEXTS[st.exitCode] || '') : (ended ? 'Freigabe beendet.' : 'Bereit.');
+    return failed ? 'Freigabe fehlgeschlagen. ' + (EXIT_TEXTS[sh.exitCode] || '') : 'Freigabe beendet.';
   }
 
-  function renderProgress(st) {
-    var total = typeof st.total === 'number' && st.total > 0 ? st.total : TOTAL_STEPS;
-    var cur = typeof st.step === 'number' ? st.step : 0;
+  function renderProgress(sh) {
+    var total = typeof sh.total === 'number' && sh.total > 0 ? sh.total : TOTAL_STEPS;
+    var cur = typeof sh.step === 'number' ? sh.step : 0;
     var texts = {};
-    (Array.isArray(st.steps) ? st.steps : []).forEach(function (s) { if (s && typeof s.n === 'number') { texts[s.n] = s.text; } });
+    (Array.isArray(sh.steps) ? sh.steps : []).forEach(function (s) { if (s && typeof s.n === 'number') { texts[s.n] = s.text; } });
 
-    var sig = total + '|' + cur + '|' + JSON.stringify(texts);
+    var sig = sh.id + '|' + total + '|' + cur + '|' + JSON.stringify(texts);
     if (sig !== stepsSig) {
       stepsSig = sig;
       while (els.steps.firstChild) { els.steps.removeChild(els.steps.firstChild); }
@@ -514,79 +934,146 @@
         els.steps.appendChild(li);
       }
     }
-    var current = st.stepText || (cur && texts[cur]) || '';
+    var current = sh.stepText || (cur && texts[cur]) || '';
     setText(els.stepCurrent, current ? 'Schritt ' + cur + ' von ' + total + ': ' + current : 'Wird gestartet …');
     return 'Freigabe wird vorbereitet. ' + current;
   }
 
-  function renderActive(st) {
-    // Show a short text instead of the long temp path when a dropped set of files is shared.
-    var reqPath = st.request && typeof st.request.path === 'string' ? st.request.path : '';
-    var fromDrop = !!reqPath && ((st.drop && st.drop.path === reqPath) || DROP_PATH_RE.test(reqPath));
+  function renderActive(sh) {
+    // Show a short text instead of the long temp path when dropped files are shared.
+    var reqPath = sh.request && typeof sh.request.path === 'string' ? sh.request.path : '';
+    var fromDrop = typeof sh.dropFiles === 'number' || (!!reqPath && DROP_PATH_RE.test(reqPath));
+    var from = '';
     if (fromDrop) {
-      var n = st.drop && st.drop.path === reqPath && typeof st.drop.files === 'number' ? st.drop.files
-        : (dropInfo && dropInfo.path === reqPath ? dropInfo.files : null);
-      setText(els.sharedFrom, 'Freigegeben: ' + (n == null ? 'abgelegte Dateien'
-        : n.toLocaleString('de-DE') + (n === 1 ? ' abgelegte Datei' : ' abgelegte Dateien')));
+      var n = typeof sh.dropFiles === 'number' ? sh.dropFiles : null;
+      from = 'Freigegeben: ' + (n == null ? 'abgelegte Dateien'
+        : n.toLocaleString('de-DE') + (n === 1 ? ' abgelegte Datei' : ' abgelegte Dateien'));
+    } else if (reqPath) {
+      from = 'Ordner: ' + reqPath;
     }
-    setHidden(els.sharedFrom, !fromDrop);
+    setText(els.sharedFrom, from);
+    setHidden(els.sharedFrom, !from);
 
-    if (els.shareUrl.value !== (st.url || '')) { els.shareUrl.value = st.url || ''; }
-    setText(els.factUntil, st.expiresUtc ? formatUntil(st.expiresUtc) : '–');
+    if (els.shareUrl.value !== (sh.url || '')) { els.shareUrl.value = sh.url || ''; }
+    setText(els.factUntil, sh.expiresUtc ? formatUntil(sh.expiresUtc) : '–');
 
-    var rem = st.remainingMinutes;
-    if (typeof rem !== 'number' && st.expiresUtc) {
-      rem = Math.max(0, Math.ceil((Date.parse(st.expiresUtc) - Date.now()) / 60000));
+    var rem = sh.remainingMinutes;
+    if (typeof rem !== 'number' && sh.expiresUtc) {
+      rem = Math.max(0, Math.ceil((Date.parse(sh.expiresUtc) - Date.now()) / 60000));
     }
     setText(els.factRemaining, formatRemaining(rem));
-    setText(els.factSize, formatSize(st.sizeBytes));
-    setText(els.factSha, st.sha256 || '–');
+    setText(els.factSize, formatSize(sh.sizeBytes));
+    setText(els.factSha, sh.sha256 || '–');
 
     // No health event yet means every check so far has passed.
-    var h = HEALTH_TEXTS[st.health || 'ok'];
+    var h = HEALTH_TEXTS[sh.health || 'ok'];
     els.healthDot.className = 'dot dot-' + (h ? h[0] : 'none');
     setText(els.healthText, h ? h[1] : 'Keine Meldung');
     return 'Freigabe aktiv.';
   }
 
+  function headCountText(n) {
+    return n + (n === 1 ? ' aktive Freigabe' : ' aktive Freigaben');
+  }
+
+  function announcePhaseChanges(shares, first) {
+    var nextSeen = {};
+    shares.forEach(function (sh) {
+      nextSeen[sh.id] = sh.phase;
+      if (first || !seenPhases || sh.id === selected) { return; }
+      var prev = seenPhases[sh.id];
+      if (!prev || prev === sh.phase) { return; }
+      var what = sh.phase === 'active' ? 'ist jetzt aktiv.' : (sh.phase === 'ended' ? 'wurde beendet.' : (sh.phase === 'error' ? 'ist fehlgeschlagen.' : ''));
+      if (what) { announce('Freigabe „' + shareName(sh) + '“ ' + what); }
+    });
+    seenPhases = nextSeen;
+  }
+
   function render(st, dropStale) {
-    var label;
-    switch (st.phase) {
-      case 'starting':
-        showView('progress');
-        label = renderProgress(st);
-        els.btnCancel.disabled = false;
-        break;
-      case 'active':
-        showView('active');
-        label = renderActive(st);
-        break;
-      case 'stopping':
-        showView('stopping');
-        label = 'Freigabe wird beendet …';
-        break;
-      default: // idle, ended, error
-        label = renderForm(st);
-        showView('form');
-        els.btnStart.disabled = uploading;
-        break;
+    var shares = st.shares.filter(function (s) { return s && typeof s.id === 'string'; });
+    var ids = shares.map(function (s) { return s.id; });
+
+    if (!selectionInit) {
+      selectionInit = true;
+      storageKey = TAB_KEY_PREFIX + (typeof st.build === 'string' ? st.build : '');
+      selected = chooseInitialSelection(shares);
+      tabStop = selected;
+      storeSelection();
     }
-    // While uploading, the form is left alone; the drop state is re-rendered after the upload.
-    if (!uploading && !dropStale) { applyDrop(dropFromState(st)); }
-    if (st.phase !== 'idle' && st.phase !== 'starting') { /* keep prefilled form for next run */ }
-    if (st.phase === 'starting' || st.phase === 'active' || st.phase === 'stopping') {
-      formPrefilled = true; // do not overwrite the user's form once a run exists
+
+    // A share that was just started may not be listed yet; keep the UI as it is until it shows up.
+    if (pendingSelect) {
+      if (ids.indexOf(pendingSelect) >= 0 || Date.now() > pendingUntil) { pendingSelect = null; }
+      else { return; }
+    }
+
+    // The selected share disappeared (dismissed elsewhere): fall back to its left neighbour or the form.
+    if (selected !== NEW_TAB && ids.indexOf(selected) < 0) {
+      var idx = lastIds.indexOf(selected);
+      var fallback = idx > 0 && ids.indexOf(lastIds[idx - 1]) >= 0 ? lastIds[idx - 1] : NEW_TAB;
+      if (editingId) { endEdit(false); }
+      selected = fallback;
+      tabStop = fallback;
+      storeSelection();
+    }
+    lastIds = ids;
+
+    announcePhaseChanges(shares, seenPhases === null);
+
+    setText(els.headCount, headCountText(runningOf(st)));
+    renderTabs(shares);
+    var tabId = 'tab-' + selected;
+    if (els.panel.getAttribute('aria-labelledby') !== tabId) { els.panel.setAttribute('aria-labelledby', tabId); }
+
+    var label;
+    var sh = selected === NEW_TAB ? null : findShareIn(shares, selected);
+    if (!sh) {
+      showView('form');
+      renderNewTab(st);
+      label = 'Neue Freigabe.';
+      // While uploading, the form is left alone; the drop state is re-rendered after the upload.
+      if (!uploading && !dropStale) { applyDrop(dropFromState(st)); }
+    } else {
+      renderShareHead(sh);
+      resetShareUi(sh);
+      switch (sh.phase) {
+        case 'starting':
+          showView('progress');
+          label = renderProgress(sh);
+          break;
+        case 'active':
+          showView('active');
+          label = renderActive(sh);
+          break;
+        case 'stopping':
+          showView('stopping');
+          label = 'Freigabe wird beendet …';
+          break;
+        default: // ended, error
+          showView('done');
+          label = renderDone(sh);
+          break;
+      }
+      if (!uploading && !dropStale) { applyDrop(dropFromState(st)); }
     }
     setHidden(els.foot, false);
 
-    var key = st.phase + '|' + st.exitCode;
-    if (key !== lastAnnounce) {
-      lastAnnounce = key;
-      announce(label);
+    var key = selected + '|' + (sh ? sh.phase + '|' + sh.exitCode : '');
+    if (key !== announceKey) {
+      announceKey = key;
+      announce(sh ? '„' + shareName(sh) + '“: ' + label : label);
     }
   }
 
+  function findShareIn(list, id) {
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { return list[i]; } }
+    return null;
+  }
+
   // ---------------------------------------------------------------- user actions
+  var startPending = false;
+  var picking = false;
+
   function showFormError(text) {
     setText(els.formError, text);
     setHidden(els.formError, !text);
@@ -598,12 +1085,45 @@
     return fallback;
   }
 
-  function onFormInput() { formDirty = true; showFormError(''); }
+  function onFormInput() { showFormError(''); }
   ['input', 'change'].forEach(function (ev) { els.form.addEventListener(ev, onFormInput); });
+  els.folder.addEventListener('input', updateNamePreview);
+
+  // Placeholder of the name field: what the backend will most likely use (display only, contract 8.2).
+  function updateNamePreview() {
+    var d = '';
+    if (dropInfo) {
+      if (dropTops && dropTops.length) {
+        d = dropTops.length === 1 ? dropTops[0] : dropTops[0] + ' +' + (dropTops.length - 1);
+      }
+    } else {
+      d = leafOf(els.folder.value.trim());
+    }
+    var ph = d ? clipName(d) : 'Wird automatisch vergeben';
+    if (els.nameInput.placeholder !== ph) { els.nameInput.placeholder = ph; }
+  }
+
+  function afterStart(shareId) {
+    els.folder.value = '';
+    els.nameInput.value = '';
+    dropEpoch++;
+    applyDrop(null);
+    showDropStatus('');
+    showFormError('');
+    updateNamePreview();
+    if (typeof shareId === 'string' && shareId) {
+      selected = shareId;
+      tabStop = shareId;
+      pendingSelect = shareId;
+      pendingUntil = Date.now() + 5000;
+      storeSelection();
+    }
+    refreshSoon();
+  }
 
   els.form.addEventListener('submit', function (e) {
     e.preventDefault();
-    if (uploading) { return; }
+    if (uploading || startPending) { return; }
     var path = els.folder.value.trim();
     if (!path) {
       showFormError('Bitte einen Ordner angeben.');
@@ -611,35 +1131,44 @@
       return;
     }
     showFormError('');
-    els.btnStart.disabled = true;
+    startPending = true;
+    updateStartButton();
+    var name = els.nameInput.value.trim();
     action('/api/start', {
       path: path,
       minutes: parseInt(els.minutes.value, 10),
       compression: els.compression.value,
-      includeGenerated: els.includeGenerated.checked
+      includeGenerated: els.includeGenerated.checked,
+      name: name || null
     }).then(function (r) {
+      startPending = false;
       if (r.status === 200 && r.data && r.data.ok) {
-        formPrefilled = true;
-        refreshSoon();
+        afterStart(r.data.shareId);
       } else {
-        els.btnStart.disabled = false;
-        showFormError(errorFromResponse(r, 'Die Freigabe konnte nicht gestartet werden.'));
+        var max = lastState && lastState.limits ? posNum(lastState.limits.maxShares) : 0;
+        var fb = r.status === 409 && max
+          ? 'Maximal ' + max + (max === 1 ? ' Freigabe' : ' Freigaben') + ' gleichzeitig. Bitte erst eine beenden.'
+          : 'Die Freigabe konnte nicht gestartet werden.';
+        showFormError(errorFromResponse(r, fb));
       }
-    }).catch(function () { /* fatal already shown */ });
+      updateStartButton();
+    }).catch(function () { startPending = false; /* fatal already shown */ });
   });
 
   els.btnPick.addEventListener('click', function () {
-    els.btnPick.disabled = true;
+    picking = true;
+    updateBusy();
     showFormError('');
     action('/api/pick-folder', {}).then(function (r) {
-      els.btnPick.disabled = uploading;
+      picking = false;
+      updateBusy();
       if (r.status === 200 && r.data && typeof r.data.path === 'string' && r.data.path) {
         var picked = r.data.path;
         // A picked folder replaces an active drop (discarded first).
         return releaseDrop().then(function (ok) {
           if (!ok) { return; }
           els.folder.value = picked;
-          formDirty = true;
+          updateNamePreview();
         });
       } else if (r.status === 200) {
         /* cancelled: nothing */
@@ -648,20 +1177,57 @@
       } else {
         showFormError(errorFromResponse(r, 'Die Ordnerauswahl ist fehlgeschlagen.'));
       }
-    }).catch(function () { els.btnPick.disabled = uploading; });
+    }).catch(function () { picking = false; updateBusy(); });
   });
 
   els.btnCancel.addEventListener('click', function () {
+    var id = selected;
     els.btnCancel.disabled = true;
-    action('/api/stop', {}).then(function () { refreshSoon(); }).catch(function () {});
+    action(shareApi(id, 'stop'), {}).then(function (r) {
+      if (r.status !== 200 && selected === id) { els.btnCancel.disabled = false; }
+      refreshSoon();
+    }).catch(function () {});
   });
 
   els.btnStop.addEventListener('click', function () {
-    if (!window.confirm('Freigabe wirklich beenden? Der Link funktioniert danach nicht mehr.')) { return; }
+    var id = selected;
+    var sh = findShare(id);
+    var nm = sh ? shareName(sh) : '';
+    var msg = nm
+      ? 'Freigabe „' + nm + '“ wirklich beenden? Der Link funktioniert danach nicht mehr.'
+      : 'Freigabe wirklich beenden? Der Link funktioniert danach nicht mehr.';
+    if (!window.confirm(msg)) { return; }
     els.btnStop.disabled = true;
-    action('/api/stop', {}).then(function () {
-      els.btnStop.disabled = false;
+    action(shareApi(id, 'stop'), {}).then(function (r) {
+      if (r.status !== 200 && selected === id) { els.btnStop.disabled = false; }
       refreshSoon();
+    }).catch(function () {});
+  });
+
+  els.btnDismiss.addEventListener('click', function () {
+    var id = selected;
+    if (!id || id === NEW_TAB) { return; }
+    var idx = lastIds.indexOf(id);
+    var target = idx > 0 ? lastIds[idx - 1] : NEW_TAB;
+    els.btnDismiss.disabled = true;
+    action(shareApi(id, 'dismiss'), {}).then(function (r) {
+      if (r.status === 200 || r.status === 404) {
+        if (selected === id) {
+          selected = target;
+          tabStop = target;
+          storeSelection();
+        }
+        // Show the neighbour right away; the next poll drops the dismissed tab.
+        if (lastState && Array.isArray(lastState.shares)) {
+          lastState = Object.assign({}, lastState, {
+            shares: lastState.shares.filter(function (s) { return s.id !== id; })
+          });
+          renderCurrent();
+        }
+        refreshSoon();
+      } else {
+        els.btnDismiss.disabled = false;
+      }
     }).catch(function () {});
   });
 
@@ -681,10 +1247,10 @@
     setHidden(els.copyError, !text);
   }
 
-  function browserCopy() {
-    var url = els.shareUrl.value;
+  function browserCopy(url) {
     function legacy() {
       try {
+        if (els.shareUrl.value !== url) { return false; }
         els.shareUrl.focus();
         els.shareUrl.select();
         return document.execCommand('copy');
@@ -697,11 +1263,13 @@
   }
 
   els.btnCopy.addEventListener('click', function () {
+    var id = selected;
+    var url = els.shareUrl.value;
     showCopyError('');
     els.btnCopy.disabled = true;
-    action('/api/copy', {}).then(function (r) {
+    action(shareApi(id, 'copy'), {}).then(function (r) {
       if (r.status === 200) { return true; }
-      if (r.status === 409 || r.status === 501) { return browserCopy(); }
+      if (r.status === 409 || r.status === 501) { return browserCopy(url); }
       return false;
     }).then(function (ok) {
       els.btnCopy.disabled = false;
@@ -710,10 +1278,10 @@
   });
 
   els.btnQuit.addEventListener('click', function () {
-    var running = lastState && (lastState.phase === 'starting' || lastState.phase === 'active' || lastState.phase === 'stopping');
-    var msg = running
-      ? 'WorkspaceShare beenden? Die laufende Freigabe wird dabei beendet.'
-      : 'WorkspaceShare beenden?';
+    var n = runningOf(lastState);
+    var msg = 'WorkspaceShare beenden?';
+    if (n === 1) { msg += ' 1 laufende Freigabe wird beendet.'; }
+    else if (n > 1) { msg += ' ' + n + ' laufende Freigaben werden beendet.'; }
     if (!window.confirm(msg)) { return; }
     els.btnQuit.disabled = true;
     // The backend may exit right after answering; any outcome counts as quit.
@@ -728,24 +1296,22 @@
     }).catch(done);
   });
 
-  // ---------------------------------------------------------------- drag & drop (contract section 7)
+  // ---------------------------------------------------------------- drag & drop (contract sections 7 and 8)
   var uploading = false;        // upload sequence (begin / files / finish) is running
   var collecting = false;       // dropped entries are being read
   var cancelRequested = false;
   var removing = false;         // discard of the active drop is running
-  var dropInfo = null;          // finished drop: { id, path, files, totalBytes } or null
+  var dropInfo = null;          // finished draft drop: { id, path, files, totalBytes } or null
+  var dropTops = null;          // top-level names of that drop (known only for uploads made in this page)
   var dropEpoch = 0;            // bumped on every local drop change; makes in-flight polls stale
   var serviceOutdated = false;  // backend without /api/drop/* (404) or without state.limits
-
-  function num(v) { return typeof v === 'number' && isFinite(v) && v >= 0 ? v : 0; }
-  function posNum(v) { return typeof v === 'number' && isFinite(v) && v > 0 ? v : 0; }
 
   function dropSummaryText(info) {
     return info.files.toLocaleString('de-DE') + (info.files === 1 ? ' Datei' : ' Dateien') + ', ' + formatSize(info.totalBytes);
   }
 
   function dropFromState(st) {
-    var d = st && st.drop;
+    var d = st && st.draft && st.draft.drop;
     if (!d || typeof d.path !== 'string' || !d.path || d.finished !== true) { return null; }
     return { id: typeof d.id === 'string' ? d.id : '', path: d.path, files: num(d.files), totalBytes: num(d.totalBytes) };
   }
@@ -754,6 +1320,7 @@
   function applyDrop(info) {
     var prev = dropInfo;
     dropInfo = info;
+    if (!info || !prev || prev.id !== info.id) { dropTops = null; }
     if (info) {
       if (els.folder.value !== info.path) { els.folder.value = info.path; }
       els.folder.readOnly = true;
@@ -766,12 +1333,13 @@
       els.folder.classList.remove('locked');
       setHidden(els.dropInfo, true);
     }
+    updateNamePreview();
   }
 
   function updateBusy() {
     var busy = uploading || collecting;
     els.btnFiles.disabled = busy || serviceOutdated;
-    els.btnPick.disabled = busy;
+    els.btnPick.disabled = busy || picking;
     els.folder.disabled = uploading;
     els.btnDropRemove.disabled = uploading || removing;
     els.dropzone.classList.toggle('dz-disabled', busy || serviceOutdated);
@@ -792,7 +1360,7 @@
     uploading = on;
     setHidden(els.dropzone, on);
     setHidden(els.upload, !on);
-    els.btnStart.disabled = on;
+    updateStartButton();
     updateBusy();
   }
 
@@ -952,6 +1520,18 @@
     runUpload(items);
   }
 
+  // Unique top-level entry names in order of appearance.
+  function topLevelNames(items) {
+    var seen = Object.create(null);
+    var out = [];
+    items.forEach(function (it) {
+      var top = String(it.path).split('/')[0];
+      var k = top.toLowerCase();
+      if (!seen[k]) { seen[k] = true; out.push(top); }
+    });
+    return out;
+  }
+
   // ---- upload
   function httpErrorText(r) {
     // /api/drop/* answers 404 only on a backend that predates the drop endpoints.
@@ -959,7 +1539,7 @@
     if (r && r.data && typeof r.data.error === 'string' && r.data.error) { return r.data.error; }
     switch (r && r.status) {
       case 400: return 'Ungültiger Dateiname oder ungültige Anfrage.';
-      case 409: return 'Konflikt: Die Datei ist doppelt oder der Zustand erlaubt das Ablegen gerade nicht.';
+      case 409: return 'Konflikt: Die Datei ist doppelt oder es läuft gerade ein anderes Hochladen.';
       case 411:
       case 413: return 'Die Datei oder die Gesamtgröße ist zu groß.';
       case 507: return 'Zu wenig Speicherplatz auf dem Datenlaufwerk.';
@@ -995,6 +1575,7 @@
     var total = 0;
     var done = 0;
     var dropId = null;
+    var tops = topLevelNames(items);
     items.forEach(function (it) { total += it.file.size; });
 
     cancelRequested = false;
@@ -1063,6 +1644,8 @@
       dropEpoch++;
       setUploading(false);
       applyDrop(info);
+      dropTops = tops;
+      updateNamePreview();
       showDropStatus('');
       announce('Hochgeladen: ' + dropSummaryText(info) + '.');
       refreshSoon();
@@ -1195,12 +1778,20 @@
   });
 
   // ---------------------------------------------------------------- start
+  // The token comes from the URL hash (shortcut) and is kept in sessionStorage so that a reload
+  // (F5) still works. A hash token always replaces a stored one. Never localStorage, cookie or query.
   function init() {
     if (mockMode) {
       token = 'mock';
     } else {
       var hash = location.hash || '';
-      token = hash.charAt(0) === '#' ? hash.slice(1) : hash;
+      var fromHash = hash.charAt(0) === '#' ? hash.slice(1) : hash;
+      if (fromHash) {
+        token = fromHash;
+        storageSet(TOKEN_KEY, token);
+      } else {
+        token = storageGet(TOKEN_KEY) || '';
+      }
       try { history.replaceState(null, '', location.pathname); } catch (e) { /* ignore */ }
     }
     if (!token) {
