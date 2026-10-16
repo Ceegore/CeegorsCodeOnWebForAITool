@@ -48,7 +48,7 @@ function Invoke-Api {
     $id = [Guid]::NewGuid().ToString('N')
     $hf = Join-Path $tmp "h-$id.txt"
     $bf = Join-Path $tmp "b-$id.txt"
-    $cargs = @('-s', '--noproxy', '*', '--max-time', '10', '-D', $hf, '-o', $bf, '-w', '%{http_code}', '-X', $Method)
+    $cargs = @('-s', '--noproxy', '127.0.0.1', '--max-time', '10', '-D', $hf, '-o', $bf, '-w', '%{http_code}', '-X', $Method)
     if ($PathAsIs) { $cargs += '--path-as-is' }
     if ($Token) { $cargs += @('-H', "X-WS-Token: $Token") }
     foreach ($h in $ExtraHeaders) { $cargs += @('-H', $h) }
@@ -208,7 +208,7 @@ function Start-BackgroundCurl {
     # Runs curl detached (so the test can keep talking to the backend meanwhile); returns the process and its files.
     param([string[]]$CurlArgs, [string]$Tag)
     $out = Join-Path $tmp ("bg-$Tag-" + [Guid]::NewGuid().ToString('N') + '.txt')
-    $all = @('-s', '--noproxy', '*', '--max-time', '120', '-o', $out, '-w', '%{http_code}') + $CurlArgs
+    $all = @('-s', '--noproxy', '127.0.0.1', '--max-time', '120', '-o', $out, '-w', '%{http_code}') + $CurlArgs
     $quoted = @($all | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_ + '"' } else { $_ } })
     $codeF = $out + '.code'
     $p = Start-Process -FilePath $curl -ArgumentList $quoted -PassThru @hiddenWindow -RedirectStandardOutput $codeF -RedirectStandardError ($out + '.err')
@@ -295,7 +295,7 @@ function Invoke-Upload {
     $id = [Guid]::NewGuid().ToString('N')
     $bf = Join-Path $tmp "ub-$id.txt"
     $url = 'http://127.0.0.1:{0}/api/drop/file?drop={1}&path={2}' -f $B.Port, $DropId, [Uri]::EscapeDataString($Rel)
-    $cargs = @('-s', '--noproxy', '*', '--max-time', '60', '-o', $bf, '-w', '%{http_code}', '-X', 'POST',
+    $cargs = @('-s', '--noproxy', '127.0.0.1', '--max-time', '60', '-o', $bf, '-w', '%{http_code}', '-X', 'POST',
         '-H', 'Content-Type: application/octet-stream', '--data-binary', "@$File")
     if (-not $NoToken) { $cargs += @('-H', "X-WS-Token: $($B.Token)") }
     foreach ($h in $ExtraHeaders) { $cargs += @('-H', $h) }
@@ -366,7 +366,7 @@ function Get-StaticFile {
     # GET a static path without token; saves the body bytes to $OutFile and returns the HTTP status.
     param($B, [string]$Path, [string]$OutFile)
     if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
-    $codeText = (& $curl -s --noproxy '*' --max-time 10 -o $OutFile -w '%{http_code}' ('http://127.0.0.1:{0}{1}' -f $B.Port, $Path)) -join ''
+    $codeText = (& $curl -s --noproxy 127.0.0.1 --max-time 10 -o $OutFile -w '%{http_code}' ('http://127.0.0.1:{0}{1}' -f $B.Port, $Path)) -join ''
     $status = 0
     [void][int]::TryParse($codeText.Trim(), [ref]$status)
     return $status
