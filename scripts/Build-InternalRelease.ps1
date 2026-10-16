@@ -188,6 +188,9 @@ try {
         'config\mandatory-excludes.txt','config\generated-excludes.txt','config\gitleaks-workspaceshare.toml',
         'scripts\WorkspaceShare.Process.psm1','scripts\WorkspaceShare.Curl.psm1','scripts\WorkspaceShare.Health.psm1','scripts\WorkspaceShare.Job.psm1','scripts\WorkspaceShare.Path.psm1','scripts\WorkspaceShare.Dependency.psm1','scripts\Watch-WorkspaceShare.ps1','scripts\Test-TunnelSoak.ps1','scripts\Test-QuickTunnelDns.ps1',
         'tests\Test-WorkspaceShare.ps1','tests\Test-LifecycleHardening.ps1','tests\Test-NativeRunnerSmoke.ps1',
+        'Start-WorkspaceShareGui.ps1','Install-GuiShortcut.ps1','scripts\WorkspaceShare.Platform.psm1','scripts\WorkspaceShare.Gui.Http.psm1',
+        'gui\index.html','gui\app.js','gui\app.css','gui\favicon.svg',
+        'tests\Test-WorkspaceShareGui.Http.ps1','tests\Test-WorkspaceShareGui.ps1','tests\Fake-WorkspaceShare.ps1',
         'bin\cloudflared.exe','bin\miniserve.exe','bin\gitleaks.exe','bin\7za.exe','bin\README.md',
         'bin\licenses\cloudflared-LICENSE.txt','bin\licenses\miniserve-LICENSE.txt','bin\licenses\Gitleaks-LICENSE.txt','bin\licenses\7-Zip-LICENSE.txt'
     )

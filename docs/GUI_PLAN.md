@@ -1,6 +1,8 @@
 # WorkspaceShare GUI – Plan (not implemented yet)
 
-Status: plan only, 2026-10-16. Nothing in this document is built yet.
+Status: implemented 2026-10-16 (steps 1–7 of §8; the binding interfaces are in
+`docs/GUI_CONTRACT.md`). Step 8, manual acceptance through the shortcut on the SAC
+machine, is still open. Linux port: `docs/LINUX_PLAN.md`.
 
 ## 1. Goal
 

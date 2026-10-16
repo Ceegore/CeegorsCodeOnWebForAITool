@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>WorkspaceShare</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="card" id="card">
+  <header class="card-head">
+    <img class="logo" src="favicon.svg" alt="" width="32" height="32">
+    <div>
+      <h1>WorkspaceShare</h1>
+      <p class="sub">Ordner als ZIP über einen geheimen Link freigeben</p>
+    </div>
+  </header>
+
+  <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- Fatal messages (no token, connection lost, quit) -->
+  <section id="view-fatal" class="view" hidden>
+    <div id="fatal-box" class="box box-error" role="alert">
+      <p id="fatal-text" class="box-text"></p>
+    </div>
+  </section>
+
+  <section id="view-quit" class="view" hidden>
+    <div class="box box-info">
+      <p class="box-title">WorkspaceShare wurde beendet.</p>
+      <p class="box-text">Dieses Fenster kann geschlossen werden.</p>
+    </div>
+  </section>
+
+  <section id="view-loading" class="view">
+    <p class="muted"><span class="spinner" aria-hidden="true"></span> Verbinde mit WorkspaceShare …</p>
+  </section>
+
+  <!-- Form: idle / ended / error -->
+  <section id="view-form" class="view" hidden>
+    <div id="ended-box" class="box box-info" hidden>
+      <p class="box-title">Freigabe beendet</p>
+      <p id="ended-text" class="box-text"></p>
+    </div>
+
+    <div id="error-box" class="box box-error" role="alert" hidden>
+      <p id="error-title" class="box-title"></p>
+      <p id="error-hint" class="box-text"></p>
+      <p id="error-message" class="box-text"></p>
+      <details id="error-details" class="details" hidden>
+        <summary>Details</summary>
+        <pre id="error-log" class="log"></pre>
+      </details>
+    </div>
+
+    <form id="form" novalidate autocomplete="off">
+      <div class="field">
+        <label for="folder">Ordner</label>
+        <div class="row">
+          <input type="text" id="folder" name="folder" class="grow" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="C:\Projekte\MeinOrdner">
+          <button type="button" id="btn-pick" class="btn btn-secondary" hidden>Ordner wählen…</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="minutes">Dauer der Freigabe</label>
+        <select id="minutes" name="minutes">
+          <option value="15">15 Min.</option>
+          <option value="30">30 Min.</option>
+          <option value="60">1 Std.</option>
+          <option value="120">2 Std.</option>
+          <option value="240" selected>4 Std.</option>
+          <option value="480">8 Std.</option>
+          <option value="1440">24 Std.</option>
+        </select>
+      </div>
+
+      <details class="details" id="advanced">
+        <summary>Erweitert</summary>
+        <div class="details-body">
+          <div class="field">
+            <label for="compression">Kompression</label>
+            <select id="compression" name="compression">
+              <option value="Fast" selected>Schnell (Standard)</option>
+              <option value="Store">Ohne Kompression</option>
+            </select>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="include-generated" name="includeGenerated">
+            <label for="include-generated">Build-/Cache-Ordner einschließen</label>
+          </div>
+        </div>
+      </details>
+
+      <p id="form-error" class="inline-error" role="alert" hidden></p>
+
+      <button type="submit" id="btn-start" class="btn btn-primary btn-block">Freigeben</button>
+    </form>
+  </section>
+
+  <!-- Progress: starting -->
+  <section id="view-progress" class="view" hidden>
+    <h2>Freigabe wird vorbereitet</h2>
+    <ol id="steps" class="steps"></ol>
+    <p id="step-current" class="step-current"></p>
+    <div class="actions">
+      <button type="button" id="btn-cancel" class="btn btn-secondary">Abbrechen</button>
+    </div>
+  </section>
+
+  <!-- Share: active -->
+  <section id="view-active" class="view" hidden>
+    <h2>Freigabe aktiv</h2>
+    <div class="field">
+      <label for="share-url">Download-Link</label>
+      <input type="text" id="share-url" class="url-input" readonly spellcheck="false">
+    </div>
+    <div class="actions">
+      <button type="button" id="btn-copy" class="btn btn-primary">Link kopieren</button>
+    </div>
+    <p id="copy-error" class="inline-error" role="alert" hidden></p>
+    <p class="hint">Der Link ist geheim: Jeder, der ihn hat, kann die Datei herunterladen.</p>
+
+    <dl class="facts">
+      <div class="fact"><dt>Aktiv bis</dt><dd id="fact-until">–</dd></div>
+      <div class="fact"><dt>Verbleibend</dt><dd id="fact-remaining">–</dd></div>
+      <div class="fact"><dt>Archivgröße</dt><dd id="fact-size">–</dd></div>
+      <div class="fact"><dt>Verbindung</dt><dd><span id="health-dot" class="dot dot-none" aria-hidden="true"></span><span id="health-text">–</span></dd></div>
+    </dl>
+
+    <details class="details">
+      <summary>SHA-256</summary>
+      <p id="fact-sha" class="mono"></p>
+    </details>
+
+    <div class="actions">
+      <button type="button" id="btn-stop" class="btn btn-danger">Freigabe beenden</button>
+    </div>
+  </section>
+
+  <!-- Stopping -->
+  <section id="view-stopping" class="view" hidden>
+    <p class="busy"><span class="spinner" aria-hidden="true"></span> Freigabe wird beendet …</p>
+    <div class="actions">
+      <button type="button" class="btn btn-secondary" disabled>Bitte warten …</button>
+    </div>
+  </section>
+
+  <footer class="card-foot" id="foot">
+    <button type="button" id="btn-quit" class="linkbtn">Beenden</button>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

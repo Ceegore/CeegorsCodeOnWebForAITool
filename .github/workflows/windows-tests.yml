@@ -44,7 +44,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           $rc = 0
-          foreach ($suite in @(@('Test-WorkspaceShare', 'test-output'), @('Test-LifecycleHardening', 'lifecycle-output'), @('Test-NativeRunnerSmoke', 'native-runner-output'))) {
+          foreach ($suite in @(@('Test-WorkspaceShare', 'test-output'), @('Test-LifecycleHardening', 'lifecycle-output'), @('Test-NativeRunnerSmoke', 'native-runner-output'), @('Test-WorkspaceShareGui.Http', 'gui-http-output'), @('Test-WorkspaceShareGui', 'gui-output'))) {
             $global:LASTEXITCODE = 0
             try { & ".\tests\$($suite[0]).ps1" *>&1 | Tee-Object -FilePath "artifacts\$($suite[1]).txt" }
             catch { Write-Host "::error::$($suite[0]) threw: $($_.Exception.Message)"; $global:LASTEXITCODE = 1 }

@@ -122,6 +122,52 @@ Kurzer Test:
 
 Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopiert. Am Sitzungsende wird die Zwischenablage nur dann geleert, wenn sie noch exakt diesen Link enthält.
 
+Für Automatisierung schreibt `-EventStream` maschinenlesbare Fortschrittsereignisse (siehe `docs\GUI_CONTRACT.md`).
+
+## Grafische Oberfläche (GUI)
+
+Die GUI ist eine einfache Browser-Seite, die ausschließlich auf `127.0.0.1` läuft und von `Start-WorkspaceShareGui.ps1` bereitgestellt wird. Sie benötigt nur Windows PowerShell 5.1, keine zusätzlichen Programme und kompiliert nichts; sie ist mit Smart App Control kompatibel. Sie verwendet dasselbe `Share-Workspace.ps1` mit allen Sicherheitsprüfungen. Die GUI startet es nur, zeigt Fortschritt und Link an und beendet es.
+
+Einmalige Einrichtung:
+
+```powershell
+.\Install-GuiShortcut.ps1
+```
+
+Das Skript erstellt die Verknüpfungen „WorkspaceShare“ auf dem Desktop und im Startmenü. Mit `-Desktop` oder `-StartMenu` wird auf einen der Orte beschränkt, mit `-Remove` werden die Verknüpfungen gelöscht. Die Verknüpfung startet `powershell.exe -NoLogo -NoProfile -STA -WindowStyle Hidden -File ...\Start-WorkspaceShareGui.ps1`; es gibt keine .cmd-Datei und keine ExecutionPolicy-Umgehung.
+
+Direkter Start ohne Verknüpfung (öffnet den Browser automatisch):
+
+```powershell
+powershell.exe -NoProfile -STA -File .\Start-WorkspaceShareGui.ps1
+```
+
+Bedienung:
+
+1. Ordner wählen („Ordner wählen…“) oder den Pfad eintippen.
+2. Dauer festlegen.
+3. Optional „Erweitert“ öffnen (Kompression, Build-/Cache-Ordner).
+4. „Freigeben“ klicken. Der Fortschritt zeigt 8 Schritte.
+5. Danach den Link mit „Link kopieren“ übernehmen. Er wird ohne Windows-Zwischenablageverlauf und ohne Cloud-Zwischenablage kopiert.
+6. „Freigabe beenden“ beendet die laufende Freigabe.
+
+„Beenden“ unten auf der Seite beendet eine laufende Freigabe und schließt den GUI-Dienst.
+
+Sicherheitshinweise:
+
+- Die Seite ist nur vom eigenen PC aus erreichbar (`127.0.0.1`) und durch ein zufälliges Sitzungs-Token geschützt. Das Token steht in der Adresse und wird nach dem Laden aus der Adresszeile entfernt.
+- Das Schließen des Browser-Tabs beendet eine laufende Freigabe **nicht**. Über die Verknüpfung erneut öffnen; die GUI verbindet sich mit dem laufenden Dienst.
+- Endet der GUI-Dienst, wird eine laufende Freigabe automatisch gestoppt.
+
+Tests (ohne Netzwerk):
+
+```powershell
+.\tests\Test-WorkspaceShareGui.Http.ps1
+.\tests\Test-WorkspaceShareGui.ps1
+```
+
+Technische Details stehen in `docs\GUI_PLAN.md` und `docs\GUI_CONTRACT.md`. Der Linux-Plan liegt in `docs\LINUX_PLAN.md` und ist noch nicht umgesetzt.
+
 ## Wichtige Parameter
 
 | Parameter | Wirkung |

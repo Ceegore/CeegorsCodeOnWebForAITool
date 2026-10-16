@@ -3,6 +3,8 @@ bin/*.exe
 bin/licenses/
 
 # Generated dependency state and release artifacts.
+# dependencies.lock.json is written by Install-Dependencies.ps1 from the installed binaries.
+dependencies.lock.json
 dist/
 *.zip
 *.zip.sha256.txt

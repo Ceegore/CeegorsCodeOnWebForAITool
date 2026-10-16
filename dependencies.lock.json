@@ -1,9 +1,0 @@
-{
-  "schema": 2,
-  "installed": false,
-  "generatedUtc": null,
-  "platform": "windows-x64",
-  "installerVersion": "3.1.0",
-  "message": "Run .\\Install-Dependencies.ps1. This file will be replaced with hashes of installed executables.",
-  "dependencies": []
-}

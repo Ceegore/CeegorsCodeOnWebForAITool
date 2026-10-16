@@ -67,7 +67,11 @@ param(
 
     [bool]$KeepDiagnosticsOnError = $true,
 
-    [string]$ToolRoot
+    [string]$ToolRoot,
+
+    [switch]$EventStream,
+    [int]$ParentProcessId = 0,
+    [switch]$TestStopAfterSnapshot
 )
 
 Set-StrictMode -Version Latest
@@ -110,6 +114,12 @@ $script:JobName = $null
 $script:DependencyLease = $null
 $script:ActiveStartTimestamp = [int64]0
 $script:ActiveDurationTicks = [int64]0
+$script:ParentProcessRecorded = $false
+$script:ParentStartTicks = [int64]0
+$script:ParentGone = $false
+$script:ParentCheckTimer = $null
+$script:EndedEventSent = $false
+$script:LastErrorMessage = ''
 
 $BinDirectory = Join-Path $ToolRoot 'bin'
 $ConfigDirectory = Join-Path $ToolRoot 'config'
@@ -152,6 +162,54 @@ function Write-Step {
         [Parameter(Mandatory = $true)][string]$Text
     )
     Write-Host ("[{0}/{1}] {2}" -f $Number, $Total, $Text)
+    Write-ShareEvent -Type 'step' -Fields ([ordered]@{ n = $Number; total = $Total; text = $Text })
+}
+
+# Machine-readable event line for the GUI backend (see docs\GUI_CONTRACT.md, section 2).
+# No-op without -EventStream; never throws.
+function Write-ShareEvent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Type,
+        [System.Collections.IDictionary]$Fields = @{}
+    )
+    if (-not $EventStream) { return }
+    try {
+        $evt = [ordered]@{ v = 1; type = $Type; ts = [DateTime]::UtcNow.ToString('o') }
+        foreach ($key in @($Fields.Keys)) {
+            $value = $Fields[$key]
+            if (($key -eq 'text' -or $key -eq 'message') -and $null -ne $value) {
+                $value = Protect-DiagnosticText -Text ([string]$value) -KnownSecretUrls $script:SecretUrls
+            }
+            $evt[[string]$key] = $value
+        }
+        $json = ConvertTo-Json -InputObject $evt -Compress -Depth 5
+        $json = [regex]::Replace($json, '[^\x00-\x7E]', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ('\u{0:x4}' -f [int][char]$m.Value) })
+        [Console]::Out.WriteLine('@@WSEVENT@@ ' + $json)
+        [Console]::Out.Flush()
+    }
+    catch {}
+}
+
+# Launcher warnings are mirrored as events (shadows the cmdlet inside this script only).
+function Write-Warning {
+    param([Parameter(Mandatory = $true, Position = 0)][AllowEmptyString()][string]$Message)
+    Write-ShareEvent -Type 'warning' -Fields ([ordered]@{ text = $Message })
+    Microsoft.PowerShell.Utility\Write-Warning -Message $Message
+}
+
+function Set-ManualStopReason {
+    if ($script:ParentGone) { $script:StopReason = 'ParentExited' } else { $script:StopReason = 'ManualStop' }
+}
+
+function Write-EndedEvent {
+    if ($script:EndedEventSent) { return }
+    $script:EndedEventSent = $true
+    try {
+        $reason = [string]$script:StopReason
+        if ($script:ExitCode -ne 0 -and ([string]::IsNullOrEmpty($reason) -or $reason -eq 'Expired')) { $reason = 'Error' }
+        Write-ShareEvent -Type 'ended' -Fields ([ordered]@{ exitCode = [int]$script:ExitCode; reason = $reason; message = [string]$script:LastErrorMessage })
+    }
+    catch {}
 }
 
 function Stop-WithError {
@@ -210,7 +268,31 @@ function Test-StopRequested {
     if($script:WatchdogProcess){
         try{$script:WatchdogProcess.Refresh();if($script:WatchdogProcess.HasExited -and ($script:ActiveStartTimestamp -le 0 -or (Get-ActiveElapsedSeconds) -lt ($script:ActiveDurationTicks/[double][Diagnostics.Stopwatch]::Frequency))){Stop-WithError -Code 50 -Message 'Der Sicherheits-Watchdog wurde unerwartet beendet.'}}catch{throw}
     }
-    return ($script:SessionDirectory -and (Test-Path -LiteralPath (Join-Path $script:SessionDirectory 'stop.requested') -PathType Leaf))
+    if ($script:SessionDirectory -and (Test-Path -LiteralPath (Join-Path $script:SessionDirectory 'stop.requested') -PathType Leaf)) { return $true }
+    if ($script:ParentProcessRecorded) {
+        if ($script:ParentGone) { return $true }
+        # Cheap: re-check the parent at most every 2 seconds.
+        if ($null -eq $script:ParentCheckTimer) { $script:ParentCheckTimer = [Diagnostics.Stopwatch]::StartNew() }
+        elseif ($script:ParentCheckTimer.ElapsedMilliseconds -lt 2000) { return $false }
+        else { $script:ParentCheckTimer.Restart() }
+        $parent = $null
+        try { $parent = Get-Process -Id $ParentProcessId -ErrorAction Stop } catch { $parent = $null }
+        $gone = ($null -eq $parent)
+        if (-not $gone) {
+            try { if ($parent.HasExited) { $gone = $true } } catch {}
+        }
+        if (-not $gone -and $script:ParentStartTicks -gt 0) {
+            $ticks = Get-ProcessStartTicksSafe $parent
+            if ($ticks -gt 0 -and $ticks -ne $script:ParentStartTicks) { $gone = $true }
+        }
+        if ($null -ne $parent) { try { $parent.Dispose() } catch {} }
+        if ($gone) {
+            $script:ParentGone = $true
+            $script:StopReason = 'ParentExited'
+            return $true
+        }
+    }
+    return $false
 }
 
 function Test-EffectiveKeepArchive {
@@ -710,7 +792,7 @@ function Wait-ForPublicDnsPublication {
     param([Parameter(Mandatory=$true)][string]$HostName,[ValidateRange(5,600)][int]$TimeoutSeconds=180)
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do{
-        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+        if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $successfulResolvers=0
         foreach($resolver in @('1.1.1.1','8.8.8.8','9.9.9.9')){
             try{$answer=Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop|Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress }|Select-Object -First 1;if($answer){$successfulResolvers++}}catch{}
@@ -1188,7 +1270,7 @@ function Wait-ForCloudflaredMetrics {
 
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do {
-        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+        if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
         $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/healthcheck" -TimeoutSeconds 3
@@ -1341,11 +1423,11 @@ function Wait-ForHealthyTunnel {
     $timer=[Diagnostics.Stopwatch]::StartNew()
     $snapshot = $null
     do {
-        if(Test-StopRequested){$script:StopReason='ManualStop';return $null}
+        if(Test-StopRequested){Set-ManualStopReason;return $null}
         $snapshot = Get-TunnelHealthSnapshot -PublicUrl $PublicUrl -LocalUrl $LocalUrl -MetricsPort $MetricsPort -SampleStart $SampleStart -SampleBytes $SampleBytes -AllowFullFileResponse:$AllowFullFileResponse
         [void](Write-HealthSnapshot -Snapshot $snapshot)
         if ($snapshot.Classification -eq 'Healthy') { return $snapshot }
-        if(Test-StopRequested){$script:StopReason='ManualStop';return $null}
+        if(Test-StopRequested){Set-ManualStopReason;return $null}
         Start-Sleep -Seconds 2
     } while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds)
     return $snapshot
@@ -1408,7 +1490,7 @@ function Wait-ForQuickTunnelUrl {
     $regex = '(?<![a-z0-9.-])https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com(?:/|\s|$)'
 
     do {
-        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+        if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $Process.Refresh()
         if ($Process.HasExited) {
             Stop-WithError -Code 41 -Message (
@@ -1780,6 +1862,9 @@ $cloudflaredStdErr = $null
 $sessionId = $null
 
 try {
+    $toolVersion = ''
+    try { $toolVersion = (Get-Content -LiteralPath (Join-Path $ToolRoot 'VERSION') -TotalCount 1 -ErrorAction Stop).Trim() } catch {}
+    Write-ShareEvent -Type 'start' -Fields ([ordered]@{ pid = $PID; version = $toolVersion })
     if(-not(Test-Path -LiteralPath $Path -PathType Container)){Stop-WithError -Code 10 -Message "Der Pfad ist kein vorhandener Ordner: $Path"}
     Write-Host ''
     Write-Host 'WorkspaceShare 3.1 – read-only Quick-Tunnel-Freigabe'
@@ -1807,6 +1892,16 @@ try {
     Import-Module -Name $JobModulePath -Force -ErrorAction Stop
     Import-Module -Name $PathModulePath -Force -ErrorAction Stop
     Import-Module -Name $DependencyModulePath -Force -ErrorAction Stop
+
+    if ($ParentProcessId -gt 0) {
+        $parentAtStart = $null
+        try { $parentAtStart = Get-Process -Id $ParentProcessId -ErrorAction Stop } catch { $parentAtStart = $null }
+        if ($null -eq $parentAtStart) { Stop-WithError -Code 10 -Message "Der angegebene Elternprozess existiert nicht: $ParentProcessId" }
+        $script:ParentStartTicks = Get-ProcessStartTicksSafe $parentAtStart
+        try { $parentAtStart.Dispose() } catch {}
+        $script:ParentProcessRecorded = $true
+    }
+
     Enable-SystemAwake
 
     Write-Step 1 $totalSteps 'Abhängigkeiten und Umgebung prüfen ...'
@@ -1816,6 +1911,10 @@ try {
             "-UnsafeSkipSecretScan ist ausschließlich zusammen mit -TestMode zulässig. " +
             "Im normalen Betrieb ist der Secret-Scan verpflichtend."
         )
+    }
+
+    if ($TestStopAfterSnapshot -and -not $TestMode) {
+        Stop-WithError -Code 10 -Message '-TestStopAfterSnapshot ist ausschließlich zusammen mit -TestMode zulässig.'
     }
 
     $script:DependencyLease=Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Shared -TimeoutSeconds 30
@@ -1926,6 +2025,7 @@ try {
 
     Write-Host ("      Geprüfte Dateien: {0:N0}" -f $inspection.FileCount)
     Write-Host ("      Konservative Quellgröße: {0:N2} GB" -f ($inspection.EstimatedBytes / 1GB))
+    if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     $sessionId = "{0}-{1}" -f (
         [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'),
@@ -1939,6 +2039,7 @@ try {
     Write-OwnerMetadata -Phase 'Preparing'
     Move-Item -LiteralPath $script:SessionDirectory -Destination $finalSessionDirectory -ErrorAction Stop
     $script:SessionDirectory=$finalSessionDirectory
+    Write-ShareEvent -Type 'session' -Fields ([ordered]@{ path = $script:SessionDirectory })
     $script:HealthLogPath = Join-Path $script:SessionDirectory 'health.jsonl'
 
     $script:NormalExitMarker = Join-Path $script:SessionDirectory 'normal.exit'
@@ -1970,6 +2071,7 @@ try {
     }
 
     Write-Step 4 $totalSteps 'Bereinigten ZIP64-Snapshot erzeugen ...'
+    if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     $exclusions = New-Object System.Collections.Generic.List[string]
 
@@ -2023,6 +2125,12 @@ try {
     Lock-ArchiveReadOnly -ArchivePath $script:ArchivePath
 
     Test-ExactArchiveContents -ArchivePath $script:ArchivePath -VerificationRoot (Join-Path $script:SessionDirectory 'archive-verification') -GitleaksReportPath $gitleaksReport -ExclusionPatterns @($exclusions|Select-Object -Unique) -IncludedRelativePaths $includedRelativePaths -RunSecretScan:(-not $UnsafeSkipSecretScan)
+
+    if ($TestStopAfterSnapshot) {
+        # Test hook: snapshot is created and verified; end without miniserve/cloudflared.
+        $script:StopReason = 'TestSnapshotOnly'
+        Stop-WithError -Code 0 -Message 'Test: Snapshot wurde erstellt und geprüft; die Freigabe wird nicht gestartet.'
+    }
 
     Write-SevenZipManifest `
         -ArchivePath $script:ArchivePath `
@@ -2223,7 +2331,7 @@ try {
         -AllowFullFileResponse:$startupSample.AllowFullFileResponse `
         -TimeoutSeconds 180
 
-    if (-not $initialSnapshot) { $script:StopReason='ManualStop'; Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.' }
+    if (-not $initialSnapshot) { Set-ManualStopReason; Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.' }
     if (-not $initialSnapshot -or $initialSnapshot.Classification -ne 'Healthy') {
         $hostName = ([Uri]$finalUrl).DnsSafeHost
         $diagnosticArguments = @(Get-LiveDnsOverrideConfigLines -HostName $hostName)
@@ -2240,7 +2348,7 @@ try {
     }
 
     foreach ($sample in $healthSamples) {
-        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+        if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $sampleSnapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort -SampleStart $sample.Start -SampleBytes $sample.Length -AllowFullFileResponse:$sample.AllowFullFileResponse
         [void](Write-HealthSnapshot -Snapshot $sampleSnapshot)
         if ($sampleSnapshot.Classification -ne 'Healthy') {
@@ -2258,11 +2366,11 @@ try {
             "Der öffentliche Range-Test (206/$publicRangeLength Bytes) ist fehlgeschlagen."
         )
     }
-    if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+    if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     $publicHeadersPath = Join-Path $script:SessionDirectory 'public-headers.txt'
     Assert-CacheHeaders -Url $finalUrl -HeaderPath $publicHeadersPath
-    if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
+    if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
 
     # Replace the temporary setup lease with the requested lifetime only after
     # every public gate has succeeded.
@@ -2309,6 +2417,7 @@ try {
     Write-Host ("Aktiv bis: {0}" -f $expiresUtc.ToLocalTime().ToString('dd.MM.yyyy HH:mm:ss'))
     Write-Host ("Archiv: {0:N2} GB" -f ($archiveSize / 1GB))
     Write-Host ("SHA-256: {0}" -f $archiveHash)
+    Write-ShareEvent -Type 'ready' -Fields ([ordered]@{ url = $finalUrl; expiresUtc = $expiresUtc.ToUniversalTime().ToString('o'); sizeBytes = [int64]$archiveSize; sha256 = [string]$archiveHash })
     Write-Host ''
     Write-Host 'Dieses Fenster geöffnet lassen. Vorzeitig beenden: Strg+C'
     Write-Host ''
@@ -2325,16 +2434,16 @@ try {
     while ((Get-ActiveElapsedSeconds) -lt $duration.TotalSeconds) {
         $nowUtc = [DateTime]::UtcNow
         $nowSeconds=Get-ActiveElapsedSeconds
-        if(Test-StopRequested){$script:StopReason='ManualStop';$script:ExitCode=0;break}
+        if(Test-StopRequested){Set-ManualStopReason;$script:ExitCode=0;break}
         $loopGapSeconds = $nowSeconds-$lastLoopSeconds
         $lastLoopSeconds=$nowSeconds
         $script:MiniserveProcess.Refresh()
         $script:CloudflaredProcess.Refresh()
         $script:WatchdogProcess.Refresh()
         $stopRequested=Test-StopRequested
-        if ($script:MiniserveProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "miniserve wurde unerwartet beendet (Exit $($script:MiniserveProcess.ExitCode))." }
-        if ($script:CloudflaredProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "cloudflared wurde unerwartet beendet (Exit $($script:CloudflaredProcess.ExitCode))." }
-        if ($script:WatchdogProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){$script:StopReason='ManualStop'};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message 'Der Sicherheits-Watchdog wurde unerwartet beendet.' }
+        if ($script:MiniserveProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){Set-ManualStopReason};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "miniserve wurde unerwartet beendet (Exit $($script:MiniserveProcess.ExitCode))." }
+        if ($script:CloudflaredProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){Set-ManualStopReason};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message "cloudflared wurde unerwartet beendet (Exit $($script:CloudflaredProcess.ExitCode))." }
+        if ($script:WatchdogProcess.HasExited) { if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds -or $stopRequested) {if($stopRequested){Set-ManualStopReason};$script:ExitCode=0;break}; Stop-WithError -Code 50 -Message 'Der Sicherheits-Watchdog wurde unerwartet beendet.' }
 
         if ($loopGapSeconds -gt [Math]::Max(30, $HealthCheckSeconds * 3)) {
             Write-Warning ("Die Überwachung war {0:N0} Sekunden unterbrochen. Möglicher Standby-/Netzwerkwechsel; vollständige Prüfung läuft sofort." -f $loopGapSeconds)
@@ -2347,12 +2456,13 @@ try {
             $healthSampleIndex++
             $snapshot = Get-TunnelHealthSnapshot -PublicUrl $finalUrl -LocalUrl $localUrl -MetricsPort $script:CloudflaredMetricsPort -SampleStart $sample.Start -SampleBytes $sample.Length -AllowFullFileResponse:$sample.AllowFullFileResponse
             [void](Write-HealthSnapshot -Snapshot $snapshot)
-            if(Test-StopRequested){$script:StopReason='ManualStop';$script:ExitCode=0;break}
+            if(Test-StopRequested){Set-ManualStopReason;$script:ExitCode=0;break}
             if ((Get-ActiveElapsedSeconds) -ge $duration.TotalSeconds) { $script:ExitCode = 0; break }
             if ($snapshot.Classification -eq 'Healthy') {
                 if ($null -ne $unhealthySinceSeconds) {
                     $outageSeconds = (Get-ActiveElapsedSeconds)-$unhealthySinceSeconds
                     Write-Host ("      Tunnel wieder gesund nach etwa {0:N0} Sekunden." -f $outageSeconds) -ForegroundColor Green
+                    Write-ShareEvent -Type 'health' -Fields ([ordered]@{ state = 'recovered'; text = ("Tunnel wieder gesund nach etwa {0:N0} Sekunden." -f $outageSeconds) })
                 }
                 $unhealthySinceSeconds = $null;$observedOutageBudget=[double]::PositiveInfinity
             }
@@ -2364,12 +2474,16 @@ try {
                 $allowedSeconds=[Math]::Min(600,$observedOutageBudget)
                 if ($snapshot.Classification -eq 'RateLimited') {
                     if (([DateTime]::UtcNow - $lastRateLimitWarningUtc).TotalSeconds -ge 60) {
-                        Write-Warning ("Quick Tunnel meldet Rate-Limiting. Ungesund seit {0:N0}/{1}s; HTTP={2}, Retry-After={3}s." -f $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.RetryAfterSeconds)
+                        $degradedText = ("Quick Tunnel meldet Rate-Limiting. Ungesund seit {0:N0}/{1}s; HTTP={2}, Retry-After={3}s." -f $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.RetryAfterSeconds)
+                        Microsoft.PowerShell.Utility\Write-Warning $degradedText
+                        Write-ShareEvent -Type 'health' -Fields ([ordered]@{ state = 'degraded'; text = $degradedText })
                         $lastRateLimitWarningUtc = [DateTime]::UtcNow
                     }
                 }
                 else {
-                    Write-Warning ("Tunnel nicht gesund: {0}. Ununterbrochener Ausfall: {1:N0}/{2}s. HTTP={3}, curl={4}, CF={5}, Ready={6}. {7}" -f $snapshot.Classification, $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.PublicCurlExit, $snapshot.CloudflareError, $snapshot.Ready, $snapshot.Message)
+                    $degradedText = ("Tunnel nicht gesund: {0}. Ununterbrochener Ausfall: {1:N0}/{2}s. HTTP={3}, curl={4}, CF={5}, Ready={6}. {7}" -f $snapshot.Classification, $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.PublicCurlExit, $snapshot.CloudflareError, $snapshot.Ready, $snapshot.Message)
+                    Microsoft.PowerShell.Utility\Write-Warning $degradedText
+                    Write-ShareEvent -Type 'health' -Fields ([ordered]@{ state = 'degraded'; text = $degradedText })
                 }
                 if ($unhealthySeconds -ge $allowedSeconds) {
                     Stop-WithError -Code 50 -Message ("Der öffentliche Quick Tunnel blieb {0:N0} Sekunden ungesund.`nAktuelle Fehlerklasse: {1}." -f $unhealthySeconds, $snapshot.Classification)
@@ -2382,7 +2496,9 @@ try {
         $remaining = [TimeSpan]::FromSeconds([Math]::Max(0,$duration.TotalSeconds-(Get-ActiveElapsedSeconds)))
         $wholeMinutes = [Math]::Max(0, [Math]::Ceiling($remaining.TotalMinutes))
         if ($wholeMinutes -ne $lastMinuteShown) {
-            Write-Host ("      Verbleibend: ca. {0} Minute(n); letzte Tunnelprüfung wird alle {1}s ausgeführt." -f $wholeMinutes, $HealthCheckSeconds)
+            $remainingText = ("Verbleibend: ca. {0} Minute(n); letzte Tunnelprüfung wird alle {1}s ausgeführt." -f $wholeMinutes, $HealthCheckSeconds)
+            Write-Host ("      " + $remainingText)
+            Write-ShareEvent -Type 'status' -Fields ([ordered]@{ remainingMinutes = [int]$wholeMinutes; text = $remainingText })
             $lastMinuteShown = $wholeMinutes
         }
         $lastLoopSeconds=Get-ActiveElapsedSeconds
@@ -2390,7 +2506,7 @@ try {
     }
 
     Write-Host ''
-    if($script:StopReason -eq 'ManualStop'){Write-Host 'Die Freigabe wurde auf Benutzerwunsch beendet.'}else{Write-Host 'Die festgelegte Freigabezeit ist abgelaufen.'}
+    if($script:StopReason -in @('ManualStop','ParentExited')){Write-Host 'Die Freigabe wurde auf Benutzerwunsch beendet.'}else{Write-Host 'Die festgelegte Freigabezeit ist abgelaufen.'}
     $script:ExitCode = 0
 }
 catch {
@@ -2401,6 +2517,7 @@ catch {
     $message = Protect-DiagnosticText -Text $message -KnownSecretUrls $script:SecretUrls
 
     $script:ExitCode = $parsedCode
+    if ($parsedCode -ne 0) { $script:LastErrorMessage = $message }
     if ($script:ExitCode -ne 0 -and $script:SessionDirectory) {
         try {
             if ($script:CloudflaredMetricsPort -gt 0) {
@@ -2484,6 +2601,8 @@ finally {
     }
     if($cleanupComplete -and $script:JobHandle -ne [IntPtr]::Zero){try{Close-WorkspaceJob -Job $script:JobHandle}catch{$script:ExitCode=50};$script:JobHandle=[IntPtr]::Zero}
     if($script:DependencyLease){try{$script:DependencyLease.Dispose()}catch{$script:ExitCode=50};$script:DependencyLease=$null}
+    Write-EndedEvent
 }
 
+Write-EndedEvent
 exit $script:ExitCode

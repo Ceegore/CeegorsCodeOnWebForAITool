@@ -176,6 +176,57 @@ function Get-RelativeFiles {
     )
 }
 
+function Invoke-ShareChild {
+    # Runs Share-Workspace.ps1 as a child process; returns exit code and stdout lines.
+    param([string[]]$Arguments, [int]$TimeoutSeconds = 600)
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $PSHOME 'powershell.exe'
+    $childArguments = @('-NoLogo','-NoProfile','-NonInteractive','-File',$shareScript) + @($Arguments)
+    $psi.Arguments = (($childArguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+
+    $child = New-Object Diagnostics.Process
+    $child.StartInfo = $psi
+    [void]$child.Start()
+    $child.StandardInput.Close()
+    $stdoutTask = $child.StandardOutput.ReadToEndAsync()
+    $stderrTask = $child.StandardError.ReadToEndAsync()
+    if (-not $child.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $child.Kill() } catch {}
+        [void]$child.WaitForExit(5000)
+    }
+    $child.WaitForExit()
+    $text = $stdoutTask.Result
+    $errorText = $stderrTask.Result
+    $exitCode = $child.ExitCode
+    $child.Dispose()
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Lines    = @($text -split "\r?\n" | Where-Object { $_ -ne '' })
+        StdErr   = $errorText
+    }
+}
+
+function Get-ShareEvents {
+    param($Lines)
+    $parsed = New-Object System.Collections.Generic.List[object]
+    $allParsed = $true
+    foreach ($line in @($Lines)) {
+        if (([string]$line).StartsWith('@@WSEVENT@@ ')) {
+            try { $parsed.Add((([string]$line).Substring(12) | ConvertFrom-Json)) }
+            catch { $allParsed = $false }
+        }
+    }
+    return [pscustomobject]@{ Events = @($parsed.ToArray()); AllParsed = $allParsed }
+}
+
 try {
     New-Item -ItemType Directory -Path $temp -Force | Out-Null
 
@@ -480,6 +531,108 @@ try {
         $publicHeaderText = Get-Content -LiteralPath $publicHeaders -Raw
         Assert-True ($publicHeaderText -match '(?im)^cache-control:.*no-store') 'Öffentliches Cache-Control enthält no-store'
         Assert-True ($publicHeaderText -notmatch '(?im)^cf-cache-status:\s*HIT\s*$') 'Cloudflare meldet keinen Cache-HIT'
+    }
+
+    # ------------------------------------------------------------------
+    # Ende-zu-Ende bis zum Snapshot (kein Netzwerk, kein miniserve/cloudflared)
+    # ------------------------------------------------------------------
+    Write-Host ''
+    Write-Host 'Snapshot-Stufe und Event-Stream'
+    Write-Host '-------------------------------'
+
+    $snapshotWorkspace = Join-Path $temp 'snapshot-workspace'
+    New-Item -ItemType Directory -Path (Join-Path $snapshotWorkspace 'sub') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $snapshotWorkspace '.git') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $snapshotWorkspace 'node_modules') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'hello.txt') -Value 'hello' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'sub\readme.md') -Value '# readme' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'sub\.npmrc') -Value 'registry=https://example.invalid/' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $snapshotWorkspace '.git\config') -Value '[core]' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'node_modules\x.js') -Value 'x' -Encoding ASCII
+
+    $keptSessionPath = $null
+    try {
+        # (a) Erfolgreicher Snapshot-Lauf; -KeepArchive erhält das ZIP für die Inhaltsprüfung.
+        $runA = Invoke-ShareChild -Arguments @('-Path',$snapshotWorkspace,'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard','-KeepArchive')
+        $parsedA = Get-ShareEvents $runA.Lines
+        $eventsA = @($parsedA.Events)
+        $eventLinesA = @($runA.Lines | Where-Object { $_.StartsWith('@@WSEVENT@@ ') })
+        # Remember the kept session first so cleanup works even if an assertion below throws.
+        $earlySession = @($eventsA | Where-Object { $_.type -eq 'session' })
+        if ($earlySession.Count -eq 1) { $keptSessionPath = [string]$earlySession[0].path }
+        Assert-True ($runA.ExitCode -eq 0) "Snapshot-Lauf endet mit Exit 0 (war $($runA.ExitCode))"
+        Assert-True ($eventLinesA.Count -gt 0 -and $parsedA.AllParsed -and $eventsA.Count -eq $eventLinesA.Count) 'Alle @@WSEVENT@@-Zeilen sind gültiges JSON'
+        Assert-True (@($eventsA | Where-Object { $_.v -eq 1 -and $_.type -and $_.ts }).Count -eq $eventsA.Count) 'Jedes Event hat v=1, type und ts'
+        Assert-True (@($eventsA | Where-Object { $_.type -eq 'start' }).Count -eq 1) 'Genau ein start-Event'
+        $endedA = @($eventsA | Where-Object { $_.type -eq 'ended' })
+        Assert-True ($endedA.Count -eq 1) 'Genau ein ended-Event'
+        Assert-True ($endedA.Count -eq 1 -and $endedA[0].exitCode -eq 0 -and $endedA[0].reason -eq 'TestSnapshotOnly') 'ended-Event: exitCode 0, reason TestSnapshotOnly'
+        Assert-True ($eventsA.Count -gt 0 -and $eventsA[$eventsA.Count - 1].type -eq 'ended') 'ended ist das letzte Event'
+        $stepNumbers = @($eventsA | Where-Object { $_.type -eq 'step' } | ForEach-Object { [int]$_.n })
+        Assert-True (@(@(1,2,3,4) | Where-Object { $_ -notin $stepNumbers }).Count -eq 0) 'step-Events 1..4 vorhanden'
+        $sessionEvents = @($eventsA | Where-Object { $_.type -eq 'session' })
+        Assert-True ($sessionEvents.Count -eq 1 -and [bool]$sessionEvents[0].path) 'session-Event mit Pfad vorhanden'
+        Assert-True (@($eventsA | Where-Object { $_.type -eq 'ready' }).Count -eq 0) 'Kein ready-Event vor dem Tunnelstart'
+        Assert-True (@($eventLinesA | Where-Object { $_ -cmatch '[^\x00-\x7E]' }).Count -eq 0) 'Event-Zeilen enthalten nur ASCII'
+        Assert-True (@($runA.Lines | Where-Object { $_ -match 'trycloudflare\.com' }).Count -eq 0) 'Kein Tunnel-Link im Snapshot-Lauf'
+
+        if ($sessionEvents.Count -eq 1) { $keptSessionPath = [string]$sessionEvents[0].path }
+        $zipItem = $null
+        if ($keptSessionPath -and (Test-Path -LiteralPath $keptSessionPath -PathType Container)) {
+            $zipItem = Get-ChildItem -LiteralPath $keptSessionPath -Filter 'workspace-*.zip' -File | Select-Object -First 1
+        }
+        Assert-True ($null -ne $zipItem) '-KeepArchive erhält das ZIP im gemeldeten Sitzungsordner'
+        if ($zipItem) {
+            $sevenZip = Join-Path $bin '7za.exe'
+            $zipListing = @(& $sevenZip l -ba $zipItem.FullName)
+            Assert-True ($LASTEXITCODE -eq 0) '7-Zip kann das erhaltene ZIP auflisten'
+            $zipText = ($zipListing -join "`n")
+            Assert-True ($zipText -match '(?m)hello\.txt\s*$') 'Snapshot enthält hello.txt'
+            Assert-True ($zipText -match '(?m)sub[\\/]readme\.md\s*$') 'Snapshot enthält sub\readme.md'
+            Assert-True ($zipText -notmatch '\.npmrc') 'Snapshot enthält keine .npmrc'
+            Assert-True ($zipText -notmatch '(?i)(^|[\s\\/])\.git([\\/]|\s|$)') 'Snapshot enthält kein .git'
+            Assert-True ($zipText -notmatch 'node_modules') 'Snapshot enthält kein node_modules'
+        }
+
+        # (b) .env im Workspace -> Secret-Gate (Exit 22), ended-Event trägt denselben Code.
+        $envWorkspace = Join-Path $temp 'snapshot-workspace-env'
+        New-Item -ItemType Directory -Path $envWorkspace -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $envWorkspace 'hello.txt') -Value 'hello' -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $envWorkspace '.env') -Value 'API_KEY=not-a-real-key' -Encoding ASCII
+        $runB = Invoke-ShareChild -Arguments @('-Path',$envWorkspace,'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard')
+        $endedB = @((Get-ShareEvents $runB.Lines).Events | Where-Object { $_.type -eq 'ended' })
+        Assert-True ($runB.ExitCode -eq 22) "Workspace mit .env endet mit Exit 22 (war $($runB.ExitCode))"
+        Assert-True ($endedB.Count -eq 1 -and $endedB[0].exitCode -eq 22) 'ended-Event meldet exitCode 22 bei .env'
+
+        # (c) -TestStopAfterSnapshot ohne -TestMode -> Exit 10.
+        $runC = Invoke-ShareChild -Arguments @('-Path',$snapshotWorkspace,'-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard')
+        $endedC = @((Get-ShareEvents $runC.Lines).Events | Where-Object { $_.type -eq 'ended' })
+        Assert-True ($runC.ExitCode -eq 10) "-TestStopAfterSnapshot ohne -TestMode endet mit Exit 10 (war $($runC.ExitCode))"
+        Assert-True ($endedC.Count -eq 1 -and $endedC[0].exitCode -eq 10) 'ended-Event meldet exitCode 10 ohne -TestMode'
+
+        # (d) Nicht vorhandener Pfad -> Exit 10.
+        $runD = Invoke-ShareChild -Arguments @('-Path',(Join-Path $temp 'does-not-exist'),'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard')
+        $endedD = @((Get-ShareEvents $runD.Lines).Events | Where-Object { $_.type -eq 'ended' })
+        Assert-True ($runD.ExitCode -eq 10) "Nicht vorhandener Pfad endet mit Exit 10 (war $($runD.ExitCode))"
+        Assert-True ($endedD.Count -eq 1 -and $endedD[0].exitCode -eq 10) 'ended-Event meldet exitCode 10 bei fehlendem Pfad'
+
+        # (e) Ohne -EventStream erscheinen keine Event-Zeilen.
+        $runE = Invoke-ShareChild -Arguments @('-Path',(Join-Path $temp 'does-not-exist'),'-Minutes','1','-NoClipboard')
+        Assert-True ($runE.ExitCode -eq 10 -and @($runE.Lines | Where-Object { $_.StartsWith('@@WSEVENT@@') }).Count -eq 0) 'Ohne -EventStream werden keine Events ausgegeben'
+
+        # (f) Elternprozess existiert nicht -> Exit 10.
+        $runF = Invoke-ShareChild -Arguments @('-Path',$snapshotWorkspace,'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard','-ParentProcessId','2147483000')
+        Assert-True ($runF.ExitCode -eq 10) "Nicht vorhandene -ParentProcessId endet mit Exit 10 (war $($runF.ExitCode))"
+    }
+    finally {
+        # Nur den eigenen, per Event gemeldeten Sitzungsordner unterhalb des Sitzungsbasisordners löschen.
+        if ($keptSessionPath -and $env:LOCALAPPDATA) {
+            $sessionRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions')).TrimEnd('\') + '\'
+            $fullKept = [IO.Path]::GetFullPath($keptSessionPath)
+            if ($fullKept.StartsWith($sessionRoot, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $fullKept -Leaf) -match '^\d{8}-\d{6}-[0-9a-f]{8}$') {
+                Remove-Item -LiteralPath $fullKept -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 finally {
