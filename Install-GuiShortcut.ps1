@@ -13,8 +13,52 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'scripts') 'WorkspaceShare.Platform.psm1') -Force -ErrorAction Stop
 
+if ((Get-WsPlatform) -eq 'linux') {
+    # Linux (experimentell): a freedesktop .desktop file that starts the GUI with pwsh.
+    $linuxStart = Join-Path $PSScriptRoot 'Start-WorkspaceShareGui.ps1'
+    $applications = Join-Path (Join-Path (Join-Path $HOME '.local') 'share') 'applications'
+    $linuxDirectories = @()
+    if (-not [string]::IsNullOrWhiteSpace($TargetDirectory)) { $linuxDirectories += $TargetDirectory }
+    else {
+        $linuxWantDesktop = $false
+        $linuxWantMenu = $true
+        if ($PSBoundParameters.ContainsKey('Desktop') -or $PSBoundParameters.ContainsKey('StartMenu')) {
+            $linuxWantDesktop = [bool]$Desktop
+            $linuxWantMenu = [bool]$StartMenu
+        }
+        if ($linuxWantMenu) { $linuxDirectories += $applications }
+        if ($linuxWantDesktop -and (Test-Path -LiteralPath (Join-Path $HOME 'Desktop') -PathType Container)) { $linuxDirectories += (Join-Path $HOME 'Desktop') }
+    }
+    $desktopName = 'workspaceshare.desktop'
+    if ($Remove) {
+        foreach ($dir in $linuxDirectories) {
+            $entry = Join-Path $dir $desktopName
+            if (Test-Path -LiteralPath $entry -PathType Leaf) { Remove-Item -LiteralPath $entry -Force; Write-Host "Entfernt: $entry" }
+        }
+        exit 0
+    }
+    if (-not (Test-Path -LiteralPath $linuxStart -PathType Leaf)) {
+        Write-Error "Start-WorkspaceShareGui.ps1 wurde nicht gefunden: $linuxStart"
+        exit 1
+    }
+    # Exec quoting of the desktop entry specification: double quotes, backslash-escape \ " ` $ and double %.
+    $quoteExec = { param([string]$value) '"' + ($value.Replace('\', '\\').Replace('"', '\"').Replace('`', '\`').Replace('$', '\$').Replace('%', '%%')) + '"' }
+    $execLine = (& $quoteExec (Get-WsPowerShellHost)) + ' -NoLogo -NoProfile -File ' + (& $quoteExec $linuxStart)
+    $iconPath = Join-Path (Join-Path $PSScriptRoot 'gui') 'favicon.svg'
+    $text = "[Desktop Entry]`nType=Application`nVersion=1.0`nName=WorkspaceShare`nComment=WorkspaceShare - Ordner sicher teilen`nExec=$execLine`nPath=$PSScriptRoot`nTerminal=false`nCategories=Network;Utility;`n"
+    if (Test-Path -LiteralPath $iconPath -PathType Leaf) { $text += "Icon=$iconPath`n" }
+    foreach ($dir in $linuxDirectories) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        $entry = Join-Path $dir $desktopName
+        [IO.File]::WriteAllText($entry, $text, (New-Object System.Text.UTF8Encoding($false)))
+        try { [IO.File]::SetUnixFileMode($entry, [IO.UnixFileMode]'UserRead,UserWrite,UserExecute,GroupRead,OtherRead') } catch { }
+        Write-Host "Starter erstellt: $entry"
+    }
+    exit 0
+}
+
 if ((Get-WsPlatform) -ne 'windows') {
-    Write-Warning 'Noch nicht unterstützt (siehe docs\LINUX_PLAN.md)'
+    Write-Warning 'Auf diesem System noch nicht unterstützt (siehe docs/LINUX_PLAN.md)'
     exit 0
 }
 

@@ -93,6 +93,7 @@ $script:MiniserveProcess = $null
 $script:CloudflaredProcess = $null
 $script:WatchdogProcess = $null
 $script:SleepPreventionEnabled = $false
+$script:KeepAwakeProcess = $null
 $script:NormalExitMarker = $null
 $script:ClipboardUrl = $null
 $script:KeepArchiveMarker = $null
@@ -121,16 +122,30 @@ $script:ParentCheckTimer = $null
 $script:EndedEventSent = $false
 $script:LastErrorMessage = ''
 
+# Windows PowerShell 5.1 on Windows is the product; PowerShell 7 on Linux x64 is experimental (docs/LINUX_PLAN.md).
+$script:IsWindowsHost = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+
 $BinDirectory = Join-Path $ToolRoot 'bin'
 $ConfigDirectory = Join-Path $ToolRoot 'config'
 $ScriptsDirectory = Join-Path $ToolRoot 'scripts'
 
-$SevenZipPath = Join-Path $BinDirectory '7za.exe'
-$MiniservePath = Join-Path $BinDirectory 'miniserve.exe'
-$CloudflaredPath = Join-Path $BinDirectory 'cloudflared.exe'
-$GitleaksPath = Join-Path $BinDirectory 'gitleaks.exe'
-$curlCommand = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+if ($script:IsWindowsHost) {
+    $SevenZipPath = Join-Path $BinDirectory '7za.exe'
+    $MiniservePath = Join-Path $BinDirectory 'miniserve.exe'
+    $CloudflaredPath = Join-Path $BinDirectory 'cloudflared.exe'
+    $GitleaksPath = Join-Path $BinDirectory 'gitleaks.exe'
+    $curlCommand = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+}
+else {
+    $BinDirectory = Join-Path $BinDirectory 'linux-x64'
+    $SevenZipPath = Join-Path $BinDirectory '7zz'
+    $MiniservePath = Join-Path $BinDirectory 'miniserve'
+    $CloudflaredPath = Join-Path $BinDirectory 'cloudflared'
+    $GitleaksPath = Join-Path $BinDirectory 'gitleaks'
+    $curlCommand = Get-Command 'curl' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+}
 $script:CurlPath = if ($curlCommand) { $curlCommand.Source } else { $null }
+$NullDevice = if ($script:IsWindowsHost) { 'NUL' } else { '/dev/null' }
 
 $MandatoryExcludesPath = Join-Path $ConfigDirectory 'mandatory-excludes.txt'
 $GeneratedExcludesPath = Join-Path $ConfigDirectory 'generated-excludes.txt'
@@ -144,7 +159,16 @@ $JobModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Job.psm1'
 $PathModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Path.psm1'
 $DependencyModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Dependency.psm1'
 
-$SessionBase = if ($env:LOCALAPPDATA) {
+$PlatformModulePath = Join-Path $ScriptsDirectory 'WorkspaceShare.Platform.psm1'
+if (-not (Test-Path -LiteralPath $PlatformModulePath -PathType Leaf)) {
+    [Console]::Error.WriteLine("Plattform-Modul wurde nicht gefunden: $PlatformModulePath")
+    exit 10
+}
+Import-Module -Name $PlatformModulePath -Force -ErrorAction Stop
+
+$SessionBase = if (-not $script:IsWindowsHost) {
+    Join-Path (Get-WsDataRoot) 'sessions'
+} elseif ($env:LOCALAPPDATA) {
     Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions'
 } else {
     Join-Path ([IO.Path]::GetTempPath()) 'WorkspaceShare\sessions'
@@ -262,6 +286,8 @@ function Write-JsonFileAtomic {
 function Lock-ArchiveReadOnly {
     param([Parameter(Mandatory = $true)][string]$ArchivePath)
     $script:ArchiveLockStream = New-Object IO.FileStream($ArchivePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    # Linux: the share lock is advisory (flock), so the verified archive is also made read-only (chmod 400).
+    if (-not $script:IsWindowsHost) { try { [IO.File]::SetUnixFileMode($ArchivePath, [IO.UnixFileMode]'UserRead') } catch { } }
 }
 
 function Test-StopRequested {
@@ -307,15 +333,26 @@ function Get-ActiveElapsedSeconds {
 function Write-OwnerMetadata {
     param([Parameter(Mandatory=$true)][string]$Phase)
     $launcher=Get-Process -Id $PID -ErrorAction Stop
-    $owner=[ordered]@{magic='WorkspaceShareSession';schema=1;phase=$Phase;createdUtc=[DateTime]::UtcNow.ToString('o');launcherPid=$PID;launcherPath=$launcher.Path;launcherStartTicks=$launcher.StartTime.ToUniversalTime().Ticks;jobName=$script:JobName}
+    $owner=[ordered]@{magic='WorkspaceShareSession';schema=1;phase=$Phase;createdUtc=[DateTime]::UtcNow.ToString('o');launcherPid=$PID;launcherPath=$launcher.Path;launcherStartTicks=(Get-WorkspaceProcessStartTicks -Process $launcher);jobName=$script:JobName}
     Write-JsonFileAtomic -Value $owner -Destination (Join-Path $script:SessionDirectory 'owner.json')
 }
 
 function Set-PrivateDirectoryAcl {
     param([Parameter(Mandatory=$true)][string]$Directory)
+    if(-not $script:IsWindowsHost){
+        # Linux: owner-only access (chmod 700) instead of an ACL.
+        try{Set-WsPrivateDirectory -Path $Directory}catch{Stop-WithError -Code 10 -Message "Private Verzeichnisrechte konnten nicht gesetzt werden: $Directory"}
+        return
+    }
     $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     & "$env:SystemRoot\System32\icacls.exe" $Directory '/inheritance:r' '/grant:r' ("*{0}:(OI)(CI)F" -f $sid)|Out-Null
     if($LASTEXITCODE -ne 0){Stop-WithError -Code 10 -Message "Private Verzeichnisrechte konnten nicht gesetzt werden: $Directory"}
+}
+
+function Get-WatchdogHostPath {
+    # The PowerShell host that runs the watchdog; also the executable path the watchdog is identified by.
+    if ($script:IsWindowsHost) { return (Join-Path $PSHOME 'powershell.exe') }
+    return (Get-WsPowerShellHost)
 }
 
 function Read-BoundedDiagnosticText {
@@ -344,8 +381,10 @@ function Test-ExactArchiveContents {
             if(@($parts|Where-Object{$_ -in @('.git','.svn','.hg')}).Count -gt 0){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält ausgeschlossene Versionskontrolldaten: $relative"}
             if(Test-SourcePathExcluded -RelativePath $relative -Name $entry.Name -Patterns $ExclusionPatterns){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält einen ausgeschlossenen Pfad: $relative"}
         }
-        $actualFiles=@(Get-ChildItem -LiteralPath $VerificationRoot -File -Recurse -Force|ForEach-Object{$_.FullName.Substring($VerificationRoot.Length).TrimStart('\','/').ToLowerInvariant()}|Sort-Object)
-        $expectedFiles=@($IncludedRelativePaths|ForEach-Object{([string]$_).Replace('/','\').ToLowerInvariant()}|Sort-Object)
+        # Both lists use '/' separators; Windows compares lower-cased (case-insensitive file system), Linux exactly.
+        $foldCase={param($name)if($script:IsWindowsHost){$name.ToLowerInvariant()}else{$name}}
+        $actualFiles=@(Get-ChildItem -LiteralPath $VerificationRoot -File -Recurse -Force|ForEach-Object{& $foldCase $_.FullName.Substring($VerificationRoot.Length).TrimStart('\','/').Replace('\','/')}|Sort-Object)
+        $expectedFiles=@($IncludedRelativePaths|ForEach-Object{& $foldCase ([string]$_).Replace('\','/')}|Sort-Object)
         if(Compare-Object $expectedFiles $actualFiles){Stop-WithError -Code 22 -Message 'Das fertige Archiv stimmt nicht exakt mit der eingeschlossenen Quelldateiliste überein.'}
         $inspection=Inspect-Workspace -Root $VerificationRoot -IncludeGeneratedContent
         if($inspection.AccessErrors.Count -gt 0 -or $inspection.ReparsePoints.Count -gt 0 -or $inspection.ForbiddenFiles.Count -gt 0){Stop-WithError -Code 22 -Message 'Das fertige Archiv hat die exakte Inhaltsprüfung nicht bestanden.'}
@@ -363,7 +402,7 @@ function Get-ProcessStartTicksSafe {
 
     try {
         $Process.Refresh()
-        return [int64]$Process.StartTime.ToUniversalTime().Ticks
+        return [int64](Get-WorkspaceProcessStartTicks -Process $Process)
     }
     catch {
         return [int64]0
@@ -404,6 +443,17 @@ function Assert-DependencyLock {
         'Gitleaks' = [ordered]@{ Version = '8.30.1'; File = 'bin/gitleaks.exe' }
         '7-Zip' = [ordered]@{ Version = '26.02'; File = 'bin/7za.exe' }
     }
+    if (-not $script:IsWindowsHost) {
+        if ([string]$lock.platform -ne 'linux-x64') {
+            Stop-WithError -Code 11 -Message "Das Lockfile gehört zu einer anderen Plattform ($($lock.platform)). Führe .\Install-Dependencies.ps1 -Force aus."
+        }
+        $expectedDependencies = [ordered]@{
+            'cloudflared' = [ordered]@{ Version = '2026.7.2'; File = 'bin/linux-x64/cloudflared' }
+            'miniserve' = [ordered]@{ Version = '0.35.0'; File = 'bin/linux-x64/miniserve' }
+            'Gitleaks' = [ordered]@{ Version = '8.30.1'; File = 'bin/linux-x64/gitleaks' }
+            '7-Zip' = [ordered]@{ Version = '26.02'; File = 'bin/linux-x64/7zz' }
+        }
+    }
 
     $seen = @{}
     foreach ($dependency in @($lock.dependencies)) {
@@ -417,7 +467,7 @@ function Assert-DependencyLock {
             Stop-WithError -Code 11 -Message "Das Lockfile enthält einen unerwarteten Pfad oder eine unerwartete Version für $dependencyName."
         }
         $filePath = [IO.Path]::GetFullPath((Join-Path $ToolRoot $expected.File.Replace('/', [IO.Path]::DirectorySeparatorChar)))
-        $resolvedToolRoot = [IO.Path]::GetFullPath($ToolRoot).TrimEnd('\') + '\'
+        $resolvedToolRoot = [IO.Path]::GetFullPath($ToolRoot).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
         if (-not $filePath.StartsWith($resolvedToolRoot, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-WithError -Code 11 -Message "Der Abhängigkeitspfad verlässt ToolRoot: $dependencyName"
         }
@@ -584,7 +634,7 @@ function Start-NativeProcess {
         Stop-WithError -Code 30 -Message "Prozess konnte nicht gestartet werden: $FilePath"
     }
 
-    $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+    $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue (Get-WorkspaceProcessStartTicks -Process $process) -Force
 
     return $process
 }
@@ -630,7 +680,7 @@ function Stop-ProcessConfirmed {
     )
 
     if ($null -eq $Process) { return $true }
-    try{$Process.Refresh();$ticks=if($Process.PSObject.Properties.Name -contains 'WorkspaceShareStartTicks'){[long]$Process.WorkspaceShareStartTicks}else{[long]$Process.StartTime.ToUniversalTime().Ticks};return (Stop-TrackedProcessConfirmed -ProcessId $Process.Id -ExpectedPath $ExpectedPath -ExpectedStartTicks $ticks -Attempts $Attempts -WaitMilliseconds $WaitMilliseconds)}catch{return $false}
+    try{$Process.Refresh();$ticks=if($Process.PSObject.Properties.Name -contains 'WorkspaceShareStartTicks'){[long]$Process.WorkspaceShareStartTicks}else{[long](Get-WorkspaceProcessStartTicks -Process $Process)};return (Stop-TrackedProcessConfirmed -ProcessId $Process.Id -ExpectedPath $ExpectedPath -ExpectedStartTicks $ticks -Attempts $Attempts -WaitMilliseconds $WaitMilliseconds)}catch{return $false}
 }
 
 function Get-CurlStatus {
@@ -762,7 +812,7 @@ function Get-LiveDnsOverrideConfigLines {
     param([Parameter(Mandatory = $true)][string]$HostName)
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         try {
-            $address = Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
+            $address = Get-WsResolvedAddress -Name $HostName -Type A -Server $resolver | Select-Object -First 1
             if ($address) {$value='{0}:443:{1}' -f $HostName,$address;return @('resolve = "{0}"' -f (WorkspaceShare.Curl\ConvertTo-CurlConfigQuoted $value))}
         } catch {}
     }
@@ -773,14 +823,17 @@ function Get-DnsObservation {
     param([Parameter(Mandatory = $true)][string]$HostName)
     $systemAddresses = @()
     foreach ($type in @('A', 'AAAA')) {
-        try { $systemAddresses += @(Resolve-DnsName -Name $HostName -Type $type -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch {}
+        try { $systemAddresses += @(Get-WsResolvedAddress -Name $HostName -Type $type) } catch {}
     }
     $systemAddresses = @($systemAddresses | Select-Object -Unique)
     $publicResults = @()
-    foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
+    # Without dig (Linux) the public-resolver comparisons are skipped; the HTTP gates remain authoritative.
+    $publicResolvers = @('1.1.1.1', '8.8.8.8', '9.9.9.9')
+    if (-not (Test-WsPublicResolverSupport)) { $publicResolvers = @() }
+    foreach ($resolver in $publicResolvers) {
         $addresses = @(); $errorText = ''
         foreach ($type in @('A', 'AAAA')) {
-            try { $addresses += @(Resolve-DnsName -Name $HostName -Type $type -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch { $errorText = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls }
+            try { $addresses += @(Get-WsResolvedAddress -Name $HostName -Type $type -Server $resolver) } catch { $errorText = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls }
         }
         $addresses = @($addresses | Select-Object -Unique)
         $publicResults += [pscustomobject]@{ Resolver = $resolver; Addresses = $addresses; Success = ($addresses.Count -gt 0); Error = $errorText }
@@ -790,12 +843,13 @@ function Get-DnsObservation {
 
 function Wait-ForPublicDnsPublication {
     param([Parameter(Mandatory=$true)][string]$HostName,[ValidateRange(5,600)][int]$TimeoutSeconds=180)
+    if(-not(Test-WsPublicResolverSupport)){Write-Host '      Hinweis: dig fehlt; der Vergleich mit öffentlichen DNS-Resolvern wird übersprungen.';return $true}
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do{
         if(Test-StopRequested){Set-ManualStopReason;Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $successfulResolvers=0
         foreach($resolver in @('1.1.1.1','8.8.8.8','9.9.9.9')){
-            try{$answer=Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop|Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress }|Select-Object -First 1;if($answer){$successfulResolvers++}}catch{}
+            try{$answer=Get-WsResolvedAddress -Name $HostName -Type A -Server $resolver|Select-Object -First 1;if($answer){$successfulResolvers++}}catch{}
         }
         if($successfulResolvers -ge 2){return $true}
         Start-Sleep -Seconds 2
@@ -861,10 +915,10 @@ function Get-HeaderDump {
     $arguments = @(
         '--silent',
         '--show-error',
-        '--stderr', 'NUL',
+        '--stderr', $NullDevice,
         '--max-time', '20',
         '--dump-header', $OutputPath,
-        '--output', 'NUL'
+        '--output', $NullDevice
     )
     if($Head){$arguments+='--head'}else{$arguments+=@('--range','0-0','--max-filesize','1')}
     return (Invoke-WorkspaceCurl -Url $Url -Arguments $arguments).ExitCode
@@ -1042,11 +1096,13 @@ function Get-SourceConsistencyManifest {
             $directory=$stack.Pop()
             foreach($file in @($directory.EnumerateFileSystemInfos())){
                 if(($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
-                $relative=$file.FullName.Substring($Root.Length).TrimStart('\','/').ToLowerInvariant()
+                # Windows folds case (case-insensitive file system); Linux keeps the exact name for 7-Zip.
+                $relative=$file.FullName.Substring($Root.Length).TrimStart('\','/')
+                if([IO.Path]::DirectorySeparatorChar -eq '\'){$relative=$relative.ToLowerInvariant()}
                 $excluded=Test-SourcePathExcluded -RelativePath $relative -Name $file.Name -Patterns $ExclusionPatterns
                 if($file -is [System.IO.DirectoryInfo]){if(-not $excluded){$stack.Push($file)};continue}
                 if($excluded){continue}
-                $fileIdentity=(Resolve-WorkspaceDirectoryIdentity -Path $file.FullName).Identity
+                $fileIdentity=if([IO.Path]::DirectorySeparatorChar -eq '\'){(Resolve-WorkspaceDirectoryIdentity -Path $file.FullName).Identity}else{'-'}
                 $hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
                 $result.Add(('{0}|{1}|{2}|{3}|{4}' -f $relative,$fileIdentity,$file.Length,$file.LastWriteTimeUtc.Ticks,$hash))
             }
@@ -1056,7 +1112,8 @@ function Get-SourceConsistencyManifest {
 }
 
 function Get-CloudflaredConfigConflicts {
-    $directory = Join-Path $env:USERPROFILE '.cloudflared'
+    $profileRoot = if ($script:IsWindowsHost) { $env:USERPROFILE } else { $env:HOME }
+    $directory = Join-Path $profileRoot '.cloudflared'
     return @(
         Join-Path $directory 'config.yml'
         Join-Path $directory 'config.yaml'
@@ -1144,6 +1201,8 @@ function Invoke-SevenZipSnapshot {
         $DestinationArchive,
         ("@$IncludeListPath")
     )
+    # Linux file names may contain wildcard characters: match the include list literally.
+    if (-not $script:IsWindowsHost) { $arguments = @($arguments[0..($arguments.Count - 3)]) + @('-spd') + @($arguments[($arguments.Count - 2)..($arguments.Count - 1)]) }
 
     # Der Workspace selbst ist nur das Arbeitsverzeichnis. Dadurch enthält das
     # ZIP direkt dessen Inhalt statt einer zusätzlichen Root-Ordner-Ebene.
@@ -1230,7 +1289,7 @@ function Start-MiniserveReadOnly {
             -StdOutPath (Join-Path $script:SessionDirectory 'miniserve.stdout.log') `
             -StdErrPath (Join-Path $script:SessionDirectory 'miniserve.stderr.log') `
             -Environment $childEnvironment
-    $process | Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+    $process | Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue (Get-WorkspaceProcessStartTicks -Process $process) -Force
     return $process
 }
 
@@ -1257,7 +1316,7 @@ function Start-CloudflaredQuickTunnel {
 
     $childEnvironment=New-WorkspaceChildEnvironment
     $process=Start-WorkspaceProcessInJob -Job $script:JobHandle -FilePath $CloudflaredPath -Arguments $arguments -WorkingDirectory $script:SessionDirectory -StdOutPath $StdOutPath -StdErrPath $StdErrPath -Environment $childEnvironment
-    $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue $process.StartTime.ToUniversalTime().Ticks -Force
+    $process|Add-Member -NotePropertyName WorkspaceShareStartTicks -NotePropertyValue (Get-WorkspaceProcessStartTicks -Process $process) -Force
     return $process
 }
 
@@ -1536,6 +1595,11 @@ function Assert-CacheHeaders {
 }
 
 function Enable-SystemAwake {
+    if (-not $script:IsWindowsHost) {
+        # Linux: systemd-inhibit helper when available; otherwise silently nothing.
+        $script:KeepAwakeProcess = Start-WsKeepAwake
+        return
+    }
     try {
         if (-not ('WorkspaceShare.NativePower' -as [type])) {
             Add-Type @'
@@ -1567,6 +1631,11 @@ namespace WorkspaceShare {
 }
 
 function Disable-SystemAwake {
+    if (-not $script:IsWindowsHost) {
+        Stop-WsKeepAwake -Process $script:KeepAwakeProcess
+        $script:KeepAwakeProcess = $null
+        return
+    }
     if ($script:SleepPreventionEnabled) {
         try {
             # ES_CONTINUOUS (0x80000000)
@@ -1582,6 +1651,14 @@ function Copy-LinkToClipboard {
 
     if ($NoClipboard) {
         return $false
+    }
+
+    if (-not $script:IsWindowsHost) {
+        # Linux: wl-copy / xclip / xsel when a display is available.
+        $copiedLinux = $false
+        try { $copiedLinux = [bool](Set-WsClipboardText -Text $Url) } catch { $copiedLinux = $false }
+        if ($copiedLinux) { $script:ClipboardUrl = $Url }
+        return $copiedLinux
     }
 
     try {
@@ -1625,6 +1702,11 @@ function Clear-SensitiveClipboard {
         return
     }
 
+    if (-not $script:IsWindowsHost) {
+        try { [void](Clear-WsClipboardText -Expected $script:ClipboardUrl) } catch { }
+        return
+    }
+
     try {
         $getClipboard = Get-Command 'Get-Clipboard' -ErrorAction SilentlyContinue
         $setClipboard = Get-Command 'Set-Clipboard' -ErrorAction SilentlyContinue
@@ -1652,7 +1734,7 @@ function Write-SessionMetadata {
         [long]$WatchdogStartTicks = 0
     )
 
-    $powershellExe = Join-Path $PSHOME 'powershell.exe'
+    $powershellExe = Get-WatchdogHostPath
     $launcherProcess = Get-Process -Id $PID
 
     $metadata = [ordered]@{
@@ -1666,7 +1748,7 @@ function Write-SessionMetadata {
         jobName = $script:JobName
 
         launcherPid = $PID
-        launcherStartTicks = $launcherProcess.StartTime.ToUniversalTime().Ticks
+        launcherStartTicks = (Get-WorkspaceProcessStartTicks -Process $launcherProcess)
         launcherPath = $launcherProcess.Path
 
         miniservePid = if ($script:MiniserveProcess) { $script:MiniserveProcess.Id } else { 0 }
@@ -1725,13 +1807,13 @@ function Start-Watchdog {
     Require-File -FilePath $WatchdogScriptPath -FriendlyName 'Watchdog-Skript' -Code 10
 
     $parent = Get-Process -Id $PID
-    $parentStartTicks = $parent.StartTime.ToUniversalTime().Ticks
+    $parentStartTicks = Get-WorkspaceProcessStartTicks -Process $parent
     $miniserveStartTicks = Get-ProcessStartTicksSafe $script:MiniserveProcess
     $cloudflaredStartTicks = Get-ProcessStartTicksSafe $script:CloudflaredProcess
 
-    $arguments = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
+    $arguments = @('-NoProfile')
+    if ($script:IsWindowsHost) { $arguments += @('-ExecutionPolicy', 'Bypass') } else { $arguments += '-NonInteractive' }
+    $arguments += @(
         '-File', $WatchdogScriptPath,
         '-ParentPid', [string]$PID,
         '-ParentStartTicks', [string]$parentStartTicks,
@@ -1756,7 +1838,15 @@ function Start-Watchdog {
         $arguments += '-KeepArchive'
     }
 
-    $powershellExe = Join-Path $PSHOME 'powershell.exe'
+    $powershellExe = Get-WatchdogHostPath
+    if (-not $script:IsWindowsHost) {
+        # Own session (setsid): a Ctrl+C or terminal hangup aimed at the launcher must not reach the watchdog.
+        $setsidCommand = Get-Command 'setsid' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($setsidCommand) {
+            $arguments = @($powershellExe) + @($arguments)
+            $powershellExe = $setsidCommand.Source
+        }
+    }
     return Start-NativeProcess `
         -FilePath $powershellExe `
         -Arguments $arguments `
@@ -1775,7 +1865,7 @@ function Start-ValidatedWatchdog {
         do { $watchdog.Refresh();if($watchdog.HasExited){Stop-WithError -Code 50 -Message 'Der Watchdog wurde beendet, bevor er bereit war.'};if(Test-Path -LiteralPath $readyMarker -PathType Leaf){return [pscustomobject]@{Process=$watchdog;ReadyMarker=$readyMarker}};Start-Sleep -Milliseconds 100 } while($timer.Elapsed.TotalSeconds -lt 5)
         Stop-WithError -Code 50 -Message 'Der Watchdog hat seinen Bereitschaftsmarker nicht veröffentlicht.'
     } catch {
-        $stopped=Stop-ProcessConfirmed -Process $watchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000
+        $stopped=Stop-ProcessConfirmed -Process $watchdog -ExpectedPath (Get-WatchdogHostPath) -Attempts 20 -WaitMilliseconds 1000
         if(-not $stopped){$script:ExitCode=50;throw [Exception]::new('Ein unbereiter Watchdog konnte nicht bestätigt beendet werden; die Sitzung bleibt erhalten.',$_.Exception)}
         throw
     }
@@ -1876,7 +1966,10 @@ try {
         Write-Warning '-HealthFailureThreshold is retained for compatibility; version 3.1 uses bounded time-based outage budgets.'
     }
 
-    if($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5){Stop-WithError -Code 10 -Message 'WorkspaceShare benötigt Windows PowerShell 5.1 (powershell.exe), nicht pwsh.exe.'}
+    if($script:IsWindowsHost){
+        if($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5){Stop-WithError -Code 10 -Message 'WorkspaceShare benötigt Windows PowerShell 5.1 (powershell.exe), nicht pwsh.exe.'}
+    }
+    elseif($PSVersionTable.PSVersion.Major -lt 7){Stop-WithError -Code 10 -Message 'WorkspaceShare benötigt unter Linux PowerShell 7 (pwsh).'}
 
     foreach ($module in @(
         @{ Path = $HealthModulePath; Name = 'Health-Modul' },
@@ -1921,9 +2014,9 @@ try {
     Assert-DependencyLock
 
     foreach ($required in @(
-        @{ Path = $SevenZipPath; Name = '7za.exe'; Code = 10 },
-        @{ Path = $MiniservePath; Name = 'miniserve.exe'; Code = 10 },
-        @{ Path = $CloudflaredPath; Name = 'cloudflared.exe'; Code = 10 },
+        @{ Path = $SevenZipPath; Name = [IO.Path]::GetFileName($SevenZipPath); Code = 10 },
+        @{ Path = $MiniservePath; Name = [IO.Path]::GetFileName($MiniservePath); Code = 10 },
+        @{ Path = $CloudflaredPath; Name = [IO.Path]::GetFileName($CloudflaredPath); Code = 10 },
         @{ Path = $MandatoryExcludesPath; Name = 'mandatory-excludes.txt'; Code = 10 },
         @{ Path = $GeneratedExcludesPath; Name = 'generated-excludes.txt'; Code = 10 }
     )) {
@@ -1932,12 +2025,12 @@ try {
 
     if (-not $script:CurlPath) {
         Stop-WithError -Code 10 -Message (
-            "curl.exe wurde nicht gefunden. Moderne Windows-10/11-Versionen enthalten curl.exe."
+            "curl wurde nicht gefunden. Moderne Windows-10/11-Versionen enthalten curl.exe; unter Linux wird das Paket curl benötigt."
         )
     }
 
     if (-not $UnsafeSkipSecretScan) {
-        Require-File -FilePath $GitleaksPath -FriendlyName 'gitleaks.exe' -Code 10
+        Require-File -FilePath $GitleaksPath -FriendlyName ([IO.Path]::GetFileName($GitleaksPath)) -Code 10
         Require-File -FilePath $GitleaksConfigPath -FriendlyName 'Gitleaks-Konfiguration' -Code 10
     }
 
@@ -1958,7 +2051,7 @@ try {
     Remove-StaleSessions
     Remove-OldDiagnostics
 
-    $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\')
+    $resolvedRoot = (Resolve-Path -LiteralPath $Path).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
     $sourceRootItem = Get-Item -LiteralPath $resolvedRoot -Force -ErrorAction Stop
     if (($sourceRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Stop-WithError -Code 10 -Message 'Die Quellwurzel ist ein Symlink, Junction oder anderer Reparse-Point. Bitte das echte Projektverzeichnis wählen.'
@@ -2281,7 +2374,7 @@ try {
         }
         $stopped = Stop-ProcessConfirmed -Process $script:CloudflaredProcess -ExpectedPath $CloudflaredPath -Attempts 5 -WaitMilliseconds 1000
         if (-not $stopped) { Stop-WithError -Code 41 -Message 'Ein fehlgeschlagener cloudflared-Versuch konnte nicht bestätigt beendet werden.' }
-        $watchdogStopped = Stop-ProcessConfirmed -Process $attemptWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 10 -WaitMilliseconds 1000
+        $watchdogStopped = Stop-ProcessConfirmed -Process $attemptWatchdog -ExpectedPath (Get-WatchdogHostPath) -Attempts 10 -WaitMilliseconds 1000
         if (-not $watchdogStopped) { Stop-WithError -Code 41 -Message 'Der Watchdog eines fehlgeschlagenen cloudflared-Versuchs konnte nicht bestätigt beendet werden. Ein weiterer Versuch wäre unsicher.' }
         $script:WatchdogProcess = $null
         $script:CloudflaredProcess = $null
@@ -2389,7 +2482,7 @@ try {
         -WatchdogPid $newWatchdog.Id `
         -WatchdogStartTicks (Get-ProcessStartTicksSafe $newWatchdog)
     if ($oldWatchdog) {
-        $oldWatchdogStopped = Stop-ProcessConfirmed -Process $oldWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 10 -WaitMilliseconds 1000
+        $oldWatchdogStopped = Stop-ProcessConfirmed -Process $oldWatchdog -ExpectedPath (Get-WatchdogHostPath) -Attempts 10 -WaitMilliseconds 1000
         if (-not $oldWatchdogStopped) {
             Stop-WithError -Code 50 -Message 'Der temporäre Setup-Watchdog konnte nicht beendet werden.'
         }
@@ -2551,9 +2644,9 @@ finally {
             try { New-Item -ItemType File -Path $script:NormalExitMarker -Force | Out-Null } catch {}
         }
         $allWatchdogsStopped=$true
-        if(-not(Stop-ProcessConfirmed -Process $script:WatchdogProcess -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
+        if(-not(Stop-ProcessConfirmed -Process $script:WatchdogProcess -ExpectedPath (Get-WatchdogHostPath) -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
         foreach ($retiredWatchdog in $script:RetiredWatchdogProcesses) {
-            if(-not(Stop-ProcessConfirmed -Process $retiredWatchdog -ExpectedPath (Join-Path $PSHOME 'powershell.exe') -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
+            if(-not(Stop-ProcessConfirmed -Process $retiredWatchdog -ExpectedPath (Get-WatchdogHostPath) -Attempts 20 -WaitMilliseconds 1000)){$allWatchdogsStopped=$false}
         }
     }
     $cleanupComplete=($childrenStopped -and $allWatchdogsStopped)
