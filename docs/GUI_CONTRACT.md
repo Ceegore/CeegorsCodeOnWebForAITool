@@ -98,13 +98,36 @@ ConvertTo-WsJson -Object <object> -> compact JSON, non-ASCII escaped as \uXXXX (
 
 ## 5. Backend `Start-WorkspaceShareGui.ps1` – HTTP API
 
-Parameters: `[-Port 0] [-NoBrowser] [-InstanceFile <path>] [-TestMode] [-TestShareScript <path>]`.
-`-TestShareScript` requires `-TestMode` and replaces `Share-Workspace.ps1` (a fake share for
-tests). The instance file (default `<DataRoot>\gui-instance.json`) holds
-`{"pid":..,"startTicks":..,"port":..,"token":".."}`, is written after binding and deleted on
-exit. Single instance via named mutex `Local\WorkspaceShare.Gui` (test mode: that name plus a
-hash of the instance-file path). A second start while an instance is alive only opens the
-browser at the existing URL and exits 0.
+Parameters: `[-Port 0] [-NoBrowser] [-InstanceFile <path>] [-TestMode] [-TestShareScript <path>] [-TestBuildId <id>]`.
+`-TestShareScript` and `-TestBuildId` require `-TestMode`; the first replaces `Share-Workspace.ps1`
+(a fake share for tests), the second overrides the build id (`[A-Za-z0-9_-]{1,64}`). The instance
+file (default `<DataRoot>\gui-instance.json`) holds
+`{"pid":..,"startTicks":..,"port":..,"token":"..","build":".."}`, is written after binding and
+deleted on exit. Single instance via named mutex `Local\WorkspaceShare.Gui` (test mode: that name
+plus a hash of the instance-file path).
+
+**Build id, static cache, update takeover.**
+
+- `build` = first 16 lowercase hex chars of SHA-256 over the bytes of `VERSION`,
+  `Start-WorkspaceShareGui.ps1`, `scripts/WorkspaceShare.Gui.Http.psm1`,
+  `scripts/WorkspaceShare.Platform.psm1`, `gui/index.html`, `gui/app.js`, `gui/app.css`,
+  `gui/favicon.svg` (in that order, concatenated; a missing file contributes its name only). It is
+  written to the instance file and returned as `"build"` in `/api/state`.
+- The static files are loaded **once at backend start** (via `Get-WsStaticFile`, one call per
+  allowed path) and served from memory, so UI and API always belong to the same version. A file
+  missing at start gives 404 for its route, as before. Changing the files on disk later has no
+  effect until the backend is restarted.
+- A second start that finds a live instance compares builds. **Same build:** open the existing
+  URL, exit 0. **Different or missing `build`** (older version): read its `/api/state` (raw
+  loopback request with its token, 5 s timeout). Phase `idle`/`ended`/`error`: `POST /api/quit`,
+  wait up to 20 s until that PID is gone and the mutex is free, then start normally as the new
+  instance (browser at the new URL unless `-NoBrowser`). Phase `starting`/`active`/`stopping`:
+  the share is never interrupted; the browser opens at the old instance, the console prints "Eine
+  laufende Freigabe nutzt noch die vorherige Version. ..." and the process exits 0. No answer
+  within 5 s (PID alive): nothing is killed; the old URL is opened and the process exits 0.
+- `app.js` shows a "service outdated" message (and disables the drop zone) when an `/api/drop/*`
+  call returns 404 or `/api/state` has no `limits`; if `build` changes between polls it stops
+  polling and asks to close the window and reopen it via the shortcut.
 
 Static (Host check applies, no token): `GET /`, `/index.html`, `/app.js`, `/app.css`, `/favicon.svg`.
 The browser URL is `http://127.0.0.1:<port>/#<token>`. `app.js` reads the token from
@@ -130,6 +153,7 @@ State object:
 ```json
 {
   "v": 1,
+  "build": "0123456789abcdef",
   "phase": "idle",
   "platform": "windows",
   "capabilities": {"folderPicker": true, "clipboard": true, "openBrowser": true},

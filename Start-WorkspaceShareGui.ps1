@@ -10,7 +10,8 @@ param(
     [string]$TestShareScript,
     [int64]$MaxDropBytes = 4GB,
     [int]$MaxDropFiles = 10000,
-    [string]$DataRootOverride
+    [string]$DataRootOverride,
+    [string]$TestBuildId
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,14 @@ if (-not [string]::IsNullOrEmpty($TestShareScript) -and -not $TestMode) {
 }
 if (-not [string]::IsNullOrEmpty($DataRootOverride) -and -not $TestMode) {
     [Console]::Error.WriteLine('-DataRootOverride ist nur zusammen mit -TestMode erlaubt.')
+    exit 10
+}
+if (-not [string]::IsNullOrEmpty($TestBuildId) -and -not $TestMode) {
+    [Console]::Error.WriteLine('-TestBuildId ist nur zusammen mit -TestMode erlaubt.')
+    exit 10
+}
+if (-not [string]::IsNullOrEmpty($TestBuildId) -and $TestBuildId -cnotmatch '^[A-Za-z0-9_-]{1,64}$') {
+    [Console]::Error.WriteLine('Ungültige -TestBuildId.')
     exit 10
 }
 if ($MaxDropBytes -lt 1 -or $MaxDropFiles -lt 1) {
@@ -115,6 +124,130 @@ function Open-ExistingInstance {
         [void](Open-WsBrowser -Url $url)
     }
     return $true
+}
+
+function Get-BuildIdentity {
+    # First 16 hex chars of SHA-256 over the files that make up this version (a missing file contributes
+    # its name only). Names use '/' so the id is the same on every OS. Tests may override it.
+    if ($TestMode -and -not [string]::IsNullOrEmpty($TestBuildId)) { return $TestBuildId }
+    $names = @('VERSION', 'Start-WorkspaceShareGui.ps1', 'scripts/WorkspaceShare.Gui.Http.psm1',
+        'scripts/WorkspaceShare.Platform.psm1', 'gui/index.html', 'gui/app.js', 'gui/app.css', 'gui/favicon.svg')
+    $ms = New-Object System.IO.MemoryStream
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($name in $names) {
+            $full = Join-Path $ToolRoot $name
+            [byte[]]$bytes = $null
+            if (Test-Path -LiteralPath $full -PathType Leaf) {
+                try { $bytes = [IO.File]::ReadAllBytes($full) } catch { $bytes = $null }
+            }
+            if ($null -eq $bytes) { $bytes = [Text.Encoding]::UTF8.GetBytes($name) }
+            $ms.Write($bytes, 0, $bytes.Length)
+        }
+        $hash = $sha.ComputeHash($ms.ToArray())
+    }
+    finally { $sha.Dispose(); $ms.Dispose() }
+    return ((($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16))
+}
+
+function Initialize-StaticCache {
+    # Static files are read once at start, so UI and API always come from the same version.
+    $script:Static = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    foreach ($p in @('/index.html', '/app.js', '/app.css', '/favicon.svg')) {
+        $f = Get-WsStaticFile -Path $p -GuiRoot $GuiRoot
+        if ($null -ne $f) { $script:Static[$p] = $f }
+    }
+    if ($script:Static.ContainsKey('/index.html')) { $script:Static['/'] = $script:Static['/index.html'] }
+}
+
+function Invoke-LocalApi {
+    # Minimal HTTP/1.1 request to a GUI backend on 127.0.0.1 over a raw TcpClient (no proxy, same on
+    # PS 5.1 and 7). Returns @{ Status; Body } or $null when it does not answer within TimeoutMs.
+    param([int]$Port, [string]$Token, [string]$Method, [string]$Path, [int]$TimeoutMs = 5000)
+    $client = $null
+    try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $null }
+        $client.EndConnect($ar)
+        $utf8 = New-Object System.Text.UTF8Encoding ($false)
+        $bodyBytes = New-Object byte[] 0
+        $head = 'Host: 127.0.0.1:{0}' -f $Port
+        $head += "`r`nX-WS-Token: " + $Token
+        if ($Method -ceq 'POST') {
+            $bodyBytes = $utf8.GetBytes('{}')
+            $head += "`r`nContent-Type: application/json`r`nContent-Length: " + $bodyBytes.Length
+        }
+        $head += "`r`nConnection: close`r`n`r`n"
+        $headBytes = $utf8.GetBytes($Method + ' ' + $Path + " HTTP/1.1`r`n" + $head)
+        $stream = $client.GetStream()
+        $stream.Write($headBytes, 0, $headBytes.Length)
+        if ($bodyBytes.Length -gt 0) { $stream.Write($bodyBytes, 0, $bodyBytes.Length) }
+        $stream.Flush()
+        $acc = New-Object System.IO.MemoryStream
+        $buf = New-Object byte[] 8192
+        while ($true) {
+            $left = $TimeoutMs - [int]$sw.ElapsedMilliseconds
+            if ($left -le 0) { return $null }
+            $stream.ReadTimeout = $left
+            $n = [int]$stream.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $acc.Write($buf, 0, $n)
+        }
+        $text = $utf8.GetString($acc.ToArray())
+        $split = $text.IndexOf("`r`n`r`n")
+        if ($split -lt 0 -or -not ($text -cmatch '^HTTP/1\.[01] (\d{3}) ')) { return $null }
+        return @{ Status = [int]$Matches[1]; Body = $text.Substring($split + 4) }
+    }
+    catch { return $null }
+    finally { if ($null -ne $client) { try { $client.Close() } catch { } } }
+}
+
+function Resolve-ExistingInstance {
+    # A live instance holds the mutex. Returns 'None' (nothing alive), 'Handled' (browser opened at the
+    # existing instance, caller exits 0) or 'Replaced' (older idle instance quit; this process now owns
+    # the mutex and starts normally).
+    param($Inst)
+    if ($null -eq $Inst) { return 'None' }
+    if (-not (Test-ProcessAlive $Inst.pid $Inst.startTicks)) { return 'None' }
+    $theirs = ''
+    $bp = $Inst.PSObject.Properties['build']
+    if ($null -ne $bp -and $null -ne $bp.Value) { $theirs = [string]$bp.Value }
+    if ($theirs -ceq $script:BuildId) {
+        [void](Open-ExistingInstance $Inst)
+        return 'Handled'
+    }
+    $phase = ''
+    $resp = Invoke-LocalApi -Port ([int]$Inst.port) -Token ([string]$Inst.token) -Method 'GET' -Path '/api/state' -TimeoutMs 5000
+    if ($null -ne $resp -and $resp.Status -eq 200) {
+        try { $phase = [string]((($resp.Body | ConvertFrom-Json)).phase) } catch { $phase = '' }
+    }
+    if ($phase -in @('idle', 'ended', 'error')) {
+        # Nothing is shared: replace the old backend with this (newer) one.
+        [void](Invoke-LocalApi -Port ([int]$Inst.port) -Token ([string]$Inst.token) -Method 'POST' -Path '/api/quit' -TimeoutMs 5000)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 20) {
+            if (-not (Test-ProcessAlive $Inst.pid $Inst.startTicks)) {
+                $script:ownsMutex = Enter-InstanceMutex $mutex 250
+                if ($script:ownsMutex) {
+                    Write-Host 'Die vorherige Version von WorkspaceShare wurde beendet. Die neue Version wird gestartet.'
+                    return 'Replaced'
+                }
+            }
+            else { Start-Sleep -Milliseconds 200 }
+        }
+        if (-not (Test-ProcessAlive $Inst.pid $Inst.startTicks)) { return 'None' }
+        Write-Host 'Die vorherige Version von WorkspaceShare lässt sich nicht beenden. Das vorhandene Fenster wird geöffnet.'
+    }
+    elseif ($phase -in @('starting', 'active', 'stopping')) {
+        Write-Host 'Eine laufende Freigabe nutzt noch die vorherige Version. Nach dem Beenden der Freigabe WorkspaceShare über die Verknüpfung neu starten.'
+    }
+    else {
+        Write-Host 'Der laufende WorkspaceShare-Dienst antwortet nicht. Das vorhandene Fenster wird geöffnet.'
+    }
+    [void](Open-ExistingInstance $Inst)
+    return 'Handled'
 }
 
 function New-GuiToken {
@@ -429,6 +562,7 @@ function Get-StateObject {
     foreach ($st in $s.steps) { $steps += , ([ordered]@{ n = $st.n; text = $st.text }) }
     return [ordered]@{
         v = 1
+        build = [string]$script:BuildId
         phase = $s.phase
         platform = $script:Platform
         capabilities = [ordered]@{
@@ -1053,10 +1187,10 @@ function Invoke-Route {
     if (-not $chk.Allowed) { Send-ErrorJson $Stream ([int]$chk.Status); return }
 
     if (-not $isApi) {
-        $file = $null
+        # Served from the cache filled at backend start (ordinal path match; no file access per request).
         if ($Req.Method -ceq 'GET') {
-            $file = Get-WsStaticFile -Path $Req.Path -GuiRoot $GuiRoot
-            if ($null -ne $file) {
+            if ($script:Static.ContainsKey($Req.Path)) {
+                $file = $script:Static[$Req.Path]
                 Write-WsHttpResponse -Stream $Stream -Status 200 -ContentType $file.ContentType -Body $file.Bytes
                 return
             }
@@ -1064,8 +1198,7 @@ function Invoke-Route {
             return
         }
         # Known static path with a wrong method -> 405, anything else -> 404.
-        $probe = Get-WsStaticFile -Path $Req.Path -GuiRoot $GuiRoot
-        if ($null -ne $probe) { Send-ErrorJson $Stream 405 } else { Send-ErrorJson $Stream 404 }
+        if ($script:Static.ContainsKey($Req.Path)) { Send-ErrorJson $Stream 405 } else { Send-ErrorJson $Stream 404 }
         return
     }
 
@@ -1166,14 +1299,18 @@ if ($TestMode) {
     $mutexName = $mutexName + '.' + $hex.Substring(0, 16)
 }
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+$script:BuildId = Get-BuildIdentity
+$script:Static = New-Object 'System.Collections.Generic.Dictionary[string,object]'
 $ownsMutex = Enter-InstanceMutex $mutex 0
 if (-not $ownsMutex) {
-    if (Open-ExistingInstance (Read-InstanceFile $InstanceFile)) { $mutex.Dispose(); exit 0 }
+    # A live instance of the same build -> only open it; an older idle one is replaced (Resolve-ExistingInstance).
+    $resolved = Resolve-ExistingInstance (Read-InstanceFile $InstanceFile)
+    if ($resolved -eq 'Handled') { $mutex.Dispose(); exit 0 }
     # Stale or still starting instance: wait up to 5 s.
     $waitSw = [Diagnostics.Stopwatch]::StartNew()
     while (-not $ownsMutex -and $waitSw.Elapsed.TotalSeconds -lt 5) {
         $ownsMutex = Enter-InstanceMutex $mutex 250
-        if (-not $ownsMutex -and (Open-ExistingInstance (Read-InstanceFile $InstanceFile))) { $mutex.Dispose(); exit 0 }
+        if (-not $ownsMutex -and (Resolve-ExistingInstance (Read-InstanceFile $InstanceFile)) -eq 'Handled') { $mutex.Dispose(); exit 0 }
     }
     if (-not $ownsMutex) {
         [Console]::Error.WriteLine('Eine andere WorkspaceShare-GUI blockiert den Start.')
@@ -1189,6 +1326,9 @@ $instanceWritten = $false
 $exitCode = 0
 try {
     $script:Token = New-GuiToken
+    # Identity and static files are fixed now (the mutex is ours): a later update on disk changes neither.
+    $script:BuildId = Get-BuildIdentity
+    Initialize-StaticCache
     # Single instance holds the mutex: every drop folder found now is left over from a crashed run.
     if ($StaleDropCleanup) { try { Clear-StaleDrops } catch { Write-ConsoleLog ('Alte Drop-Ordner: ' + $_.Exception.Message) } }
     $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList ([System.Net.IPAddress]::Loopback), $Port
@@ -1197,7 +1337,7 @@ try {
     $script:BoundPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
 
     $startTicks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
-    $instanceJson = ConvertTo-WsJson -Object ([ordered]@{ pid = $PID; startTicks = $startTicks; port = $script:BoundPort; token = $script:Token })
+    $instanceJson = ConvertTo-WsJson -Object ([ordered]@{ pid = $PID; startTicks = $startTicks; port = $script:BoundPort; token = $script:Token; build = $script:BuildId })
     $instanceDir = Split-Path -Parent $InstanceFile
     if (-not (Test-Path -LiteralPath $instanceDir -PathType Container)) { [void](New-Item -ItemType Directory -Path $instanceDir -Force) }
     $tmpFile = $InstanceFile + '.tmp'

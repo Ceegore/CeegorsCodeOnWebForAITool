@@ -10,6 +10,9 @@
   var MSG_LOST = 'Verbindung zum WorkspaceShare-Dienst verloren. Fenster schließen und über die Verknüpfung neu starten.';
   var MSG_UNAUTH = 'Die Sitzung ist ungültig (Token abgelehnt). Fenster schließen und über die Verknüpfung neu starten.';
 
+  var MSG_OUTDATED = 'Der WorkspaceShare-Dienst ist veraltet. Bitte unten auf „Beenden“ klicken und WorkspaceShare über die Verknüpfung neu starten.';
+  var MSG_UPDATED = 'WorkspaceShare wurde aktualisiert. Bitte das Fenster schließen und über die Verknüpfung neu öffnen.';
+
   // Mirrors the exit-code table in README.md.
   var EXIT_TEXTS = {
     10: 'Umgebung oder Parameter ungültig.',
@@ -361,6 +364,7 @@
   var fails = 0;
   var lastState = null;
   var lastAnnounce = '';
+  var knownBuild = null;        // build id of the backend seen on the first poll
 
   function stopPolling() {
     stopped = true;
@@ -388,8 +392,19 @@
       if (r.status !== 200 || !r.data || typeof r.data.phase !== 'string') {
         throw new Error('bad state');
       }
+      // Backend replaced while this page is open: the token in the URL is gone, so reloading cannot help.
+      if (typeof r.data.build === 'string') {
+        if (knownBuild === null) { knownBuild = r.data.build; }
+        else if (knownBuild !== r.data.build) {
+          stopPolling();
+          showFatal(MSG_UPDATED, false);
+          return;
+        }
+      }
       fails = 0;
       lastState = r.data;
+      // An older backend answers the state without drop limits (and has no /api/drop/*).
+      if (!r.data.limits || typeof r.data.limits !== 'object') { markOutdated(); }
       render(r.data, epoch !== dropEpoch);
     }).catch(function () {
       if (stopped) { return; }
@@ -720,6 +735,7 @@
   var removing = false;         // discard of the active drop is running
   var dropInfo = null;          // finished drop: { id, path, files, totalBytes } or null
   var dropEpoch = 0;            // bumped on every local drop change; makes in-flight polls stale
+  var serviceOutdated = false;  // backend without /api/drop/* (404) or without state.limits
 
   function num(v) { return typeof v === 'number' && isFinite(v) && v >= 0 ? v : 0; }
   function posNum(v) { return typeof v === 'number' && isFinite(v) && v > 0 ? v : 0; }
@@ -754,12 +770,22 @@
 
   function updateBusy() {
     var busy = uploading || collecting;
-    els.btnFiles.disabled = busy;
+    els.btnFiles.disabled = busy || serviceOutdated;
     els.btnPick.disabled = busy;
     els.folder.disabled = uploading;
     els.btnDropRemove.disabled = uploading || removing;
-    els.dropzone.classList.toggle('dz-disabled', busy);
-    if (busy) { els.dropzone.classList.remove('dz-over'); }
+    els.dropzone.classList.toggle('dz-disabled', busy || serviceOutdated);
+    if (serviceOutdated) { els.dropzone.setAttribute('aria-disabled', 'true'); }
+    if (busy || serviceOutdated) { els.dropzone.classList.remove('dz-over'); }
+  }
+
+  // The running backend is older than this page (no drop endpoints): drag & drop cannot work.
+  function markOutdated() {
+    if (serviceOutdated) { return; }
+    serviceOutdated = true;
+    updateBusy();
+    showDropError(MSG_OUTDATED);
+    announce(MSG_OUTDATED);
   }
 
   function setUploading(on) {
@@ -771,13 +797,14 @@
   }
 
   function showDropError(text) {
+    if (!text && serviceOutdated) { text = MSG_OUTDATED; }
     setText(els.dropError, text);
     setHidden(els.dropError, !text);
   }
 
   function showDropStatus(text) { setText(els.dropStatus, text); }
 
-  function canAccept() { return !uploading && !collecting && currentView === 'form'; }
+  function canAccept() { return !uploading && !collecting && !serviceOutdated && currentView === 'form'; }
 
   function fail(msg) { return { userMessage: msg }; }
 
@@ -927,6 +954,8 @@
 
   // ---- upload
   function httpErrorText(r) {
+    // /api/drop/* answers 404 only on a backend that predates the drop endpoints.
+    if (r && r.status === 404) { markOutdated(); return MSG_OUTDATED; }
     if (r && r.data && typeof r.data.error === 'string' && r.data.error) { return r.data.error; }
     switch (r && r.status) {
       case 400: return 'Ungültiger Dateiname oder ungültige Anfrage.';
@@ -1003,6 +1032,7 @@
       showProgress(i, count, it.path, done, total);
       return uploadFile(dropId, it).then(function (r) {
         if (r.status === 401 || r.status === 403) { throw { unauthorized: true }; }
+        if (r.status === 404) { throw fail(httpErrorText(r)); }
         if (r.status !== 200) { throw fail(httpErrorText(r) + ' (Datei: ' + it.path + ')'); }
         done += it.file.size;
         return next(i + 1);

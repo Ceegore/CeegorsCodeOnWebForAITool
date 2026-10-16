@@ -122,7 +122,10 @@ function Get-FakePid {
 
 function Start-TestBackend {
     # Every test backend gets its own -DataRootOverride below $tmp, so tests never touch the real data folder.
-    param([string]$Scenario, [string]$Name, [string]$InstanceFile, [string]$DataRoot, [string]$ExtraArgs = '')
+    # -NoWait returns right after the process started (for a start that takes over from a running instance);
+    # -Script starts a copy of the repo instead of $startScript.
+    param([string]$Scenario, [string]$Name, [string]$InstanceFile, [string]$DataRoot, [string]$ExtraArgs = '', [switch]$NoWait, [string]$StartScriptPath)
+    if (-not $StartScriptPath) { $StartScriptPath = $startScript }
     if (-not $InstanceFile) { $InstanceFile = Join-Path $tmp "gui-$Name.json" }
     if (-not $DataRoot) { $DataRoot = Join-Path $tmp "data-$Name" }
     $pidFile = Join-Path $tmp "fake-$Name.pid"
@@ -130,7 +133,7 @@ function Start-TestBackend {
     $errFile = Join-Path $tmp "backend-$Name.err"
     $env:WS_FAKE_SCENARIO = $Scenario
     $env:WS_FAKE_PIDFILE = $pidFile
-    $argText = '-NoLogo -NoProfile -STA -File "{0}" -TestMode -NoBrowser -InstanceFile "{1}" -TestShareScript "{2}" -DataRootOverride "{3}" {4}' -f $startScript, $InstanceFile, $fakeScript, $DataRoot, $ExtraArgs
+    $argText = '-NoLogo -NoProfile -STA -File "{0}" -TestMode -NoBrowser -InstanceFile "{1}" -TestShareScript "{2}" -DataRootOverride "{3}" {4}' -f $StartScriptPath, $InstanceFile, $fakeScript, $DataRoot, $ExtraArgs
     $p = Start-Process -FilePath $psExe -ArgumentList $argText -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $null = $p.Handle
     $b = [pscustomobject]@{
@@ -138,6 +141,7 @@ function Start-TestBackend {
         DataRoot = $DataRoot; Port = 0; Token = ''
     }
     $script:Backends.Add($b)
+    if ($NoWait) { return $b }
     $ok = Wait-Until -TimeoutSec 20 -Condition {
         if ($p.HasExited) { return $true }
         if (-not (Test-Path -LiteralPath $InstanceFile)) { return $false }
@@ -234,6 +238,32 @@ function Get-FileCount {
     param([string]$Dir)
     if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
     return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+}
+
+function Get-ExpectedBuild {
+    # Independent implementation of the build id (GUI_CONTRACT section 5) for a repo root.
+    param([string]$Root)
+    $names = @('VERSION', 'Start-WorkspaceShareGui.ps1', 'scripts/WorkspaceShare.Gui.Http.psm1',
+        'scripts/WorkspaceShare.Platform.psm1', 'gui/index.html', 'gui/app.js', 'gui/app.css', 'gui/favicon.svg')
+    $all = New-Object System.Collections.Generic.List[byte]
+    foreach ($n in $names) {
+        $full = Join-Path $Root $n
+        if (Test-Path -LiteralPath $full -PathType Leaf) { $all.AddRange([byte[]][IO.File]::ReadAllBytes($full)) }
+        else { $all.AddRange([byte[]][Text.Encoding]::UTF8.GetBytes($n)) }
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($all.ToArray()) } finally { $sha.Dispose() }
+    return ((($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16))
+}
+
+function Get-StaticFile {
+    # GET a static path without token; saves the body bytes to $OutFile and returns the HTTP status.
+    param($B, [string]$Path, [string]$OutFile)
+    if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
+    $codeText = (& $curl -s --noproxy '*' --max-time 10 -o $OutFile -w '%{http_code}' ('http://127.0.0.1:{0}{1}' -f $B.Port, $Path)) -join ''
+    $status = 0
+    [void][int]::TryParse($codeText.Trim(), [ref]$status)
+    return $status
 }
 
 function New-StartBody {
@@ -712,6 +742,95 @@ try {
     Assert-True ($r.Status -eq 200 -and $r.Json.files -eq 2 -and $r.Json.totalBytes -eq (409600 + 1) -and (Get-FileCount $dropsF) -eq 2) 'F: finish reports exactly the accepted files'
     Test-GuiQuit $F 'F (finished drop present)'
     Assert-True ((Get-FileCount $dropsF) -eq 0) 'F: quit removed the finished, unused drop'
+
+    # ================= build id and static cache (backend G runs from a copy of the repo)
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestBuildId abc -NoBrowser' -f $startScript) -PassThru -WindowStyle Hidden -Wait
+    Assert-True ($p.ExitCode -eq 10) '-TestBuildId without -TestMode exits with 10'
+    $copyRoot = Join-Path $tmp 'repo-copy'
+    [void](New-Item -ItemType Directory -Path (Join-Path $copyRoot 'scripts') -Force)
+    [void](New-Item -ItemType Directory -Path (Join-Path $copyRoot 'gui') -Force)
+    foreach ($f in @('VERSION', 'Start-WorkspaceShareGui.ps1')) { Copy-Item -LiteralPath (Join-Path $ToolRoot $f) -Destination $copyRoot }
+    Copy-Item -Path (Join-Path $ToolRoot 'scripts\*.psm1') -Destination (Join-Path $copyRoot 'scripts')
+    Copy-Item -Path (Join-Path $ToolRoot 'gui\*') -Destination (Join-Path $copyRoot 'gui')
+    Remove-Item -LiteralPath (Join-Path $copyRoot 'gui\favicon.svg') -Force   # a missing file contributes its name only
+    $copyApp = Join-Path $copyRoot 'gui\app.js'
+    $copyCss = Join-Path $copyRoot 'gui\app.css'
+    $appShaAtStart = Get-FileSha $copyApp
+    $expectedBuild = Get-ExpectedBuild $copyRoot
+    $G = Start-TestBackend -Scenario 'success' -Name 'G' -StartScriptPath (Join-Path $copyRoot 'Start-WorkspaceShareGui.ps1')
+    if ($G.Port -le 0) { throw 'Backend G did not start.' }
+    $instG = [IO.File]::ReadAllText($G.Instance) | ConvertFrom-Json
+    $sG = Get-State $G
+    Assert-True ($expectedBuild -match '^[0-9a-f]{16}$' -and [string]$instG.build -ceq $expectedBuild) 'G: instance file build = first 16 hex of SHA-256 over the version files'
+    Assert-True ($sG.build -ceq $expectedBuild) 'G: /api/state carries the same build'
+    $dl = Join-Path $tmp 'dl-app.js'
+    $code = Get-StaticFile $G '/app.js' $dl
+    Assert-True ($code -eq 200 -and (Get-FileSha $dl) -eq $appShaAtStart) 'G: GET /app.js returns exactly the bytes of the file at start'
+    Assert-True ((Get-StaticFile $G '/favicon.svg' (Join-Path $tmp 'dl-fav.svg')) -eq 404) 'G: a file missing at start -> 404'
+    # Update on disk after the start: the running backend keeps serving the version it started with.
+    [IO.File]::AppendAllText($copyApp, "`n// changed after start`n", $utf8)
+    Remove-Item -LiteralPath $copyCss -Force
+    $code = Get-StaticFile $G '/app.js' $dl
+    Assert-True ($code -eq 200 -and (Get-FileSha $dl) -eq $appShaAtStart -and (Get-FileSha $dl) -ne (Get-FileSha $copyApp)) 'G: /app.js stays the cached start version after the file changed on disk'
+    Assert-True ((Get-StaticFile $G '/app.css' (Join-Path $tmp 'dl-app.css')) -eq 200) 'G: /app.css is still served after the file was deleted from disk'
+    Assert-True ((Get-StaticFile $G '/' (Join-Path $tmp 'dl-index.html')) -eq 200) 'G: GET / is served from the cache'
+    Test-GuiQuit $G 'G'
+
+    # ================= update takeover (GUI_CONTRACT section 5): -TestBuildId simulates two versions
+    # (a) older backend idle -> the newer start quits it and takes over
+    $instTk = Join-Path $tmp 'gui-takeover.json'
+    $dataTk = Join-Path $tmp 'data-takeover'
+    $TA = Start-TestBackend -Scenario 'success' -Name 'TA' -InstanceFile $instTk -DataRoot $dataTk -ExtraArgs '-TestBuildId aaaa'
+    if ($TA.Port -le 0) { throw 'Backend TA did not start.' }
+    $instTA = [IO.File]::ReadAllText($instTk) | ConvertFrom-Json
+    Assert-True ([string]$instTA.build -ceq 'aaaa' -and (Get-State $TA).build -ceq 'aaaa' -and (Get-State $TA).phase -eq 'idle') 'takeover: backend A (build aaaa) is idle and reports its build'
+    $TB = Start-TestBackend -Scenario 'success' -Name 'TB' -InstanceFile $instTk -DataRoot $dataTk -ExtraArgs '-TestBuildId bbbb' -NoWait
+    $aGone = $TA.Proc.WaitForExit(20000)
+    Assert-True $aGone 'takeover: idle backend A exits within 20 s after the start of build bbbb'
+    $took = Wait-Until -TimeoutSec 25 -Condition {
+        if ($TB.Proc.HasExited) { return $true }
+        if (-not (Test-Path -LiteralPath $instTk)) { return $false }
+        $o = ([IO.File]::ReadAllText($instTk)) | ConvertFrom-Json
+        return ([int]$o.pid -eq $TB.Proc.Id -and $o.token)
+    }
+    $instTB = $null
+    if ($took -and -not $TB.Proc.HasExited) {
+        $instTB = [IO.File]::ReadAllText($instTk) | ConvertFrom-Json
+        $TB.Port = [int]$instTB.port
+        $TB.Token = [string]$instTB.token
+    }
+    Assert-True ($null -ne $instTB -and [int]$instTB.pid -eq $TB.Proc.Id -and [string]$instTB.build -ceq 'bbbb') 'takeover: instance file now holds backend B (pid, build bbbb)'
+    if ($null -ne $instTB) {
+        $sTB = Get-State $TB
+        Assert-True ($null -ne $sTB -and $sTB.build -ceq 'bbbb' -and $sTB.phase -eq 'idle') 'takeover: B serves /api/state with build bbbb'
+        Test-GuiQuit $TB 'takeover B'
+    }
+
+    # (b) + (c) running share keeps its backend; same build only reopens
+    $instBz = Join-Path $tmp 'gui-busy.json'
+    $dataBz = Join-Path $tmp 'data-busy'
+    $BA = Start-TestBackend -Scenario 'success' -Name 'BA' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId aaaa'
+    if ($BA.Port -le 0) { throw 'Backend BA did not start.' }
+    $r = Invoke-Post $BA '/api/start' (New-StartBody $shareDir 5)
+    $s = Wait-ForState $BA { param($x) $x.phase -eq 'active' }
+    Assert-True ($r.Status -eq 200 -and $null -ne $s) 'busy: backend A (build aaaa) has an active share'
+    $beforeBz = [IO.File]::ReadAllText($instBz)
+    $BC = Start-TestBackend -Scenario 'success' -Name 'BC' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId aaaa' -NoWait
+    $cExit = $BC.Proc.WaitForExit(10000)
+    Assert-True ($cExit -and $BC.Proc.ExitCode -eq 0) 'same build: second start exits 0 within 10 s'
+    if (-not $cExit) { try { $BC.Proc.Kill() } catch { } }
+    Assert-True (([IO.File]::ReadAllText($instBz)) -ceq $beforeBz -and -not $BA.Proc.HasExited -and (Get-State $BA).phase -eq 'active') 'same build: instance file unchanged, A keeps running its share'
+    $BB = Start-TestBackend -Scenario 'success' -Name 'BB' -InstanceFile $instBz -DataRoot $dataBz -ExtraArgs '-TestBuildId bbbb' -NoWait
+    $bExit = $BB.Proc.WaitForExit(15000)
+    Assert-True ($bExit -and $BB.Proc.ExitCode -eq 0) 'busy: newer start while a share is active exits 0 within 15 s'
+    if (-not $bExit) { try { $BB.Proc.Kill() } catch { } }
+    $bbOut = ''
+    if (Test-Path -LiteralPath $BB.Out) { $bbOut = [IO.File]::ReadAllText($BB.Out) }
+    Assert-True ($bbOut -like '*nutzt noch die vorherige Version*') 'busy: console tells that the running share still uses the previous version'
+    $sBz = Get-State $BA
+    Assert-True (-not $BA.Proc.HasExited -and $null -ne $sBz -and $sBz.phase -eq 'active' -and $sBz.build -ceq 'aaaa') 'busy: backend A is still alive and its share still active'
+    Assert-True (([IO.File]::ReadAllText($instBz)) -ceq $beforeBz) 'busy: instance file unchanged'
+    Test-GuiQuit $BA 'busy A'
 }
 catch {
     $script:Fail++
