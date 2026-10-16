@@ -1,4 +1,5 @@
-# 7-Zip-Wildcardmuster; eine Regel pro Zeile.
+# PowerShell-Wildcardmuster (-like); eine Regel pro Zeile.
+# Ein Muster trifft den relativen Pfad, den Dateinamen oder einen beliebigen Pfadbestandteil.
 # Keine gitignore-Syntax, keine Negation, kein automatisches Re-Include.
 
 .git
@@ -13,3 +14,23 @@
 .workspace-share\*
 WorkspaceShare\sessions
 WorkspaceShare\sessions\*
+*\WorkspaceShare\sessions\*
+
+# Zugangsdaten-Dateien und -Ordner, die still ausgelassen werden.
+.ssh
+.gnupg
+.aws
+.azure
+.kube
+.docker
+.npmrc
+.yarnrc.yml
+.pypirc
+.netrc
+_netrc
+.git-credentials
+.pgpass
+.htpasswd
+*.tfstate
+*.tfstate.*
+*.tfvars

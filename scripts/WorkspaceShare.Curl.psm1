@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function Protect-DiagnosticText {
     param([AllowNull()][string]$Text,[string[]]$KnownSecretUrls=@(),[string[]]$SecretTokens=@())
@@ -29,7 +29,7 @@ function Invoke-CurlWithPrivateUrl {
         finally{try{WorkspaceShare.Job\Stop-WorkspaceJob -Job $ephemeralJob}catch{};try{WorkspaceShare.Job\Close-WorkspaceJob -Job $ephemeralJob}catch{}}
     }
     $base=[IO.Path]::GetTempPath();$id=[Guid]::NewGuid().ToString('N');$stdout=Join-Path $base ('workspace-curl-'+$id+'.stdout');$stderr=Join-Path $base ('workspace-curl-'+$id+'.stderr');$process=$null
-    try{$environment=New-WorkspaceChildEnvironment;$process=Start-WorkspaceProcessInJob -Job $Job -FilePath $CurlPath -Arguments (@('--disable')+@($Arguments)+@('--config','-')) -WorkingDirectory $base -StdOutPath $stdout -StdErrPath $stderr -StandardInputText $privateInput -Environment $environment;$nativeProcessHandle=$process.Handle;if(-not$process.WaitForExit($ProcessTimeoutSeconds*1000)){try{Stop-WorkspaceJob -Job $Job}catch{};throw 'curl.exe exceeded its process timeout; the session Job was terminated.'};$exitCode=[WorkspaceShare.NativeJob]::GetExitCode($nativeProcessHandle);return [pscustomobject]@{ExitCode=$exitCode;StdOut=if(Test-Path $stdout){[IO.File]::ReadAllText($stdout)}else{''};StdErr=if(Test-Path $stderr){[IO.File]::ReadAllText($stderr)}else{''}}}
+    try{$environment=New-WorkspaceChildEnvironment;$process=Start-WorkspaceProcessInJob -Job $Job -FilePath $CurlPath -Arguments (@('--disable')+@($Arguments)+@('--config','-')) -WorkingDirectory $base -StdOutPath $stdout -StdErrPath $stderr -StandardInputText $privateInput -Environment $environment;$nativeProcessHandle=$process.Handle;if(-not$process.WaitForExit($ProcessTimeoutSeconds*1000)){try{$process.Kill()}catch{};throw 'curl.exe exceeded its process timeout and was terminated.'};$exitCode=[WorkspaceShare.NativeJob]::GetExitCode($nativeProcessHandle);return [pscustomobject]@{ExitCode=$exitCode;StdOut=if(Test-Path -LiteralPath $stdout){[IO.File]::ReadAllText($stdout)}else{''};StdErr=if(Test-Path -LiteralPath $stderr){[IO.File]::ReadAllText($stderr)}else{''}}}
     finally{try{if($process){$process.Dispose()}}catch{};Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue}
 }
 

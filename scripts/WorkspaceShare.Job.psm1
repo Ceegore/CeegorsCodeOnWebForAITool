@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 if (-not ('WorkspaceShare.NativeJob' -as [type])) {
 Add-Type -TypeDefinition @'
@@ -43,8 +43,8 @@ namespace WorkspaceShare {
     public static IntPtr Create(string name){string sid=WindowsIdentity.GetCurrent().User.Value;IntPtr descriptor;uint descriptorSize;if(!ConvertStringSecurityDescriptorToSecurityDescriptor("D:P(A;;GA;;;"+sid+")",1,out descriptor,out descriptorSize))Fail("ConvertStringSecurityDescriptorToSecurityDescriptor");IntPtr handle=IntPtr.Zero;int creationError=0;try{SECURITY_ATTRIBUTES attributes=new SECURITY_ATTRIBUTES();attributes.nLength=Marshal.SizeOf(attributes);attributes.lpSecurityDescriptor=descriptor;attributes.bInheritHandle=false;handle=CreateJobObject(ref attributes,name);creationError=Marshal.GetLastWin32Error();}finally{LocalFree(descriptor);}if(handle==IntPtr.Zero){Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());}if(creationError==ERROR_ALREADY_EXISTS){CloseHandle(handle);throw new InvalidOperationException("A Job Object with this name already exists.");}EXT_LIMIT info=new EXT_LIMIT();info.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;int size=Marshal.SizeOf(info);IntPtr data=Marshal.AllocHGlobal(size);try{Marshal.StructureToPtr(info,data,false);if(!SetInformationJobObject(handle,JobObjectExtendedLimitInformation,data,(uint)size)){CloseHandle(handle);Fail("SetInformationJobObject");}}finally{Marshal.FreeHGlobal(data);}return handle;}
     public static IntPtr Open(string name){IntPtr handle=OpenJobObject(0x1F001F,false,name);if(handle==IntPtr.Zero)Fail("OpenJobObject");return handle;}
     public static void Assign(IntPtr job,int pid){using(Process process=Process.GetProcessById(pid)){if(!AssignProcessToJobObject(job,process.Handle))Fail("AssignProcessToJobObject");}}
-    public static int StartSuspended(IntPtr job,string file,string args,string cwd,string stdout,string stderr,string stdinText,string[] environmentEntries,bool forceResumeFailure){
-      IntPtr input=IntPtr.Zero,inputWrite=IntPtr.Zero,output=IntPtr.Zero,error=IntPtr.Zero,environment=IntPtr.Zero;bool created=false;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();
+    public static Process StartSuspended(IntPtr job,string file,string args,string cwd,string stdout,string stderr,string stdinText,string[] environmentEntries,bool forceResumeFailure){
+      IntPtr input=IntPtr.Zero,inputWrite=IntPtr.Zero,output=IntPtr.Zero,error=IntPtr.Zero,environment=IntPtr.Zero;bool created=false;PROCESS_INFORMATION pi=new PROCESS_INFORMATION();Process child=null;
       try{
         if(stdinText==null){input=CreateFile("NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,IntPtr.Zero);if(input.ToInt64()==-1)Fail("CreateFile stdin");if(!SetHandleInformation(input,HANDLE_FLAG_INHERIT,HANDLE_FLAG_INHERIT))Fail("SetHandleInformation stdin");}
         else{SECURITY_ATTRIBUTES security=new SECURITY_ATTRIBUTES();security.nLength=Marshal.SizeOf(security);security.bInheritHandle=true;if(!CreatePipe(out input,out inputWrite,ref security,0))Fail("CreatePipe stdin");if(!SetHandleInformation(inputWrite,HANDLE_FLAG_INHERIT,0))Fail("SetHandleInformation stdin writer");}
@@ -55,10 +55,11 @@ namespace WorkspaceShare {
         if(!CreateProcess(file,new StringBuilder("\""+file+"\" "+args),IntPtr.Zero,IntPtr.Zero,true,CREATE_SUSPENDED|CREATE_NO_WINDOW|CREATE_UNICODE_ENVIRONMENT,environment,cwd,ref startup,out pi))Fail("CreateProcess");created=true;
         if(!AssignProcessToJobObject(job,pi.hProcess))Fail("AssignProcessToJobObject");
         if(forceResumeFailure){InvalidOperationException injected=new InvalidOperationException("Injected ResumeThread failure.");injected.Data["ProcessId"]=(int)pi.dwProcessId;throw injected;}
+        child=Process.GetProcessById((int)pi.dwProcessId);IntPtr cachedHandle=child.Handle;
         if(ResumeThread(pi.hThread)==0xFFFFFFFF)Fail("ResumeThread");
         if(inputWrite!=IntPtr.Zero){byte[] bytes=Encoding.UTF8.GetBytes(stdinText);uint written;if(bytes.Length>0&&(!WriteFile(inputWrite,bytes,(uint)bytes.Length,out written,IntPtr.Zero)||written!=(uint)bytes.Length))Fail("WriteFile stdin");CloseHandle(inputWrite);inputWrite=IntPtr.Zero;}
-        return (int)pi.dwProcessId;
-      }catch{if(created&&pi.hProcess!=IntPtr.Zero){TerminateProcess(pi.hProcess,1);WaitForSingleObject(pi.hProcess,5000);}throw;}
+        return child;
+      }catch{if(child!=null)child.Dispose();if(created&&pi.hProcess!=IntPtr.Zero){TerminateProcess(pi.hProcess,1);WaitForSingleObject(pi.hProcess,5000);}throw;}
       finally{if(pi.hThread!=IntPtr.Zero)CloseHandle(pi.hThread);if(pi.hProcess!=IntPtr.Zero)CloseHandle(pi.hProcess);if(input!=IntPtr.Zero&&input.ToInt64()!=-1)CloseHandle(input);if(inputWrite!=IntPtr.Zero)CloseHandle(inputWrite);if(output!=IntPtr.Zero&&output.ToInt64()!=-1)CloseHandle(output);if(error!=IntPtr.Zero&&error.ToInt64()!=-1)CloseHandle(error);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);}
     }
     public static void Terminate(IntPtr handle){if(!TerminateJobObject(handle,1))Fail("TerminateJobObject");}
@@ -90,7 +91,7 @@ function ConvertTo-WorkspaceNativeArgument {
     param([AllowEmptyString()][string]$Value)
     if($null -eq $Value -or $Value.Length -eq 0){return '""'}
     if($Value -notmatch '[\s"]'){return $Value}
-    return '"'+($Value -replace '(\\*)"','$1$1\\"' -replace '(\\+)$','$1$1')+'"'
+    return '"'+($Value -replace '(\\*)"','$1$1\"' -replace '(\\+)$','$1$1')+'"'
 }
 
 function New-WorkspaceJob { param([Parameter(Mandatory=$true)][string]$Name);[WorkspaceShare.NativeJob]::Create($Name) }
@@ -101,8 +102,8 @@ function Start-WorkspaceProcessInJob {
     if($null -eq $Environment){$Environment=New-WorkspaceChildEnvironment}
     $argumentText=(@($Arguments)|ForEach-Object{ConvertTo-WorkspaceNativeArgument $_}) -join ' '
     $entries=ConvertTo-WorkspaceEnvironmentEntries $Environment
-    $pid=[WorkspaceShare.NativeJob]::StartSuspended($Job,$FilePath,$argumentText,$WorkingDirectory,$StdOutPath,$StdErrPath,$StandardInputText,$entries,[bool]$TestForceResumeFailure)
-    [Diagnostics.Process]::GetProcessById($pid)
+    # The Process object is opened before the child resumes, so its handle and exit code survive even an immediate exit.
+    [WorkspaceShare.NativeJob]::StartSuspended($Job,$FilePath,$argumentText,$WorkingDirectory,$StdOutPath,$StdErrPath,$StandardInputText,$entries,[bool]$TestForceResumeFailure)
 }
 
 function Read-WorkspaceBoundedText { param([string]$Path,[int]$MaximumBytes=4194304);if(-not(Test-Path -LiteralPath $Path -PathType Leaf)){return ''};$stream=New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);try{$length=[Math]::Min([int64]$MaximumBytes,$stream.Length);[void]$stream.Seek(-$length,[IO.SeekOrigin]::End);$bytes=New-Object byte[] ([int]$length);[void]$stream.Read($bytes,0,$bytes.Length);try{(New-Object Text.UTF8Encoding($false,$true)).GetString($bytes)}catch{[Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes)}}finally{$stream.Dispose()}}

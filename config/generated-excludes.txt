@@ -1,11 +1,10 @@
 # Große, rekonstruierbare oder lokale Inhalte.
 # Mit -IncludeGenerated werden diese Regeln nicht angewendet.
+# Ein Name ohne '\*' gilt in jeder Tiefe; 'Name\*' nur im Workspace-Root.
 
 node_modules
 node_modules\*
-Library
 Library\*
-Temp
 Temp\*
 obj
 obj\*
@@ -25,7 +24,6 @@ DerivedData
 DerivedData\*
 .vs
 .vs\*
-Logs
 Logs\*
 *.log
 Thumbs.db

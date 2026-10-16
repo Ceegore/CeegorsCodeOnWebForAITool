@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Installiert die exakt gepinnten WorkspaceShare-Abhängigkeiten.
@@ -47,8 +47,10 @@ if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitPr
 
 $installMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
 $installMutexHeld = $false
-try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) } catch { throw 'The dependency-install mutex could not be acquired.' }
-if (-not $installMutexHeld) { throw 'Another dependency installation or release build is active.' }
+try { $installMutexHeld = $installMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
+catch [Threading.AbandonedMutexException] { $installMutexHeld = $true }
+catch { $installMutex.Dispose(); throw 'The dependency-install mutex could not be acquired.' }
+if (-not $installMutexHeld) { $installMutex.Dispose(); throw 'Another dependency installation or release build is active.' }
 $dependencyLease = $null
 try { $dependencyLease = Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Exclusive -TimeoutSeconds 30 }
 catch {
@@ -167,7 +169,9 @@ function Download-File {
             $response.EnsureSuccessStatusCode() | Out-Null
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $file = New-Object IO.FileStream($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { [void]$stream.CopyToAsync($file).GetAwaiter().GetResult() } finally { $file.Dispose(); $stream.Dispose(); $response.Dispose() }
+            # HttpClient.Timeout covers only the headers here; bound the body transfer separately.
+            $copyTimeout = New-Object Threading.CancellationTokenSource([TimeSpan]::FromMinutes(10))
+            try { [void]$stream.CopyToAsync($file, 81920, $copyTimeout.Token).GetAwaiter().GetResult() } finally { $copyTimeout.Dispose(); $file.Dispose(); $stream.Dispose(); $response.Dispose() }
             $lastError = $null
             break
         }
@@ -302,7 +306,7 @@ try {
             # Ungültige oder leere Lockdatei darf repariert werden.
         }
 
-        if ($existing -and $existing.installed) {
+        if ($existing -and $existing.PSObject.Properties['installed'] -and $existing.installed) {
             throw (
                 "dependencies.lock.json zeigt bereits eine Installation an. " +
                 "Nutze -Force für eine bewusste Neuinstallation."

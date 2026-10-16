@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Automatisierte lokale und optionale öffentliche Abnahmetests.
@@ -270,6 +270,8 @@ try {
     $excludeAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-SourcePathExcluded' }, $true) | Select-Object -First 1
     $manifestAst = $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-SourceConsistencyManifest' }, $true) | Select-Object -First 1
     Assert-True ($null -ne $sanitizerAst) 'Zentraler Diagnosesanitizer ist vorhanden'
+    Assert-True ($null -ne $excludeAst) 'Test-SourcePathExcluded ist in Share-Workspace.ps1 vorhanden'
+    Assert-True ($null -ne $manifestAst) 'Get-SourceConsistencyManifest ist in Share-Workspace.ps1 vorhanden'
     if ($sanitizerAst) {
         Invoke-Expression $sanitizerAst.Extent.Text
         Assert-True ((Get-AllowedOutageSeconds -Classification 'EdgeDisconnected') -eq 150) 'Edge-Ausfallbudget ist zeitbasiert'
@@ -296,6 +298,18 @@ try {
     if($excludeAst -and $manifestAst){
         Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Path.psm1') -Force
         Invoke-Expression $excludeAst.Extent.Text;Invoke-Expression $manifestAst.Extent.Text
+        $readPatterns={param($file)@(Get-Content -LiteralPath $file|ForEach-Object{$_.Trim()}|Where-Object{$_ -and -not $_.StartsWith('#')})}
+        $mandatoryPatterns=@(& $readPatterns (Join-Path $ToolRoot 'config\mandatory-excludes.txt'));$generatedPatterns=@(& $readPatterns (Join-Path $ToolRoot 'config\generated-excludes.txt'))
+        Assert-True ($mandatoryPatterns.Count -gt 0 -and $generatedPatterns.Count -gt 0) 'Ausschlussmuster werden aus config\ geladen'
+        $allPatterns=@($mandatoryPatterns)+@($generatedPatterns)
+        $isExcluded={param($relative,$patterns)Test-SourcePathExcluded -RelativePath $relative -Name ([IO.Path]::GetFileName($relative)) -Patterns $patterns}
+        Assert-True (& $isExcluded '.git\config' $mandatoryPatterns) 'Pflichtausschluss: .git\config wird ausgeschlossen'
+        Assert-True (& $isExcluded '.ssh\id_rsa' $mandatoryPatterns) 'Pflichtausschluss: .ssh\id_rsa wird ausgeschlossen'
+        Assert-True (& $isExcluded 'sub\.npmrc' $mandatoryPatterns) 'Pflichtausschluss: .npmrc wird in jeder Tiefe ausgeschlossen'
+        Assert-True (-not(& $isExcluded 'src\Library\x.cs' $allPatterns)) 'Root-verankertes Library\* schließt src\Library\x.cs nicht aus'
+        Assert-True (& $isExcluded 'Library\x.asset' $allPatterns) 'Root-verankertes Library\* schließt Library\x.asset aus'
+        Assert-True (& $isExcluded 'pages\[id]\page.tsx' @('pages\[id]\*')) 'Klammermuster pages\[id]\* trifft den literalen Pfad'
+        Assert-True (-not(& $isExcluded 'pages\i\page.tsx' @('pages\[id]\*'))) 'Klammermuster pages\[id]\* wird nicht als Zeichenklasse interpretiert'
         $manifestRoot=Join-Path $temp 'manifest-fixture';New-Item -ItemType Directory -Path (Join-Path $manifestRoot 'node_modules') -Force|Out-Null
         Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'one';Set-Content -LiteralPath (Join-Path $manifestRoot 'node_modules\cache.txt') -Value 'one'
         $manifestOne=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
@@ -343,10 +357,18 @@ try {
     $server.StartInfo = $psi
     [void]$server.Start()
 
-    Assert-True (Wait-Ready $localUrl) 'Geheimroute liefert lokal HTTP 200'
+    $serverReady = Wait-Ready $localUrl
+    Assert-True $serverReady 'Geheimroute liefert lokal HTTP 200'
+    if (-not $serverReady) {
+        Write-Host '[FAIL] miniserve wurde nicht bereit; Live-Server-Abschnitt wird abgebrochen.' -ForegroundColor Red
+        Write-Host ''
+        Write-Host "Bestanden: $passed"
+        Write-Host "Fehlgeschlagen: $failed"
+        exit 1
+    }
     $resolveLine='resolve = "fake.example:{0}:127.0.0.1"' -f $port
-    $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output','NUL') -PrivateConfigLines @($resolveLine)
-    Assert-True ($resolvedResult.ExitCode -eq 0 -and $resolveLine -notmatch '\\"') 'Private resolve-Konfiguration ist syntaktisch gültig und bleibt aus argv'
+    $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output','NUL','--write-out','%{http_code}') -PrivateConfigLines @($resolveLine)
+    Assert-True ($resolvedResult.ExitCode -eq 0 -and ((($resolvedResult.StdOut | Select-Object -Last 1) | Out-String).Trim()) -eq '200') 'Private resolve-Konfiguration ist gültig, wird angewendet und bleibt aus argv'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/" -Extra @('--head')) -in @(401,403,404)) 'Root ohne Token liefert eine explizite 4xx-Ablehnung'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/d/$(New-Token)/" -Extra @('--head')) -in @(401,403,404)) 'Falsches Token liefert eine explizite 4xx-Ablehnung'
 
@@ -355,7 +377,7 @@ try {
         Assert-True ($commandLine -notmatch [regex]::Escape($token)) 'Token fehlt in miniserve-Prozesskommandozeile'
     }
     catch {
-        Write-Host '[WARN] Prozesskommandozeile konnte nicht über CIM gelesen werden.'
+        Assert-True $false "Prozesskommandozeile nicht prüfbar: $($_.Exception.Message)"
     }
 
     try {
@@ -366,7 +388,7 @@ try {
         }
     }
     catch {
-        Write-Host '[WARN] Get-NetTCPConnection konnte nicht ausgeführt werden.'
+        Assert-True $false "Loopback-Listen-Bindung nicht prüfbar: $($_.Exception.Message)"
     }
 
     $rangeFile = Join-Path $temp 'range.bin'
@@ -399,14 +421,22 @@ try {
     Assert-True ($resumeHash -eq $originalHash) 'Fortgesetzter Download besitzt korrekten Hash'
 
     $beforeFiles = Get-RelativeFiles $temp
+    $mutationBody = Join-Path ([IO.Path]::GetTempPath()) ('ws-mutation-' + [Guid]::NewGuid().ToString('N') + '.bin')
     foreach ($method in @('POST','PUT','PATCH','DELETE','PROPFIND','MKCOL','MOVE','COPY')) {
-        [void](Invoke-TestCurl -Url $localUrl -Arguments @(
+        $mutationOutput = Invoke-TestCurl -Url $localUrl -Arguments @(
             '--silent','--show-error',
             '--request',$method,
             '--header','Destination: /d/forbidden-target',
             '--data-binary','mutation-test',
-            '--output','NUL'
-        ))
+            '--output',$mutationBody,
+            '--write-out','%{http_code}'
+        )
+        $mutationStatus = 0
+        [void][int]::TryParse((($mutationOutput | Select-Object -Last 1) | Out-String).Trim(), [ref]$mutationStatus)
+        # Same contract as the launcher gate: explicit 4xx, or the unchanged file served as if it were a GET.
+        $mutationBodyHash=if(Test-Path -LiteralPath $mutationBody -PathType Leaf){(Get-FileHash -LiteralPath $mutationBody -Algorithm SHA256).Hash}else{''}
+        Remove-Item -LiteralPath $mutationBody -Force -ErrorAction SilentlyContinue
+        Assert-True (($mutationStatus -ge 400 -and $mutationStatus -lt 500) -or ($mutationStatus -eq 200 -and $mutationBodyHash -eq $originalHash)) ("Mutation-Probe $method wird abgelehnt oder liefert nur die unveränderte Datei (HTTP $mutationStatus)")
     }
     $afterFiles = Get-RelativeFiles $temp
 

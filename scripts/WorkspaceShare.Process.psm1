@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function New-ProcessState {
     param([string]$State,[Diagnostics.Process]$Process,[string]$Message='')
@@ -17,6 +17,8 @@ function Get-ProcessIdentityState {
     }
     catch{return New-ProcessState Unknown $null $_.Exception.Message}
     try {
+        # Cache the handle before verifying, so a later Kill() acts on this exact process even if the PID is reused.
+        try{$null=$process.Handle}catch{}
         $path=$process.Path
         $ticks=$process.StartTime.ToUniversalTime().Ticks
         if([string]::IsNullOrWhiteSpace($path)){try{$process.Dispose()}catch{};return New-ProcessState Unknown $null 'Process path is unavailable.'}

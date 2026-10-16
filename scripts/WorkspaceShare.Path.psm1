@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 if (-not ('WorkspaceShare.NativePath' -as [type])) {
     Add-Type -TypeDefinition @'

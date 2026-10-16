@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Führt das lokale Release-Gate aus und erzeugt ein internes Distributions-ZIP.
@@ -46,8 +46,10 @@ $hashBackup = $hashFile + '.' + $publicationId + '.previous'
 $publicationJournal = $archive + '.publish.json'
 $releaseMutex = New-Object Threading.Mutex($false, 'Local\WorkspaceShare.DependencyInstall')
 $releaseMutexHeld = $false
-try { $releaseMutexHeld = $releaseMutex.WaitOne([TimeSpan]::FromSeconds(30)) } catch { throw 'The dependency/release mutex could not be acquired.' }
-if (-not $releaseMutexHeld) { throw 'A dependency installation or another release build is active.' }
+try { $releaseMutexHeld = $releaseMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
+catch [Threading.AbandonedMutexException] { $releaseMutexHeld = $true }
+catch { $releaseMutex.Dispose(); throw 'The dependency/release mutex could not be acquired.' }
+if (-not $releaseMutexHeld) { $releaseMutex.Dispose(); throw 'A dependency installation or another release build is active.' }
 $dependencyLease = $null
 $releaseJob=[IntPtr]::Zero
 
@@ -83,16 +85,16 @@ function Recover-ReleasePublication {
         throw 'The release publication journal is invalid.'
     }
     if ([bool]$journal.oldArchiveExisted) {
-        if (-not (Test-Path -LiteralPath ([string]$journal.archiveBackup) -PathType Leaf)) { throw 'Previous release archive backup is missing.' }
-        Move-Item -LiteralPath ([string]$journal.archiveBackup) -Destination $archive -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath ([string]$journal.archiveBackup) -PathType Leaf) { Move-Item -LiteralPath ([string]$journal.archiveBackup) -Destination $archive -Force -ErrorAction Stop }
+        elseif (-not (Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'Previous release archive backup is missing.' }
     }
     else { Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue }
     if ([bool]$journal.oldHashExisted) {
-        if (-not (Test-Path -LiteralPath ([string]$journal.hashBackup) -PathType Leaf)) { throw 'Previous release hash backup is missing.' }
-        Move-Item -LiteralPath ([string]$journal.hashBackup) -Destination $hashFile -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath ([string]$journal.hashBackup) -PathType Leaf) { Move-Item -LiteralPath ([string]$journal.hashBackup) -Destination $hashFile -Force -ErrorAction Stop }
+        elseif (-not (Test-Path -LiteralPath $hashFile -PathType Leaf)) { throw 'Previous release hash backup is missing.' }
     }
     else { Remove-Item -LiteralPath $hashFile -Force -ErrorAction SilentlyContinue }
-    Remove-Item -LiteralPath ([string]$journal.pendingArchive),([string]$journal.pendingHash) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ([string]$journal.pendingArchive),([string]$journal.pendingHash),([string]$journal.archiveBackup+'.partial'),([string]$journal.hashBackup+'.partial') -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $publicationJournal -Force -ErrorAction Stop
 }
 
@@ -110,22 +112,30 @@ try {
         throw 'Abhängigkeiten sind nicht installiert oder nicht gesperrt.'
     }
 
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     Write-Host '[1/5] Automatisierte Tests ausführen ...'
-    $testResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$testScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
+    $testResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath $windowsPowerShell -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$testScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
     if($testResult.StdOut){Write-Host $testResult.StdOut}
     if($testResult.StdErr){Write-Warning $testResult.StdErr}
     if($testResult.ExitCode -ne 0){throw "Acceptance tests failed with exit $($testResult.ExitCode)."}
-    $lifecycleResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$lifecycleTestScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
+    $lifecycleResult=Invoke-WorkspaceNativeProcess -Job $releaseJob -FilePath $windowsPowerShell -Arguments @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$lifecycleTestScript,'-ToolRoot',$ToolRoot) -WorkingDirectory $ToolRoot -TimeoutSeconds 1200 -ExpectedExitCodes @(0,1)
     if($lifecycleResult.StdOut){Write-Host $lifecycleResult.StdOut}
     if($lifecycleResult.StdErr){Write-Warning $lifecycleResult.StdErr}
     if($lifecycleResult.ExitCode -ne 0){throw "Lifecycle tests failed with exit $($lifecycleResult.ExitCode)."}
     $dependencyLease=Enter-WorkspaceDependencyLease -ToolRoot $ToolRoot -Mode Exclusive -TimeoutSeconds 30
+    # Never package binaries that differ from the lock that will ship with them.
+    $lockedNames=@($lock.dependencies|ForEach-Object{[string]$_.name})
+    if(@(Compare-Object $lockedNames @('cloudflared','miniserve','Gitleaks','7-Zip')).Count -ne 0){throw 'Lockfile does not list exactly the four pinned dependencies.'}
+    foreach($dependency in @($lock.dependencies)){
+        $dependencyPath=Join-Path $ToolRoot (([string]$dependency.file).Replace('/','\'))
+        if(-not(Test-Path -LiteralPath $dependencyPath -PathType Leaf) -or (Get-FileHash -LiteralPath $dependencyPath -Algorithm SHA256).Hash -ne ([string]$dependency.sha256).ToUpperInvariant()){throw "Binary does not match dependencies.lock.json: $($dependency.file)"}
+    }
 
     Write-Host '[2/5] Release-Inhalt statisch prüfen ...'
     $textFiles = @(
         Get-ChildItem -LiteralPath $ToolRoot -File -Recurse |
         Where-Object {
-            $_.FullName -notmatch '(?i)[\\/](bin|dist|docs)[\\/]' -and
+            $_.FullName.Substring($ToolRoot.TrimEnd('\').Length) -notmatch '(?i)^[\\/](bin|dist|docs)[\\/]' -and
             $_.Extension -in @('.ps1','.psm1','.cmd','.json','.toml','.txt','.md')
         }
     )
@@ -173,6 +183,7 @@ try {
         'README.md',
         'SECURITY.md',
         'THIRD_PARTY_NOTICES.md',
+        'LICENSE',
         'dependencies.lock.json',
         'config\mandatory-excludes.txt','config\generated-excludes.txt','config\gitleaks-workspaceshare.toml',
         'scripts\WorkspaceShare.Process.psm1','scripts\WorkspaceShare.Curl.psm1','scripts\WorkspaceShare.Health.psm1','scripts\WorkspaceShare.Job.psm1','scripts\WorkspaceShare.Path.psm1','scripts\WorkspaceShare.Dependency.psm1','scripts\Watch-WorkspaceShare.ps1','scripts\Test-TunnelSoak.ps1','scripts\Test-QuickTunnelDns.ps1',
@@ -217,8 +228,9 @@ try {
     Write-JsonAtomic -Value $journal -Path $publicationJournal
     $committed = $false
     try {
-        if ($oldArchiveExisted) { Copy-Item -LiteralPath $archive -Destination $archiveBackup -Force -ErrorAction Stop }
-        if ($oldHashExisted) { Copy-Item -LiteralPath $hashFile -Destination $hashBackup -Force -ErrorAction Stop }
+        # Backups appear atomically, so recovery never restores a torn copy over the intact release.
+        if ($oldArchiveExisted) { Copy-Item -LiteralPath $archive -Destination ($archiveBackup+'.partial') -Force -ErrorAction Stop; Move-Item -LiteralPath ($archiveBackup+'.partial') -Destination $archiveBackup -Force -ErrorAction Stop }
+        if ($oldHashExisted) { Copy-Item -LiteralPath $hashFile -Destination ($hashBackup+'.partial') -Force -ErrorAction Stop; Move-Item -LiteralPath ($hashBackup+'.partial') -Destination $hashBackup -Force -ErrorAction Stop }
         Invoke-TestFailure 'OldReleaseMoved'
         Move-Item -LiteralPath $pendingArchive -Destination $archive -Force -ErrorAction Stop
         Invoke-TestFailure 'ArchivePublished'

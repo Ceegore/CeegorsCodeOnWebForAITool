@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Erstellt einen read-only Workspace-Snapshot und veröffentlicht ihn für kurze Zeit
@@ -29,7 +29,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Hours')]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Container })]
+    [ValidateNotNullOrEmpty()]
     [string]$Path,
 
     [Parameter(ParameterSetName = 'Hours')]
@@ -255,14 +255,12 @@ function Test-ExactArchiveContents {
     param([Parameter(Mandatory = $true)][string]$ArchivePath,[Parameter(Mandatory = $true)][string]$VerificationRoot,[Parameter(Mandatory = $true)][string]$GitleaksReportPath,[string[]]$ExclusionPatterns=@(),[string[]]$IncludedRelativePaths=@(),[switch]$RunSecretScan)
     New-Item -ItemType Directory -Path $VerificationRoot -Force | Out-Null
     try {
-        $extract=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('x','-y','-bd','-bb1',("-o$VerificationRoot"),$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 1800 -ExpectedExitCodes @(0)
-        $global:LASTEXITCODE=$extract.ExitCode
-        if($LASTEXITCODE -ne 0){Stop-WithError -Code 23 -Message 'Das fertige Archiv konnte nicht zur Inhaltsprüfung extrahiert werden.'}
+        try{$extract=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('x','-y','-bd','-bb1',("-o$VerificationRoot"),$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 1800 -ExpectedExitCodes @(0)}catch{if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw};Stop-WithError -Code 23 -Message ('7-Zip ist fehlgeschlagen: '+(Protect-DiagnosticText $_.Exception.Message))}
         foreach($entry in @(Get-ChildItem -LiteralPath $VerificationRoot -Recurse -Force -ErrorAction Stop)){
             $relative=$entry.FullName.Substring($VerificationRoot.Length).TrimStart('\','/') -replace '/','\'
             $parts=@($relative -split '\\')
             if(@($parts|Where-Object{$_ -in @('.git','.svn','.hg')}).Count -gt 0){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält ausgeschlossene Versionskontrolldaten: $relative"}
-            foreach($pattern in $ExclusionPatterns){$normalized=$pattern -replace '/','\';if($relative -like $normalized -or $entry.Name -like $normalized){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält einen ausgeschlossenen Pfad: $relative"}}
+            if(Test-SourcePathExcluded -RelativePath $relative -Name $entry.Name -Patterns $ExclusionPatterns){Stop-WithError -Code 22 -Message "Das fertige Archiv enthält einen ausgeschlossenen Pfad: $relative"}
         }
         $actualFiles=@(Get-ChildItem -LiteralPath $VerificationRoot -File -Recurse -Force|ForEach-Object{$_.FullName.Substring($VerificationRoot.Length).TrimStart('\','/').ToLowerInvariant()}|Sort-Object)
         $expectedFiles=@($IncludedRelativePaths|ForEach-Object{([string]$_).Replace('/','\').ToLowerInvariant()}|Sort-Object)
@@ -303,6 +301,7 @@ function Assert-DependencyLock {
         )
     }
 
+    try {
     if ([int]$lock.schema -ne 2 -or -not $lock.installed) {
         Stop-WithError -Code 11 -Message (
             "Die Abhängigkeiten wurden noch nicht reproduzierbar installiert. " +
@@ -364,6 +363,11 @@ function Assert-DependencyLock {
 
     if ($seen.Count -ne $expectedDependencies.Count) {
         Stop-WithError -Code 11 -Message 'Das Lockfile enthält nicht exakt die erwarteten vier Abhängigkeiten.'
+    }
+    }
+    catch {
+        if ($_.Exception.Data.Contains('WorkspaceShareExitCode')) { throw }
+        Stop-WithError -Code 11 -Message ('dependencies.lock.json ist ungültig: ' + $_.Exception.Message)
     }
 }
 
@@ -584,7 +588,7 @@ function Protect-DiagnosticText {
         }
     }
     $safe = $safe -replace '(?i)\b[a-z0-9-]+\.trycloudflare\.com\b', '<redacted>.trycloudflare.com'
-    $safe = $safe -replace '(?i)/d/[A-Za-z0-9_-]{43}(?=/|\s|"|''|$)', '/d/<redacted>'
+    $safe = $safe -replace '(?i)/d/[A-Za-z0-9_-]{43}(?=/|\?|#|\s|"|''|$)', '/d/<redacted>'
     $safe = $safe -replace '(?i)%2Fd%2F[A-Za-z0-9_-]{43}', '%2Fd%2F<redacted>'
     return $safe
 }
@@ -676,7 +680,7 @@ function Get-LiveDnsOverrideConfigLines {
     param([Parameter(Mandatory = $true)][string]$HostName)
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         try {
-            $address = Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
+            $address = Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -First 1 -ExpandProperty IPAddress
             if ($address) {$value='{0}:443:{1}' -f $HostName,$address;return @('resolve = "{0}"' -f (WorkspaceShare.Curl\ConvertTo-CurlConfigQuoted $value))}
         } catch {}
     }
@@ -687,14 +691,14 @@ function Get-DnsObservation {
     param([Parameter(Mandatory = $true)][string]$HostName)
     $systemAddresses = @()
     foreach ($type in @('A', 'AAAA')) {
-        try { $systemAddresses += @(Resolve-DnsName -Name $HostName -Type $type -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch {}
+        try { $systemAddresses += @(Resolve-DnsName -Name $HostName -Type $type -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch {}
     }
     $systemAddresses = @($systemAddresses | Select-Object -Unique)
     $publicResults = @()
     foreach ($resolver in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
         $addresses = @(); $errorText = ''
         foreach ($type in @('A', 'AAAA')) {
-            try { $addresses += @(Resolve-DnsName -Name $HostName -Type $type -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch { $errorText = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls }
+            try { $addresses += @(Resolve-DnsName -Name $HostName -Type $type -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique) } catch { $errorText = Protect-DiagnosticText -Text $_.Exception.Message -KnownSecretUrls $script:SecretUrls }
         }
         $addresses = @($addresses | Select-Object -Unique)
         $publicResults += [pscustomobject]@{ Resolver = $resolver; Addresses = $addresses; Success = ($addresses.Count -gt 0); Error = $errorText }
@@ -706,10 +710,10 @@ function Wait-ForPublicDnsPublication {
     param([Parameter(Mandatory=$true)][string]$HostName,[ValidateRange(5,600)][int]$TimeoutSeconds=180)
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do{
-        if(Test-StopRequested){$script:StopReason='ManualStop';return $false}
+        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $successfulResolvers=0
         foreach($resolver in @('1.1.1.1','8.8.8.8','9.9.9.9')){
-            try{$answer=Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop|Where-Object IPAddress|Select-Object -First 1;if($answer){$successfulResolvers++}}catch{}
+            try{$answer=Resolve-DnsName -Name $HostName -Type A -Server $resolver -DnsOnly -QuickTimeout -ErrorAction Stop|Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress }|Select-Object -First 1;if($answer){$successfulResolvers++}}catch{}
         }
         if($successfulResolvers -ge 2){return $true}
         Start-Sleep -Seconds 2
@@ -792,7 +796,7 @@ function Read-PatternFile {
     }
 
     return @(
-        Get-Content -LiteralPath $FilePath |
+        Get-Content -LiteralPath $FilePath -Encoding UTF8 |
         ForEach-Object { $_.Trim() } |
         Where-Object {
             $_ -and -not $_.StartsWith('#')
@@ -830,6 +834,13 @@ function Test-ForbiddenFilename {
         'id_rsa.*',
         'id_ed25519',
         'id_ed25519.*',
+        'id_ecdsa',
+        'id_ecdsa.*',
+        'id_dsa',
+        'id_dsa.*',
+        '*.ppk',
+        '*.p8',
+        '*.kdbx',
         'credentials.json',
         'service-account*.json',
         'service_account*.json',
@@ -933,7 +944,7 @@ function Test-SourcePathExcluded {
     $parts=@($normalized -split '\\')
     if(@($parts|Where-Object{$_ -in @('.git','.svn','.hg')}).Count -gt 0){return $true}
     foreach($pattern in @($Patterns)){
-        $candidate=$pattern -replace '/','\'
+        $candidate=($pattern -replace '/','\') -replace '([\[\]`])','`$1'
         if($normalized -like $candidate -or $Name -like $candidate -or @($parts|Where-Object{$_ -like $candidate}).Count -gt 0){return $true}
     }
     return $false
@@ -943,13 +954,20 @@ function Get-SourceConsistencyManifest {
     param([Parameter(Mandatory=$true)][string]$Root,[string[]]$ExclusionPatterns=@())
     $result=New-Object 'System.Collections.Generic.List[string]'
     try{
-        foreach($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force -ErrorAction Stop)){
-            if(($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
-            $relative=$file.FullName.Substring($Root.Length).TrimStart('\','/').ToLowerInvariant()
-            if(Test-SourcePathExcluded -RelativePath $relative -Name $file.Name -Patterns $ExclusionPatterns){continue}
-            $fileIdentity=(Resolve-WorkspaceDirectoryIdentity -Path $file.FullName).Identity
-            $hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
-            $result.Add(('{0}|{1}|{2}|{3}|{4}' -f $relative,$fileIdentity,$file.Length,$file.LastWriteTimeUtc.Ticks,$hash))
+        $stack=New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+        $stack.Push((Get-Item -LiteralPath $Root -Force -ErrorAction Stop))
+        while($stack.Count -gt 0){
+            $directory=$stack.Pop()
+            foreach($file in @($directory.EnumerateFileSystemInfos())){
+                if(($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){continue}
+                $relative=$file.FullName.Substring($Root.Length).TrimStart('\','/').ToLowerInvariant()
+                $excluded=Test-SourcePathExcluded -RelativePath $relative -Name $file.Name -Patterns $ExclusionPatterns
+                if($file -is [System.IO.DirectoryInfo]){if(-not $excluded){$stack.Push($file)};continue}
+                if($excluded){continue}
+                $fileIdentity=(Resolve-WorkspaceDirectoryIdentity -Path $file.FullName).Identity
+                $hash=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                $result.Add(('{0}|{1}|{2}|{3}|{4}' -f $relative,$fileIdentity,$file.Length,$file.LastWriteTimeUtc.Ticks,$hash))
+            }
         }
     }catch{Stop-WithError -Code 20 -Message ('Die Quelle änderte sich oder konnte während der Snapshot-Prüfung nicht gelesen werden: '+$_.Exception.Message)}
     return @($result|Sort-Object)
@@ -993,6 +1011,8 @@ function Invoke-GitleaksScan {
         '--config', $GitleaksConfigPath,
         '--no-banner',
         '--no-color',
+        '--ignore-gitleaks-allow',
+        '--max-archive-depth','3',
         '--redact=100',
         '--report-format', 'json',
         '--report-path', $ReportPath,
@@ -1001,7 +1021,7 @@ function Invoke-GitleaksScan {
         $SourceRoot
     )
 
-    $result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $GitleaksPath -Arguments $arguments -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 930 -ExpectedExitCodes @(0,20)
+    try{$result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $GitleaksPath -Arguments $arguments -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 930 -ExpectedExitCodes @(0,20)}catch{if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw};Stop-WithError -Code 22 -Message ('Gitleaks-Prüfung fehlgeschlagen: '+(Protect-DiagnosticText $_.Exception.Message))}
     $code = $result.ExitCode
 
     if ($code -eq 20) {
@@ -1045,7 +1065,7 @@ function Invoke-SevenZipSnapshot {
 
     # Der Workspace selbst ist nur das Arbeitsverzeichnis. Dadurch enthält das
     # ZIP direkt dessen Inhalt statt einer zusätzlichen Root-Ordner-Ebene.
-    $result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments $arguments -WorkingDirectory $SourceRoot -TimeoutSeconds 3600 -ExpectedExitCodes @(0) -StdOutPath $LogPath -StdErrPath ($LogPath+'.stderr') -KeepLogs
+    try{$result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments $arguments -WorkingDirectory $SourceRoot -TimeoutSeconds 3600 -ExpectedExitCodes @(0) -StdOutPath $LogPath -StdErrPath ($LogPath+'.stderr') -KeepLogs}catch{if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw};Stop-WithError -Code 23 -Message ('7-Zip ist fehlgeschlagen: '+(Protect-DiagnosticText $_.Exception.Message))}
     $code = $result.ExitCode
     if($result.StdOut){Write-Host $result.StdOut}
 
@@ -1070,7 +1090,7 @@ function Test-SevenZipArchive {
         [Parameter(Mandatory = $true)][string]$LogPath
     )
 
-    $result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('t','-bd','-bb1',$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 1800 -ExpectedExitCodes @(0) -StdOutPath $LogPath -StdErrPath ($LogPath+'.stderr') -KeepLogs
+    try{$result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('t','-bd','-bb1',$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 1800 -ExpectedExitCodes @(0) -StdOutPath $LogPath -StdErrPath ($LogPath+'.stderr') -KeepLogs}catch{if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw};Stop-WithError -Code 23 -Message ('7-Zip ist fehlgeschlagen: '+(Protect-DiagnosticText $_.Exception.Message))}
     if ($result.ExitCode -ne 0) {
         Stop-WithError -Code 23 -Message (
             "Die Integritätsprüfung des ZIP-Archivs ist fehlgeschlagen. Details: $LogPath"
@@ -1084,7 +1104,7 @@ function Write-SevenZipManifest {
         [Parameter(Mandatory = $true)][string]$ManifestPath
     )
 
-    $result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('l','-slt',$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 600 -ExpectedExitCodes @(0) -StdOutPath $ManifestPath -StdErrPath ($ManifestPath+'.stderr') -KeepLogs
+    try{$result=Invoke-WorkspaceNativeProcess -Job $script:JobHandle -FilePath $SevenZipPath -Arguments @('l','-slt',$ArchivePath) -WorkingDirectory $script:SessionDirectory -TimeoutSeconds 600 -ExpectedExitCodes @(0) -StdOutPath $ManifestPath -StdErrPath ($ManifestPath+'.stderr') -KeepLogs}catch{if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw};Stop-WithError -Code 23 -Message ('7-Zip ist fehlgeschlagen: '+(Protect-DiagnosticText $_.Exception.Message))}
     if ($result.ExitCode -ne 0) {
         Stop-WithError -Code 23 -Message "Das Archivmanifest konnte nicht erstellt werden."
     }
@@ -1168,7 +1188,7 @@ function Wait-ForCloudflaredMetrics {
 
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do {
-        if(Test-StopRequested){return $false}
+        if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
         $probe = Invoke-CurlProbe -Url "http://127.0.0.1:$MetricsPort/healthcheck" -TimeoutSeconds 3
@@ -1385,7 +1405,7 @@ function Wait-ForQuickTunnelUrl {
     )
 
     $timer=[Diagnostics.Stopwatch]::StartNew()
-    $regex = '(?<![a-z0-9.-])https://[a-z0-9-]+\.trycloudflare\.com(?:/|\s|$)'
+    $regex = '(?<![a-z0-9.-])https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com(?:/|\s|$)'
 
     do {
         if(Test-StopRequested){$script:StopReason='ManualStop';Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.'}
@@ -1449,8 +1469,8 @@ namespace WorkspaceShare {
 '@
         }
 
-        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-        $result = [WorkspaceShare.NativePower]::SetThreadExecutionState(0x80000001)
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED (0x80000001; als uint32, da PS 5.1 das Hex-Literal als negatives Int32 liest)
+        $result = [WorkspaceShare.NativePower]::SetThreadExecutionState([uint32]2147483649)
         if ($result -eq 0) {
             throw 'SetThreadExecutionState returned zero.'
         }
@@ -1467,8 +1487,8 @@ namespace WorkspaceShare {
 function Disable-SystemAwake {
     if ($script:SleepPreventionEnabled) {
         try {
-            # ES_CONTINUOUS
-            [void][WorkspaceShare.NativePower]::SetThreadExecutionState(0x80000000)
+            # ES_CONTINUOUS (0x80000000)
+            [void][WorkspaceShare.NativePower]::SetThreadExecutionState([uint32]2147483648)
         }
         catch {
         }
@@ -1483,13 +1503,31 @@ function Copy-LinkToClipboard {
     }
 
     try {
-        $setClipboard = Get-Command 'Set-Clipboard' -ErrorAction SilentlyContinue
-        if ($setClipboard) {
-            Set-Clipboard -Value $Url -ErrorAction Stop
+        # Bevorzugt: Clipboard-Verlauf (Win+V) und Cloud-Clipboard ausschließen (nur im STA-Thread möglich).
+        $copied = $false
+        if ([Threading.Thread]::CurrentThread.GetApartmentState() -eq 'STA') {
+            try {
+                Add-Type -AssemblyName System.Windows.Forms
+                $data = New-Object System.Windows.Forms.DataObject
+                $data.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $Url)
+                foreach ($format in @('ExcludeClipboardContentFromMonitorProcessing', 'CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard')) {
+                    $data.SetData($format, (New-Object IO.MemoryStream(, [byte[]](0, 0, 0, 0))))
+                }
+                [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+                $copied = $true
+            }
+            catch { $copied = $false }
         }
-        else {
-            $Url | & "$env:SystemRoot\System32\clip.exe"
-            if ($LASTEXITCODE -ne 0) { return $false }
+
+        if (-not $copied) {
+            $setClipboard = Get-Command 'Set-Clipboard' -ErrorAction SilentlyContinue
+            if ($setClipboard) {
+                Set-Clipboard -Value $Url -ErrorAction Stop
+            }
+            else {
+                $Url | & "$env:SystemRoot\System32\clip.exe"
+                if ($LASTEXITCODE -ne 0) { return $false }
+            }
         }
 
         $script:ClipboardUrl = $Url
@@ -1685,7 +1723,8 @@ function Remove-StaleSessions {
         if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
             $ownerPath=Join-Path $directory.FullName 'owner.json'
             try{$owner=Get-Content -LiteralPath $ownerPath -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop}catch{Write-Warning "Alte Sitzung ohne verifizierbare Eigentümerdaten bleibt bestehen: $($directory.FullName)";continue}
-            if([string]$owner.magic -ne 'WorkspaceShareSession' -or [int]$owner.schema -ne 1){Write-Warning "Alte Sitzung mit ungültigen Eigentümerdaten bleibt bestehen: $($directory.FullName)";continue}
+            $ownerProperties=if($owner){$owner.PSObject.Properties}else{$null}
+            if(-not $ownerProperties -or -not $ownerProperties['magic'] -or -not $ownerProperties['schema'] -or -not $ownerProperties['launcherPid'] -or -not $ownerProperties['launcherPath'] -or -not $ownerProperties['launcherStartTicks'] -or [string]$owner.magic -ne 'WorkspaceShareSession' -or [int]$owner.schema -ne 1){Write-Warning "Alte Sitzung mit ungültigen Eigentümerdaten bleibt bestehen: $($directory.FullName)";continue}
             $ownerState=Get-ProcessIdentityState -ProcessId ([int]$owner.launcherPid) -ExpectedPath ([string]$owner.launcherPath) -ExpectedStartTicks ([long]$owner.launcherStartTicks)
             if($ownerState.State -in @('Absent','Conflict')){Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue}
             continue
@@ -1741,6 +1780,7 @@ $cloudflaredStdErr = $null
 $sessionId = $null
 
 try {
+    if(-not(Test-Path -LiteralPath $Path -PathType Container)){Stop-WithError -Code 10 -Message "Der Pfad ist kein vorhandener Ordner: $Path"}
     Write-Host ''
     Write-Host 'WorkspaceShare 3.1 – read-only Quick-Tunnel-Freigabe'
     Write-Host '====================================================='
@@ -1763,7 +1803,7 @@ try {
     )) { Require-File -FilePath $module.Path -FriendlyName $module.Name -Code 10 }
     Import-Module -Name $HealthModulePath -Force -ErrorAction Stop
     Import-Module -Name $ProcessModulePath -Force -ErrorAction Stop
-    Import-Module -Name $CurlModulePath -Force -ErrorAction Stop
+    Import-Module -Name $CurlModulePath -Force -ErrorAction Stop -Function Invoke-CurlWithPrivateUrl,ConvertTo-CurlConfigQuoted
     Import-Module -Name $JobModulePath -Force -ErrorAction Stop
     Import-Module -Name $PathModulePath -Force -ErrorAction Stop
     Import-Module -Name $DependencyModulePath -Force -ErrorAction Stop
@@ -1908,7 +1948,7 @@ try {
     )
     $script:JobHandle=New-WorkspaceJob -Name $script:JobName
 
-    Write-Host ("      7-Zip: {0}" -f (Get-ExecutableVersionText -FilePath $SevenZipPath -Arguments @('i')))
+    Write-Host ("      7-Zip: {0}" -f [string](((Get-ExecutableVersionText -FilePath $SevenZipPath -Arguments @('i')) -split '\r?\n')|Where-Object{$_.Trim()}|Select-Object -First 1))
     Write-Host ("      miniserve: {0}" -f (Get-ExecutableVersionText -FilePath $MiniservePath))
     Write-Host ("      cloudflared: {0}" -f (Get-ExecutableVersionText -FilePath $CloudflaredPath))
     if (-not $UnsafeSkipSecretScan) { Write-Host ("      Gitleaks: {0}" -f (Get-ExecutableVersionText -FilePath $GitleaksPath -Arguments @('version'))) }
@@ -2033,6 +2073,7 @@ try {
             $script:MiniserveProcess = $null
         }
         catch {
+            if($_.Exception.Data.Contains('WorkspaceShareExitCode')){throw}
             $stopped = Stop-ProcessConfirmed -Process $script:MiniserveProcess -ExpectedPath $MiniservePath -Attempts 10 -WaitMilliseconds 1000
             if (-not $stopped) { Stop-WithError -Code 30 -Message 'Ein fehlgeschlagener miniserve-Versuch konnte nicht bestätigt beendet werden.' }
             $script:MiniserveProcess = $null
@@ -2182,6 +2223,7 @@ try {
         -AllowFullFileResponse:$startupSample.AllowFullFileResponse `
         -TimeoutSeconds 180
 
+    if (-not $initialSnapshot) { $script:StopReason='ManualStop'; Stop-WithError -Code 0 -Message 'Die Freigabe wurde manuell beendet.' }
     if (-not $initialSnapshot -or $initialSnapshot.Classification -ne 'Healthy') {
         $hostName = ([Uri]$finalUrl).DnsSafeHost
         $diagnosticArguments = @(Get-LiveDnsOverrideConfigLines -HostName $hostName)
@@ -2224,9 +2266,9 @@ try {
 
     # Replace the temporary setup lease with the requested lifetime only after
     # every public gate has succeeded.
-    $script:ActiveStartTimestamp=[Diagnostics.Stopwatch]::GetTimestamp()
+    $script:ActiveStartTimestamp=[Diagnostics.Stopwatch]::GetTimestamp();$activeStartUtc=[DateTime]::UtcNow
     $script:ActiveDurationTicks=[int64]($duration.TotalSeconds*[Diagnostics.Stopwatch]::Frequency)
-    $expiresUtc = [DateTime]::UtcNow.Add($duration)
+    $expiresUtc = $activeStartUtc.Add($duration)
     $oldWatchdog = $script:WatchdogProcess
     $newWatchdog = (Start-ValidatedWatchdog -ExpiresUtc $expiresUtc -StartTimestamp $script:ActiveStartTimestamp -DurationTicks $script:ActiveDurationTicks).Process
     # The replacement is live before retiring the temporary setup watchdog.
@@ -2319,7 +2361,7 @@ try {
                 $unhealthySeconds = (Get-ActiveElapsedSeconds)-$unhealthySinceSeconds
                 $currentBudget=Get-AllowedOutageSeconds -Classification $snapshot.Classification -RetryAfterSeconds $snapshot.RetryAfterSeconds
                 $observedOutageBudget=[Math]::Min($observedOutageBudget,$currentBudget)
-                $allowedSeconds=[Math]::Min(180,$observedOutageBudget)
+                $allowedSeconds=[Math]::Min(600,$observedOutageBudget)
                 if ($snapshot.Classification -eq 'RateLimited') {
                     if (([DateTime]::UtcNow - $lastRateLimitWarningUtc).TotalSeconds -ge 60) {
                         Write-Warning ("Quick Tunnel meldet Rate-Limiting. Ungesund seit {0:N0}/{1}s; HTTP={2}, Retry-After={3}s." -f $unhealthySeconds, $allowedSeconds, $snapshot.PublicHttpStatus, $snapshot.RetryAfterSeconds)
@@ -2343,6 +2385,7 @@ try {
             Write-Host ("      Verbleibend: ca. {0} Minute(n); letzte Tunnelprüfung wird alle {1}s ausgeführt." -f $wholeMinutes, $HealthCheckSeconds)
             $lastMinuteShown = $wholeMinutes
         }
+        $lastLoopSeconds=Get-ActiveElapsedSeconds
         Start-Sleep -Seconds 2
     }
 
@@ -2414,11 +2457,15 @@ finally {
             )
         }
         else {
-            Remove-Item `
-                -LiteralPath $script:SessionDirectory `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
+            for ($removeAttempt = 1; $removeAttempt -le 10; $removeAttempt++) {
+                Remove-Item `
+                    -LiteralPath $script:SessionDirectory `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $script:SessionDirectory)) { break }
+                Start-Sleep -Milliseconds 500
+            }
             if (Test-Path -LiteralPath $script:SessionDirectory) {
                 $script:ExitCode = 50
                 Write-Warning 'Der Sitzungsordner konnte nicht vollständig entfernt werden.'
@@ -2431,8 +2478,8 @@ finally {
     }
 
     Write-Host ''
-    if ($childrenStopped) { Write-Host 'Tunnel und lokaler Server wurden beendet.' }
-    if ($cleanupComplete -and -not (Test-EffectiveKeepArchive) -and -not (Test-Path -LiteralPath $script:SessionDirectory)) {
+    if ($childrenStopped -and $script:SessionDirectory) { Write-Host 'Tunnel und lokaler Server wurden beendet.' }
+    if ($cleanupComplete -and -not (Test-EffectiveKeepArchive) -and $script:SessionDirectory -and -not (Test-Path -LiteralPath $script:SessionDirectory)) {
         Write-Host 'Der temporäre Snapshot wurde gelöscht.'
     }
     if($cleanupComplete -and $script:JobHandle -ne [IntPtr]::Zero){try{Close-WorkspaceJob -Job $script:JobHandle}catch{$script:ExitCode=50};$script:JobHandle=[IntPtr]::Zero}

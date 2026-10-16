@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Erzeugt lokale Test-Workspaces für die Snapshot- und Sicherheits-Gates.
@@ -39,6 +39,10 @@ if (Test-Path -LiteralPath $resolvedOutput) {
     if(-not($identity.FinalPath+'\').StartsWith($tempIdentity.FinalPath.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Fixture root does not resolve below the canonical system temporary directory.'}
     $markerData=Get-Content -LiteralPath $marker -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop
     if([string]$markerData.magic -ne 'WorkspaceShareFixtures' -or [string]$markerData.identity -ne $identity.Identity -or [string]$markerData.finalPath -ne $identity.FinalPath){throw 'Fixture safety marker does not match the current canonical root identity.'}
+    # Reparse-Points zuerst nicht-rekursiv entfernen, damit der rekursive Löschlauf keine Junction-Ziele berührt.
+    foreach($reparseItem in @(Get-ChildItem -LiteralPath $resolvedOutput -Recurse -Force -Attributes ReparsePoint -ErrorAction Stop)){
+        if($reparseItem.PSIsContainer){[IO.Directory]::Delete($reparseItem.FullName)}else{Remove-Item -LiteralPath $reparseItem.FullName -Force}
+    }
     Remove-Item -LiteralPath $resolvedOutput -Recurse -Force
 }
 New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
@@ -95,11 +99,14 @@ $link = Join-Path $reparse 'junction-outside'
 try {
     cmd.exe /c "mklink /J `"$link`" `"$target`"" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning 'Junction konnte nicht erstellt werden; Fixture 06 ist unvollständig.'
+        throw 'mklink /J lieferte einen Fehlercode.'
+    }
+    if (-not (Test-Path -LiteralPath $link) -or ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        throw 'Die Junction wurde nicht als Reparse-Point angelegt.'
     }
 }
 catch {
-    Write-Warning 'Junction konnte nicht erstellt werden; Fixture 06 ist unvollständig.'
+    throw ('Junction konnte nicht erstellt werden; Fixture 06 ist unvollständig: ' + $_.Exception.Message)
 }
 
 if ($IncludeLargeFiles) {

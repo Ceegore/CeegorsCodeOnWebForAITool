@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$Hostname)
 
@@ -13,7 +13,7 @@ function Resolve-Addresses {
         try {
             $parameters = @{ Name = $Name; Type = $type; DnsOnly = $true; QuickTimeout=$true; ErrorAction = 'Stop' }
             if ($Server) { $parameters.Server = $Server }
-            $addresses += @(Resolve-DnsName @parameters | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
+            $addresses += @(Resolve-DnsName @parameters | Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
         }
         catch {}
     }

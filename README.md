@@ -39,7 +39,7 @@ werden.
 Öffne PowerShell in diesem Ordner, zum Beispiel:
 
 ```powershell
-Set-Location "C:\Projects\AITunnelTool\WorkspaceShare_FINAL"
+Set-Location "<Pfad zum Ordner WorkspaceShare_FINAL>"
 ```
 
 Falls die Dateien aus einem ZIP-Archiv stammen und Windows sie blockiert hat,
@@ -58,15 +58,29 @@ Schließen des Fensters automatisch verloren und ändert keine Systemrichtlinie:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 ```
 
+> **Hinweis:** Auf Rechnern mit Smart App Control oder WDAC-Richtlinien sollten
+> `Unblock-File` und `Set-ExecutionPolicy` nur für Dateien verwendet werden, denen
+> du vertraust. Ein `git clone`-Checkout trägt keine Mark-of-the-Web; mit der
+> Richtlinie `RemoteSigned` sind beide Schritte dann nicht nötig. Unter `Restricted`
+> (Standard auf Windows-Clients) bleibt `Set-ExecutionPolicy` erforderlich.
+
 Danach die geprüften Laufzeitabhängigkeiten einrichten:
 
 ```powershell
 .\Install-Dependencies.ps1
 ```
 
+Neuinstallation bei vorhandenem Lockfile:
+
+```powershell
+.\Install-Dependencies.ps1 -Force
+```
+
 `Install.cmd` ist nicht erforderlich und wird nicht empfohlen. Der direkte
 PowerShell-Aufruf liefert verständliche Fehler und vermeidet Warnungen durch
-Batch-zu-PowerShell-Launcher.
+Batch-zu-PowerShell-Launcher. Die vier `.cmd`-Dateien (`Install.cmd`,
+`WorkspaceShare.cmd`, `Test.cmd`, `Stop.cmd`) sind nur Hinweis-Stubs, die eine
+Meldung ausgeben und mit Exit 1 enden; die `.ps1`-Skripte müssen direkt verwendet werden.
 
 Das Installationsskript:
 
@@ -92,12 +106,6 @@ Ohne gültiges Lockfile startet `Share-Workspace.ps1` nicht.
 .\tests\Test-WorkspaceShare.ps1
 ```
 
-Oder:
-
-```bat
-Test.cmd
-```
-
 ## Workspace freigeben
 
 Bleibe im selben Tool-Ordner und führe aus:
@@ -118,8 +126,9 @@ Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopier
 
 | Parameter | Wirkung |
 |---|---|
-| `-Hours 1..24` | Freigabedauer in Stunden; Standard 4 |
-| `-Minutes 1..1440` | alternative Freigabedauer in Minuten |
+| `-Path <Ordner>` | Pflicht, Position 0; existierender Quellordner; ungültiger Pfad: Exit 10 |
+| `-Hours 1..24` | Freigabedauer in Stunden; Standard 4; schließt `-Minutes` aus |
+| `-Minutes 1..1440` | alternative Freigabedauer in Minuten; schließt `-Hours` aus |
 | `-Compression Fast` | ZIP Deflate mit niedriger Kompressionsstufe; Standard |
 | `-Compression Store` | keine Kompression; schnell bei bereits komprimierten Assets |
 | `-IncludeGenerated` | schließt normalerweise ausgelassene Build-/Cache-Ordner ein |
@@ -130,7 +139,7 @@ Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopier
 | `-TunnelProtocol auto\|quic\|http2` | Cloudflared-Transport; Standard `auto` mit QUIC-/HTTP2-Fallback |
 | `-TunnelEdgeIpVersion auto\|4\|6` | Edge-IP-Modus; Standard `auto` |
 | `-HealthCheckSeconds 5..120` | Intervall für lokale, Edge-, DNS- und öffentliche Byte-Prüfungen; Standard 15 |
-| `-HealthFailureThreshold 2..12` | veralteter Kompatibilitätsparameter; Ausfälle werden zeitbasiert bewertet |
+| `-HealthFailureThreshold 2..12` | veralteter Kompatibilitätsparameter; Ausfälle werden zeitbasiert bewertet; Standard 4; andere Werte erzeugen nur eine Warnung |
 | `-TunnelRetries 5..12` | Cloudflared-Verbindungsversuche; Standard 8 |
 | `-KeepDiagnosticsOnError $true\|$false` | speichert bei Fehlern sichere Logs außerhalb des Snapshot-Ordners; Standard `$true` |
 
@@ -138,14 +147,27 @@ Der Link wird standardmäßig einmal ausgegeben und in die Zwischenablage kopier
 
 Während einer aktiven Freigabe kann ein unabhängiger Soak-Test die lokale Route,
 Cloudflared-Readiness und einen exakten öffentlichen Byte-Abruf protokollieren.
-Er fragt die URLs verdeckt ab (oder liest sie aus Prozess-Umgebungsvariablen), damit
-ein Capability-Token nicht in der Befehlszeile oder im Verlauf erscheint.
 
 ```powershell
 .\scripts\Test-TunnelSoak.ps1 `
   -MetricsPort <port> `
   -Minutes 60
 ```
+
+| Parameter | Wirkung |
+|---|---|
+| `-MetricsPort 1..65535` | Pflicht; Port des lokalen Cloudflared-Metrics-Endpunkts (`/ready`) |
+| `-Minutes 1..1440` | Testdauer in Minuten; Standard 60 |
+| `-IntervalSeconds 5..300` | Abstand zwischen den Proben; Standard 15 |
+| `-OutputPath <Datei>` | JSONL-Protokoll; Standard `tunnel-soak-<UTC>.jsonl` im aktuellen Ordner |
+| `-MaximumAllowedOutageSeconds 0..3600` | zulässige Dauer der längsten zusammenhängenden Störung; Standard 0 (dann führt bereits ein fehlgeschlagenes Sample zu Exit 1) |
+
+Die URLs werden aus den Umgebungsvariablen `WORKSPACESHARE_PUBLIC_URL` und
+`WORKSPACESHARE_LOCAL_URL` gelesen (danach aus dem Prozess entfernt) oder sicher
+abgefragt. URL-Argumente auf der Befehlszeile werden abgelehnt (Exit 2), damit ein
+Capability-Token nicht in Prozesslisten oder im Verlauf erscheint.
+
+Exit-Codes von `Test-TunnelSoak`: `0` gesund, `1` Ausfall, `2` ungültige Eingabe.
 
 Vor einer echten Langzeitabnahme muss der ausgegebene Quick-Tunnel-Hostname auch
 über den normalen Windows-DNS-Resolver erreichbar sein. Der Preflight schreibt
@@ -167,7 +189,12 @@ Optional im freizugebenden Workspace:
 .workspace-share.exclude.txt
 ```
 
-Syntax: einfache 7-Zip-Wildcards, keine Gitignore-Semantik.
+Syntax: PowerShell-`-like`-Wildcards, nämlich `*` (beliebig viele Zeichen) und `?`
+(ein Zeichen). `[` und `]` gelten wörtlich (z. B. `pages\[id]` für Next.js-Routen),
+es gibt keine Zeichenklassen. Keine Gitignore-Semantik und keine 7-Zip-Syntax.
+Ein Muster trifft den relativen Pfad, den Dateinamen oder einen beliebigen einzelnen
+Pfadbestandteil. Ein nackter Name wie `HugeRawAssets` trifft in jeder Tiefe,
+`HugeRawAssets\*` nur im Workspace-Root.
 
 Beispiel:
 
@@ -178,7 +205,14 @@ HugeRawAssets\*
 *.blend1
 ```
 
-Die Pflichtausschlüsse aus `config\mandatory-excludes.txt` können projektseitig nicht aufgehoben werden.
+Die Pflichtausschlüsse aus `config\mandatory-excludes.txt` können projektseitig nicht
+aufgehoben werden. Dazu gehören Git-Verzeichnisse sowie Zugangsdaten-Dateien und
+-Ordner wie `.ssh`, `.aws`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`,
+`*.tfstate` und `*.tfvars`; sie werden stillschweigend ausgelassen.
+
+Private-Key- und Passwortdatenbank-Dateien (`*.pem`, `*.key`, `*.pfx`, `*.ppk`,
+`*.kdbx`, `id_rsa`, `id_ecdsa`, `id_dsa`, `id_ed25519`, `.env`) blockieren die
+Freigabe mit Exit 22. Beispieldateien wie `.env.example` sind davon ausgenommen.
 
 ## Snapshot-Konsistenz
 
@@ -209,12 +243,6 @@ vorhanden, beendet er anschließend das in den Sitzungsmetadaten gespeicherte Jo
 Object und prüft die einzelnen Prozessidentitäten als Fallback. `-KeepArchives`
 oder ein vorhandener `keep.archive`-Marker betrifft nur die lokale Aufbewahrung.
 
-Oder:
-
-```bat
-Stop.cmd
-```
-
 ## Test-Fixtures
 
 ```powershell
@@ -244,6 +272,8 @@ dist\WorkspaceShare-3.1.0-internal.zip
 dist\WorkspaceShare-3.1.0-internal.zip.sha256.txt
 ```
 
+Das ZIP enthält außerdem die `LICENSE` des Projekts.
+
 ## Laufzeitdaten
 
 ```text
@@ -256,6 +286,7 @@ dist\WorkspaceShare-3.1.0-internal.zip.sha256.txt
 
 | Bereich | Code |
 |---|---:|
+| Normaler Ablauf oder manueller Stopp | 0 |
 | Umgebung/Parameter | 10 |
 | Dependency-Lock/Hash | 11 |
 | Workspace-Lesbarkeit/Reparse | 20 |
@@ -268,6 +299,8 @@ dist\WorkspaceShare-3.1.0-internal.zip.sha256.txt
 | Tunnel-URL | 42 |
 | öffentliche Gates | 43 |
 | Laufzeit/unerwarteter Prozessabbruch | 50 |
+
+Exit-Code 1 ohne Meldung deutet auf einen PowerShell-Startfehler (z. B. Ausführungsrichtlinie) hin.
 
 ## Bewusste Grenzen
 

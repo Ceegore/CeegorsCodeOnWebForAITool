@@ -7,6 +7,7 @@ hineinkopiert und keine veränderten Binärdateien verteilt.
 ## miniserve
 
 - Projekt: svenstaro/miniserve
+- Version: 0.35.0
 - Lizenz: MIT
 - Verwendung: read-only Auslieferung genau einer Snapshot-Datei über HTTP
 - Quelle: https://github.com/svenstaro/miniserve
@@ -15,14 +16,16 @@ hineinkopiert und keine veränderten Binärdateien verteilt.
 ## cloudflared
 
 - Projekt: cloudflare/cloudflared
+- Version: 2026.7.2
 - Lizenz: Apache License 2.0
 - Verwendung: ausgehender Cloudflare Quick Tunnel
 - Quelle: https://github.com/cloudflare/cloudflared
-- Mitzuliefern: LICENSE und NOTICE der verwendeten Version
+- Mitzuliefern: LICENSE (das Installationsskript legt die Upstream-LICENSE unter `bin\licenses\` ab)
 
 ## 7-Zip / 7za.exe
 
 - Projekt: 7-Zip
+- Version: 26.02
 - Lizenz: überwiegend GNU LGPL; zusätzliche Bestandteile und Hinweise beachten
 - Verwendung: Erstellen, Testen und Auflisten des ZIP64-Snapshots
 - Quelle und Quellcodehinweis: https://www.7-zip.org/
@@ -35,6 +38,7 @@ hineinkopiert und keine veränderten Binärdateien verteilt.
 ## Gitleaks
 
 - Projekt: gitleaks/gitleaks
+- Version: 8.30.1
 - Lizenz: MIT
 - Verwendung: optionale, standardmäßig aktive Secret-Prüfung
 - Quelle: https://github.com/gitleaks/gitleaks
