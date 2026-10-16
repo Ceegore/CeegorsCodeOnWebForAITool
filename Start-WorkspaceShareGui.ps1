@@ -7,13 +7,24 @@ param(
     [switch]$NoBrowser,
     [string]$InstanceFile,
     [switch]$TestMode,
-    [string]$TestShareScript
+    [string]$TestShareScript,
+    [int64]$MaxDropBytes = 4GB,
+    [int]$MaxDropFiles = 10000,
+    [string]$DataRootOverride
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not [string]::IsNullOrEmpty($TestShareScript) -and -not $TestMode) {
     [Console]::Error.WriteLine('-TestShareScript ist nur zusammen mit -TestMode erlaubt.')
+    exit 10
+}
+if (-not [string]::IsNullOrEmpty($DataRootOverride) -and -not $TestMode) {
+    [Console]::Error.WriteLine('-DataRootOverride ist nur zusammen mit -TestMode erlaubt.')
+    exit 10
+}
+if ($MaxDropBytes -lt 1 -or $MaxDropFiles -lt 1) {
+    [Console]::Error.WriteLine('Ungültige Drop-Limits.')
     exit 10
 }
 if ($Port -lt 0 -or $Port -gt 65535) {
@@ -38,8 +49,20 @@ if ($TestMode -and -not [string]::IsNullOrEmpty($TestShareScript)) {
     }
     $ShareScript = (Resolve-Path -LiteralPath $TestShareScript).ProviderPath
 }
+# Data folder: the platform's per-user folder; tests may point it elsewhere (never the real one).
+$StaleDropCleanup = $true
+if ([string]::IsNullOrWhiteSpace($DataRootOverride)) {
+    $DataRoot = Get-WsDataRoot
+    # -TestMode without an override must not delete anything in the real data folder at start.
+    if ($TestMode) { $StaleDropCleanup = $false }
+}
+else {
+    $DataRoot = [IO.Path]::GetFullPath($DataRootOverride)
+    [void][IO.Directory]::CreateDirectory($DataRoot)
+}
+$DropsRoot = [IO.Path]::GetFullPath((Join-Path $DataRoot 'drops'))
 if ([string]::IsNullOrWhiteSpace($InstanceFile)) {
-    $InstanceFile = Join-Path (Get-WsDataRoot) 'gui-instance.json'
+    $InstanceFile = Join-Path $DataRoot 'gui-instance.json'
 }
 $InstanceFile = [IO.Path]::GetFullPath($InstanceFile)
 
@@ -122,6 +145,11 @@ $script:QuitStopSent = $false
 $script:QuitKillSw = $null
 $script:Token = ''
 $script:BoundPort = 0
+$script:CurrentDrop = $null
+$script:PendingDeletes = New-Object 'System.Collections.Generic.List[string]'
+$script:PendingSw = [Diagnostics.Stopwatch]::StartNew()
+$script:PathComparison = [StringComparison]::Ordinal
+if ($script:Platform -eq 'windows') { $script:PathComparison = [StringComparison]::OrdinalIgnoreCase }
 
 function New-ShareState {
     return @{
@@ -334,6 +362,8 @@ function Complete-Share {
     $script:ExitSeen = $null
     $script:StopSw = $null
     $script:KillSent = $false
+    # The share is over: a drop folder that was shared is not needed any more.
+    if ($null -ne $script:CurrentDrop -and $script:CurrentDrop.InUse) { Remove-CurrentDrop }
 }
 
 function Update-Child {
@@ -421,7 +451,117 @@ function Get-StateObject {
         message = $s.message
         log = [string[]]$script:Log.ToArray()
         request = $s.request
+        drop = (Get-DropState)
+        limits = [ordered]@{ maxDropBytes = [int64]$MaxDropBytes; maxDropFiles = [int]$MaxDropFiles }
     }
+}
+
+# ---------------------------------------------------------------- drop folder (GUI_CONTRACT section 7)
+
+function Get-DropState {
+    $d = $script:CurrentDrop
+    if ($null -eq $d) { return $null }
+    return [ordered]@{ id = $d.Id; path = $d.Leaf; files = [int]$d.Files; totalBytes = [int64]$d.Bytes; finished = [bool]$d.Finished }
+}
+
+function Remove-DropDirectory {
+    # Deletes a folder tree; when something is locked the path is retried later (loop / exit).
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    try {
+        if ([IO.Directory]::Exists($Path)) { [IO.Directory]::Delete($Path, $true) }
+    }
+    catch {
+        if (-not $script:PendingDeletes.Contains($Path)) { $script:PendingDeletes.Add($Path) }
+        Write-ConsoleLog ('Drop-Ordner konnte noch nicht gelöscht werden: ' + $_.Exception.Message)
+    }
+}
+
+function Clear-PendingDeletes {
+    if ($script:PendingDeletes.Count -eq 0) { return }
+    $paths = @($script:PendingDeletes.ToArray())
+    $script:PendingDeletes.Clear()
+    foreach ($p in $paths) { Remove-DropDirectory $p }
+}
+
+function Remove-CurrentDrop {
+    $d = $script:CurrentDrop
+    $script:CurrentDrop = $null
+    if ($null -eq $d) { return }
+    Remove-DropDirectory $d.Root
+}
+
+function Clear-StaleDrops {
+    # Backend start: this process is the only instance, so every existing drop folder is stale.
+    if (-not [IO.Directory]::Exists($DropsRoot)) { return }
+    foreach ($dir in [IO.Directory]::GetDirectories($DropsRoot)) { Remove-DropDirectory $dir }
+}
+
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    return [string]::Equals($A, $B, $script:PathComparison)
+}
+
+function Test-IsInsidePath {
+    # True when $Path is $Root itself or below it.
+    param([string]$Path, [string]$Root)
+    if (Test-SamePath $Path $Root) { return $true }
+    $sep = [string][IO.Path]::DirectorySeparatorChar
+    $prefix = $Root.TrimEnd('\', '/') + $sep
+    return $Path.StartsWith($prefix, $script:PathComparison)
+}
+
+function Convert-DropRelativePath {
+    # Validates the relative path of an uploaded file (rules of GUI_CONTRACT 7.2). Returns the
+    # normalized path ('/' separated) or $null.
+    param([AllowNull()][string]$Rel)
+    if ([string]::IsNullOrEmpty($Rel) -or $Rel.Length -gt 400) { return $null }
+    foreach ($ch in $Rel.ToCharArray()) {
+        if ([char]::IsControl($ch) -or $ch -eq [char]0xFFFD) { return $null }
+    }
+    $segments = $Rel.Split('/')
+    if ($segments.Count -lt 1 -or $segments.Count -gt 64) { return $null }
+    foreach ($seg in $segments) {
+        if ($seg.Length -lt 1 -or $seg.Length -gt 255) { return $null }
+        if ($seg -eq '.' -or $seg -eq '..') { return $null }
+        if ($seg.IndexOfAny([char[]]'<>:"\|?*') -ge 0) { return $null }
+        if ($seg.EndsWith('.') -or $seg.EndsWith(' ')) { return $null }
+        $dot = $seg.IndexOf('.')
+        $stem = $seg
+        if ($dot -ge 0) { $stem = $seg.Substring(0, $dot) }
+        if ($stem.TrimEnd(' ') -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') { return $null }
+    }
+    return ($segments -join '/')
+}
+
+function Get-DropQueryValues {
+    # Parses 'drop=..&path=..' (percent-decoded). Returns $null on duplicates or malformed input.
+    param([string]$Query)
+    $values = @{}
+    if ([string]::IsNullOrEmpty($Query)) { return $values }
+    foreach ($pair in $Query.Split('&')) {
+        if ($pair.Length -eq 0) { continue }
+        $eq = $pair.IndexOf('=')
+        if ($eq -lt 1) { return $null }
+        $name = $pair.Substring(0, $eq)
+        if ($values.ContainsKey($name)) { return $null }
+        try { $values[$name] = [Uri]::UnescapeDataString($pair.Substring($eq + 1)) } catch { return $null }
+    }
+    return $values
+}
+
+function Get-FreeSpaceBytes {
+    # Free bytes on the data drive, or -1 when it cannot be determined.
+    try {
+        $drivePath = $DataRoot
+        if ($script:Platform -eq 'windows') {
+            $drivePath = [IO.Path]::GetPathRoot($DataRoot)
+            if ([string]::IsNullOrEmpty($drivePath) -or $drivePath.StartsWith('\\')) { return [int64]-1 }
+        }
+        $di = New-Object System.IO.DriveInfo -ArgumentList $drivePath
+        return [int64]$di.AvailableFreeSpace
+    }
+    catch { return [int64]-1 }
 }
 
 # ---------------------------------------------------------------- API handlers (return @{Status; Body})
@@ -458,6 +598,13 @@ function Invoke-ApiStart {
     }
     catch {
         return (New-ApiResult 400 @{ error = 'Der Ordner existiert nicht oder der Pfad ist ungültig.' })
+    }
+    # Only the finished drop of this backend may be shared from inside the drops folder.
+    $useDrop = $false
+    if (Test-IsInsidePath $fullPath $DropsRoot) {
+        $d = $script:CurrentDrop
+        if ($null -ne $d -and $d.Finished -and -not $d.InUse -and (Test-SamePath $fullPath $d.Leaf)) { $useDrop = $true }
+        else { return (New-ApiResult 400 @{ error = 'Dieser Ordner ist nicht freigebbar.' }) }
     }
     $minutes = ConvertTo-StrictInt (Get-EventProp $obj 'minutes')
     if ($null -eq $minutes -or $minutes -lt 1 -or $minutes -gt 1440) {
@@ -510,6 +657,7 @@ function Invoke-ApiStart {
     }
     $script:LastPath = $fullPath
     $script:Share.phase = 'starting'
+    if ($useDrop) { $script:CurrentDrop.InUse = $true }
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
@@ -522,6 +670,7 @@ function Invoke-ApiStart {
         try { $proc.Dispose() } catch { }
         $script:Share.phase = 'error'
         $script:Share.message = 'Der Freigabeprozess konnte nicht gestartet werden.'
+        if ($useDrop) { Remove-CurrentDrop }
         Write-ConsoleLog ('Start fehlgeschlagen: ' + $_.Exception.Message)
         return (New-ApiResult 500 @{ error = 'Der Freigabeprozess konnte nicht gestartet werden.' })
     }
@@ -578,22 +727,318 @@ function Invoke-ApiQuit {
     return (New-ApiResult 200 @{ ok = $true })
 }
 
-# ---------------------------------------------------------------- HTTP plumbing
+function Test-DropPhaseBusy {
+    return ($script:QuitRequested -or (Test-ShareBusyPhase))
+}
 
-function Send-ErrorJson {
-    param($Stream, [int]$Status)
-    $text = switch ($Status) {
+function New-DropId {
+    $bytes = New-Object byte[] 16
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Get-RequestDropId {
+    # dropId from a JSON body, or $null when the body or the id is malformed.
+    param($Req)
+    $obj = $null
+    try { $obj = $Req.Body | ConvertFrom-Json } catch { $obj = $null }
+    if ($null -eq $obj -or $obj -isnot [pscustomobject]) { return $null }
+    $id = Get-EventProp $obj 'dropId'
+    if ($id -isnot [string] -or $id -cnotmatch '^[0-9a-f]{32}$') { return $null }
+    return $id
+}
+
+function Invoke-ApiDropBegin {
+    if (Test-DropPhaseBusy) {
+        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+    }
+    Remove-CurrentDrop
+    $id = New-DropId
+    $leafName = 'Dateien-' + (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+    $root = Join-Path $DropsRoot $id
+    $leaf = Join-Path $root $leafName
+    try { [void][IO.Directory]::CreateDirectory($leaf) }
+    catch {
+        Write-ConsoleLog ('Drop-Ordner konnte nicht angelegt werden: ' + $_.Exception.Message)
+        return (New-ApiResult 500 @{ error = 'Der temporäre Ordner konnte nicht angelegt werden.' })
+    }
+    $script:CurrentDrop = @{
+        Id = $id; Root = $root; Leaf = [IO.Path]::GetFullPath($leaf)
+        Files = 0; Bytes = [int64]0; Finished = $false; InUse = $false
+        Paths = (New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase))
+    }
+    return (New-ApiResult 200 @{ dropId = $id })
+}
+
+function Invoke-ApiDropFinish {
+    param($Req)
+    if (Test-DropPhaseBusy) {
+        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+    }
+    $id = Get-RequestDropId $Req
+    $d = $script:CurrentDrop
+    if ($null -eq $id -or $null -eq $d -or $id -cne $d.Id) {
+        return (New-ApiResult 400 @{ error = 'Unbekannte Drop-ID.' })
+    }
+    if ($d.Files -lt 1) {
+        return (New-ApiResult 400 @{ error = 'Es wurde keine Datei übertragen.' })
+    }
+    $d.Finished = $true
+    return (New-ApiResult 200 ([ordered]@{ path = $d.Leaf; files = [int]$d.Files; totalBytes = [int64]$d.Bytes }))
+}
+
+function Invoke-ApiDropDiscard {
+    param($Req)
+    if (Test-DropPhaseBusy) {
+        return (New-ApiResult 409 @{ error = 'Es läuft bereits eine Freigabe.' })
+    }
+    $id = Get-RequestDropId $Req
+    $d = $script:CurrentDrop
+    if ($null -eq $id -or $null -eq $d -or $id -cne $d.Id) {
+        return (New-ApiResult 400 @{ error = 'Unbekannte Drop-ID.' })
+    }
+    Remove-CurrentDrop
+    return (New-ApiResult 200 @{ ok = $true })
+}
+
+function Get-ErrorText {
+    param([int]$Status)
+    switch ($Status) {
         400 { 'Ungültige Anfrage.' }
         401 { 'Nicht autorisiert.' }
         403 { 'Zugriff verweigert.' }
         404 { 'Nicht gefunden.' }
         405 { 'Methode nicht erlaubt.' }
         408 { 'Zeitüberschreitung.' }
+        409 { 'Konflikt.' }
+        411 { 'Content-Length fehlt.' }
         413 { 'Anfrage zu groß.' }
         431 { 'Anfrage-Header zu groß.' }
+        507 { 'Nicht genügend Speicherplatz.' }
         default { 'Interner Fehler.' }
     }
-    Write-WsJsonResponse -Stream $Stream -Status $Status -Object @{ error = $text }
+}
+
+function Skip-RequestBody {
+    # After an early rejection: read and discard (a bounded amount of) the body so the peer can finish
+    # sending and sees the response instead of a connection reset.
+    param($Stream, $Client, $Req, [int64]$Limit)
+    try {
+        if ($Req.Headers.ContainsKey('Expect')) { return }
+        $remaining = [int64]$Req.ContentLength - [int64]$Req.BodyPrefix.Length
+        if ($remaining -le 0) { return }
+        if ($remaining -gt $Limit) { $remaining = $Limit }
+        try { $Client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send) } catch { }
+        $buf = New-Object byte[] 65536
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($remaining -gt 0 -and $sw.Elapsed.TotalSeconds -lt 20) {
+            $Stream.ReadTimeout = 2000
+            $want = $buf.Length
+            if ($remaining -lt $want) { $want = [int]$remaining }
+            $n = $Stream.Read($buf, 0, $want)
+            if ($n -le 0) { break }
+            $remaining -= $n
+        }
+    }
+    catch { }
+}
+
+function Send-UploadReject {
+    param($Stream, $Client, $Req, [int]$Status, [string]$Message, [int64]$DrainLimit = 67108864)
+    if ([string]::IsNullOrEmpty($Message)) { $Message = Get-ErrorText $Status }
+    try { Write-WsJsonResponse -Stream $Stream -Status $Status -Object @{ error = $Message } } catch { return }
+    Skip-RequestBody $Stream $Client $Req $DrainLimit
+}
+
+function Get-DeepestException {
+    param($Exception)
+    $e = $Exception
+    while ($null -ne $e.InnerException) { $e = $e.InnerException }
+    return $e
+}
+
+function Get-IoFailureStatus {
+    # Maps a failure while creating or writing a drop file to an HTTP status.
+    param($Exception, [string]$FullPath)
+    $e = Get-DeepestException $Exception
+    if ($e -is [System.IO.PathTooLongException] -or $e -is [System.ArgumentException] -or $e -is [System.NotSupportedException]) { return 400 }
+    $code = 0
+    try { $code = [int]($e.HResult -band 0xFFFF) } catch { $code = 0 }
+    if ($code -eq 112 -or $code -eq 39) { return 507 }
+    if ($e -is [System.IO.IOException] -and -not [string]::IsNullOrEmpty($FullPath) -and (Test-Path -LiteralPath $FullPath)) { return 409 }
+    if ($e -is [System.IO.IOException] -and $e.Message -match '(?i)no space|disk full') { return 507 }
+    return 500
+}
+
+function Remove-PartialDropFile {
+    param([string]$FullPath, [string]$Leaf)
+    for ($i = 0; $i -lt 5; $i++) {
+        try { if ([IO.File]::Exists($FullPath)) { [IO.File]::Delete($FullPath) }; break }
+        catch { Start-Sleep -Milliseconds 100 }
+    }
+    # Remove directories this upload created (empty ones only), up to the drop leaf.
+    try {
+        $p = [IO.Path]::GetDirectoryName($FullPath)
+        $sepChar = [string][IO.Path]::DirectorySeparatorChar
+        while (-not [string]::IsNullOrEmpty($p) -and $p.StartsWith($Leaf + $sepChar, $script:PathComparison)) {
+            if (-not [IO.Directory]::Exists($p) -or [IO.Directory]::GetFileSystemEntries($p).Length -gt 0) { break }
+            [IO.Directory]::Delete($p)
+            $p = [IO.Path]::GetDirectoryName($p)
+        }
+    }
+    catch { }
+}
+
+function Invoke-DropFileUpload {
+    # POST /api/drop/file?drop=<id>&path=<relative path>: the body streams straight to disk.
+    # Called with a -HeadersOnly request, before anything of the body has been read.
+    param($Req, $Stream, $Client)
+    $rejectSmall = [int64]1048576
+    $chk = Test-WsRequestAllowed -Request $Req -Port $script:BoundPort -Token $script:Token -RequireToken
+    if (-not $chk.Allowed) {
+        Send-UploadReject $Stream $Client $Req ([int]$chk.Status) '' $rejectSmall
+        return
+    }
+    if (Test-DropPhaseBusy) {
+        Send-UploadReject $Stream $Client $Req 409 'Es läuft bereits eine Freigabe.'
+        return
+    }
+    $q = Get-DropQueryValues $Req.Query
+    $d = $script:CurrentDrop
+    if ($null -eq $q -or -not $q.ContainsKey('drop') -or -not $q.ContainsKey('path') -or $null -eq $d -or [string]$q['drop'] -cne $d.Id) {
+        Send-UploadReject $Stream $Client $Req 400 'Unbekannte Drop-ID.'
+        return
+    }
+    if ($d.Finished) {
+        Send-UploadReject $Stream $Client $Req 409 'Der Drop ist bereits abgeschlossen.'
+        return
+    }
+    $rel = Convert-DropRelativePath ([string]$q['path'])
+    if ($null -eq $rel) {
+        Send-UploadReject $Stream $Client $Req 400 'Ungültiger Datei- oder Ordnername.'
+        return
+    }
+    $leaf = [string]$d.Leaf
+    $sepChar = [string][IO.Path]::DirectorySeparatorChar
+    $full = $null
+    try {
+        $full = [IO.Path]::GetFullPath([IO.Path]::Combine($leaf, $rel.Replace('/', $sepChar)))
+        if (-not $full.StartsWith($leaf + $sepChar, $script:PathComparison)) { $full = $null }
+    }
+    catch { $full = $null }
+    if ($null -eq $full) {
+        Send-UploadReject $Stream $Client $Req 400 'Ungültiger oder zu langer Pfad.'
+        return
+    }
+    # Duplicate, or a file/folder name clash with an earlier path.
+    $clash = $d.Paths.Contains($rel)
+    $segs = $rel.Split('/')
+    for ($i = 1; $i -lt $segs.Count -and -not $clash; $i++) {
+        if ($d.Paths.Contains((($segs[0..($i - 1)]) -join '/'))) { $clash = $true }
+    }
+    if (-not $clash -and (Test-Path -LiteralPath $full)) { $clash = $true }
+    if ($clash) {
+        Send-UploadReject $Stream $Client $Req 409 'Dieser Pfad wurde bereits übertragen.'
+        return
+    }
+    $len = [int64]$Req.ContentLength
+    if ($len -lt 0) {
+        Send-UploadReject $Stream $Client $Req 411 '' $rejectSmall
+        return
+    }
+    if (([int64]$d.Files + 1) -gt [int64]$MaxDropFiles) {
+        Send-UploadReject $Stream $Client $Req 413 'Zu viele Dateien.'
+        return
+    }
+    if ($len -gt $MaxDropBytes -or ([int64]$d.Bytes + $len) -gt $MaxDropBytes) {
+        Send-UploadReject $Stream $Client $Req 413 'Die Dateien sind zu groß.'
+        return
+    }
+    $free = Get-FreeSpaceBytes
+    if ($free -ge 0 -and $free -lt ($len + [int64]536870912)) {
+        Send-UploadReject $Stream $Client $Req 507 'Nicht genügend Speicherplatz.'
+        return
+    }
+
+    $fs = $null
+    try {
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($full))
+        $fs = New-Object System.IO.FileStream -ArgumentList $full, ([IO.FileMode]::CreateNew), ([IO.FileAccess]::Write), ([IO.FileShare]::None), 65536
+    }
+    catch {
+        if ($null -ne $fs) { try { $fs.Dispose() } catch { } }
+        $st = Get-IoFailureStatus $_.Exception $full
+        Write-ConsoleLog ('Drop-Datei konnte nicht angelegt werden: ' + $_.Exception.Message)
+        Send-UploadReject $Stream $Client $Req $st ''
+        return
+    }
+
+    if ($Req.Headers.ContainsKey('Expect') -and [string]$Req.Headers['Expect'] -ieq '100-continue') {
+        try {
+            $cont = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n")
+            $Stream.Write($cont, 0, $cont.Length)
+            $Stream.Flush()
+        }
+        catch { }
+    }
+
+    $failStatus = 0
+    $failText = ''
+    try {
+        try { $Client.ReceiveTimeout = 30000 } catch { }
+        Copy-WsHttpBody -Stream $Stream -Request $Req -Destination $fs -MaxBytes ([int64]$MaxDropBytes - [int64]$d.Bytes) -IdleTimeoutMs 30000
+        $fs.Flush()
+    }
+    catch {
+        $ex = $_.Exception
+        if ($ex.Data.Contains('WsHttpStatus')) { $failStatus = [int]$ex.Data['WsHttpStatus'] }
+        else { $failStatus = Get-IoFailureStatus $ex $null; if ($failStatus -eq 409) { $failStatus = 500 } }
+        $failText = $ex.Message
+        Write-ConsoleLog ('Drop-Upload fehlgeschlagen (' + $failStatus + '): ' + $failText)
+    }
+    finally {
+        try { $fs.Dispose() } catch { if ($failStatus -eq 0) { $failStatus = 500 } }
+    }
+    if ($failStatus -ne 0) {
+        Remove-PartialDropFile $full $leaf
+        # A dead or stalled peer gets no drain; otherwise the unread rest of the body is discarded.
+        $drain = [int64]67108864
+        if ($failStatus -eq 400 -or $failStatus -eq 408) { $drain = [int64]0 }
+        Send-UploadReject $Stream $Client $Req $failStatus '' $drain
+        return
+    }
+    $d.Files = [int]$d.Files + 1
+    $d.Bytes = [int64]$d.Bytes + $len
+    [void]$d.Paths.Add($rel)
+    Write-WsJsonResponse -Stream $Stream -Status 200 -Object ([ordered]@{ ok = $true; bytes = $len })
+}
+
+# ---------------------------------------------------------------- HTTP plumbing
+
+function Send-ErrorJson {
+    param($Stream, [int]$Status)
+    Write-WsJsonResponse -Stream $Stream -Status $Status -Object @{ error = (Get-ErrorText $Status) }
+}
+
+function Complete-RequestBody {
+    # Reads the (small) JSON body of a request that was parsed with -HeadersOnly; same limits and
+    # statuses as Read-WsHttpRequest without the switch (413 / 400 / 408).
+    param($Req, $Stream)
+    $len = [int64]$Req.ContentLength
+    if ($len -le 0) { return $Req }
+    $ms = New-Object System.IO.MemoryStream
+    Copy-WsHttpBody -Stream $Stream -Request $Req -Destination $ms -MaxBytes 65536 -IdleTimeoutMs 5000
+    try {
+        $strict = New-Object System.Text.UTF8Encoding ($false, $true)
+        $Req.Body = $strict.GetString($ms.ToArray())
+    }
+    catch {
+        $ex = New-Object System.Exception 'Request body is not valid UTF-8.'
+        $ex.Data['WsHttpStatus'] = 400
+        throw $ex
+    }
+    return $Req
 }
 
 function Invoke-Route {
@@ -650,6 +1095,22 @@ function Invoke-Route {
             if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
             $result = Invoke-ApiQuit
         }
+        '/api/drop/begin' {
+            if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
+            $result = Invoke-ApiDropBegin
+        }
+        '/api/drop/finish' {
+            if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
+            $result = Invoke-ApiDropFinish $Req
+        }
+        '/api/drop/discard' {
+            if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
+            $result = Invoke-ApiDropDiscard $Req
+        }
+        '/api/drop/file' {
+            # POST is handled earlier by Invoke-DropFileUpload; anything else is a wrong method.
+            Send-ErrorJson $Stream 405; return
+        }
         default { Send-ErrorJson $Stream 404; return }
     }
     Write-WsJsonResponse -Stream $Stream -Status $result.Status -Object $result.Body
@@ -663,7 +1124,15 @@ function Invoke-Connection {
         $Client.SendTimeout = 5000
         $stream = $Client.GetStream()
         $req = $null
-        try { $req = Read-WsHttpRequest -Stream $stream -TimeoutMs 5000 }
+        try {
+            $req = Read-WsHttpRequest -Stream $stream -TimeoutMs 5000 -HeadersOnly
+            if ($req.Method -ceq 'POST' -and $req.Path -ceq '/api/drop/file') {
+                # File uploads stream straight to disk; authorization happens before any body byte is read.
+                Invoke-DropFileUpload $req $stream $Client
+                return
+            }
+            $req = Complete-RequestBody $req $stream
+        }
         catch {
             $status = 0
             if ($_.Exception.Data.Contains('WsHttpStatus')) { $status = [int]$_.Exception.Data['WsHttpStatus'] }
@@ -720,6 +1189,8 @@ $instanceWritten = $false
 $exitCode = 0
 try {
     $script:Token = New-GuiToken
+    # Single instance holds the mutex: every drop folder found now is left over from a crashed run.
+    if ($StaleDropCleanup) { try { Clear-StaleDrops } catch { Write-ConsoleLog ('Alte Drop-Ordner: ' + $_.Exception.Message) } }
     $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList ([System.Net.IPAddress]::Loopback), $Port
     try { $listener.ExclusiveAddressUse = $true } catch { }
     $listener.Start()
@@ -747,6 +1218,10 @@ try {
         $busy = $false
         try {
             Update-Child
+            if ($script:PendingDeletes.Count -gt 0 -and $script:PendingSw.Elapsed.TotalSeconds -gt 5) {
+                $script:PendingSw.Restart()
+                Clear-PendingDeletes
+            }
             while ($listener.Pending() -and $pending.Count -lt 32) {
                 $c = $listener.AcceptTcpClient()
                 $pending.Add(@{ Client = $c; Sw = [Diagnostics.Stopwatch]::StartNew() })
@@ -806,6 +1281,7 @@ catch {
 }
 finally {
     try { Stop-ShareForShutdown } catch { }
+    try { Remove-CurrentDrop; Clear-PendingDeletes } catch { }
     if ($script:CopiedUrl) { try { [void](Clear-WsClipboardText -Expected $script:CopiedUrl) } catch { } }
     if ($null -ne $listener) { try { $listener.Stop() } catch { } }
     if ($instanceWritten) {

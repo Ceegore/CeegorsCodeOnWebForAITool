@@ -152,3 +152,78 @@ after `ready`; `stopping` after `/api/stop` or `/api/quit`; `ended` when the chi
 `gui\index.html`, `gui\app.js`, `gui\app.css`, `gui\favicon.svg`. Polls `GET /api/state` every
 1000 ms. Hides "Ordner wählen…" when `capabilities.folderPicker` is false (Linux prep).
 Error texts for exit codes come from a table in `app.js` that mirrors the README table.
+
+## 7. Drag & drop of files (contract v1.1)
+
+Goal: files (and optionally folders) dragged from Windows Explorer – or any Linux file
+manager – into the browser page are copied into a private temporary folder, and that
+folder is then shared through the **unchanged** `Share-Workspace.ps1` process, exactly like a
+folder the user picked. Everything here is platform-neutral: the browser File API on the
+client, plain .NET streams on the backend, the folder under `Get-WsDataRoot`. No new
+platform-module function is needed, so it works on Linux as soon as the backend runs on `pwsh`.
+
+### 7.1 Drop folder
+
+- `<DataRoot>/drops/<dropId>/<leaf>`; `dropId` = 32 lowercase hex chars (random);
+  `<leaf>` = `Dateien-yyyyMMdd-HHmmss` (local time). The leaf is the folder that gets shared, so
+  the recipient's ZIP gets a meaningful name. Built with `Join-Path` only.
+- `drops` is a sibling of `sessions`/`staging`/`diagnostics`, never inside them.
+- At most one drop exists at a time. A new `begin` discards the previous unused drop.
+- Cleanup: the backend deletes a drop folder (a) when its share ends (phase `ended`/`error`),
+  (b) on `/api/drop/discard`, (c) on `/api/quit` / backend exit, and (d) at backend start for
+  every drop folder not owned by this process (stale after a crash).
+
+### 7.2 Endpoints (token required, only in phase `idle`/`ended`/`error`, else 409)
+
+| Method + path | Body | 200 response |
+|---|---|---|
+| `POST /api/drop/begin` | `{}` | `{"dropId":"<hex>"}` |
+| `POST /api/drop/file?drop=<dropId>&path=<urlencoded relative path>` | raw file bytes, `Content-Type: application/octet-stream`, `Content-Length` required | `{"ok":true,"bytes":n}` |
+| `POST /api/drop/finish` | `{"dropId":".."}` | `{"path":"<full drop leaf path>","files":n,"totalBytes":n}`; 400 if no file was received |
+| `POST /api/drop/discard` | `{"dropId":".."}` | `{"ok":true}` |
+
+Errors: 400 invalid path/name or unknown dropId; 409 duplicate path or wrong phase;
+411 missing Content-Length; 413 file or total too large; 507 not enough disk space
+(Content-Length + 512 MiB headroom must fit on the data drive). A failed or aborted file
+upload deletes the partial file.
+
+Relative path rules (both OSes, checked on the backend): segments separated by `/`;
+1–64 segments; each segment 1–255 chars; not `.` or `..`; no control chars; none of
+`< > : " \ | ? *`; no trailing dot or space; not a Windows reserved name (`CON`, `PRN`, `AUX`,
+`NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with an extension); whole path at most 400 chars. The
+final full path must stay inside the drop leaf (`GetFullPath` prefix check).
+
+Limits (backend parameters): `-MaxDropBytes` (default 4 GiB, applies per file and in total),
+`-MaxDropFiles` (default 10000).
+
+### 7.3 HTTP module additions
+
+```
+Read-WsHttpRequest ... [-HeadersOnly]
+    -> with -HeadersOnly the body is not read; the result additionally has
+       ContentLength ([int64], -1 if absent) and BodyPrefix ([byte[]] bytes already read past the headers)
+Copy-WsHttpBody -Stream <IO.Stream> -Request <obj from -HeadersOnly> -Destination <IO.Stream>
+                [-MaxBytes <int64>] [-IdleTimeoutMs 30000]
+    -> copies exactly ContentLength bytes (BodyPrefix first) in 64 KiB chunks; throws with
+       Data['WsHttpStatus'] = 400 (stream ended early), 408 (idle timeout), 413 (> MaxBytes)
+```
+
+### 7.4 State object additions
+
+`"drop": null` or `{"id":"..","path":"..","files":n,"totalBytes":n,"finished":true|false}`,
+and `"limits": {"maxDropBytes":n,"maxDropFiles":n}`. When a share is started with
+`path` equal to the finished drop path, the backend marks the drop as in use and deletes it
+after that share ends.
+
+### 7.5 Front end
+
+- A drop zone in the form view ("Dateien oder Ordner hierher ziehen") plus a button
+  "Dateien auswählen…" (`<input type="file" multiple>`, works everywhere, also on Linux).
+- `dragover`/`drop` are prevented on `window`, so a file dropped outside the zone never makes
+  the browser open it.
+- Folders: `DataTransferItem.webkitGetAsEntry()` recursively; relative paths are kept (`/`).
+- Upload: `begin`, then files one after another (`fetch` with the `File` as body), with a
+  progress bar (bytes done / total), then `finish`. On success the folder field shows the drop
+  path read-only plus a summary ("3 Dateien, 12,4 MB") and an "Entfernen" button (`discard`).
+  Picking or typing another folder discards the drop.
+- Client-side pre-checks mirror the limits in `state.limits`; the backend stays authoritative.

@@ -56,12 +56,43 @@
       </details>
     </div>
 
+    <!-- Drag & drop of files / folders -->
+    <div class="dropbox" role="group" aria-label="Dateien ablegen">
+      <div id="dropzone" class="dropzone">
+        <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M12 15V4"/>
+          <path d="M7.5 8.5 12 4l4.5 4.5"/>
+          <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
+        </svg>
+        <p class="dz-text">Dateien oder Ordner hierher ziehen</p>
+        <button type="button" id="btn-files" class="btn btn-secondary">Dateien auswählen…</button>
+        <input type="file" id="file-input" multiple hidden tabindex="-1">
+      </div>
+
+      <div id="upload" class="upload" hidden>
+        <p id="upload-title" class="upload-title">Dateien werden hochgeladen …</p>
+        <progress id="upload-progress" class="progress" max="1000" value="0" aria-labelledby="upload-title"></progress>
+        <p id="upload-file" class="upload-line"></p>
+        <p id="upload-bytes" class="upload-line muted"></p>
+        <div class="actions">
+          <button type="button" id="btn-upload-cancel" class="btn btn-secondary">Abbrechen</button>
+        </div>
+      </div>
+
+      <p id="drop-status" class="dz-status" role="status" aria-live="polite" aria-atomic="true"></p>
+      <p id="drop-error" class="inline-error" role="alert" hidden></p>
+    </div>
+
     <form id="form" novalidate autocomplete="off">
       <div class="field">
         <label for="folder">Ordner</label>
         <div class="row">
           <input type="text" id="folder" name="folder" class="grow" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="C:\Projekte\MeinOrdner">
           <button type="button" id="btn-pick" class="btn btn-secondary" hidden>Ordner wählen…</button>
+        </div>
+        <div id="drop-info" class="drop-info" hidden>
+          <span id="drop-summary" class="drop-summary"></span>
+          <button type="button" id="btn-drop-remove" class="btn btn-secondary">Entfernen</button>
         </div>
       </div>
 
@@ -114,6 +145,7 @@
   <!-- Share: active -->
   <section id="view-active" class="view" hidden>
     <h2>Freigabe aktiv</h2>
+    <p id="shared-from" class="shared-from" hidden></p>
     <div class="field">
       <label for="share-url">Download-Link</label>
       <input type="text" id="share-url" class="url-input" readonly spellcheck="false">

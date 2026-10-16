@@ -86,6 +86,111 @@ Assert-True ((Get-ErrorStatus "GET / HTTP/1.1`r`nHost: a`r`nHost: b`r`n`r`n") -e
 Assert-True ((Get-ErrorStatus "GET / HTTP/1.1`r`nHost x`r`n`r`n") -eq 400) 'header line without colon -> 400'
 Assert-True ((Get-ErrorStatus "GET / HTTP/1.1`r`nHost : x`r`n`r`n") -eq 400) 'space before colon in header name -> 400'
 
+# ---- Read-WsHttpRequest -HeadersOnly / Copy-WsHttpBody ----
+function New-BinaryRequestStream {
+    param([string]$HeadText, [byte[]]$BodyBytes)
+    $hb = $utf8.GetBytes($HeadText)
+    $all = New-Object byte[] ($hb.Length + $BodyBytes.Length)
+    [Array]::Copy($hb, 0, $all, 0, $hb.Length)
+    if ($BodyBytes.Length -gt 0) { [Array]::Copy($BodyBytes, 0, $all, $hb.Length, $BodyBytes.Length) }
+    return (New-Object System.IO.MemoryStream (, $all))
+}
+function Get-Sha256Hex {
+    param([byte[]]$Bytes)
+    $h = [Security.Cryptography.SHA256]::Create()
+    try { return (($h.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $h.Dispose() }
+}
+function Get-RandomBytes {
+    param([int]$Count, [int]$Seed = 4242)
+    $b = New-Object byte[] $Count
+    (New-Object System.Random $Seed).NextBytes($b)
+    return , $b
+}
+function Get-CopyStatus {
+    # WsHttpStatus of a failed Copy-WsHttpBody, 0 when it succeeded, -1 for any other failure.
+    param($Stream, $Request, $Destination, [hashtable]$Params = @{})
+    try { Copy-WsHttpBody -Stream $Stream -Request $Request -Destination $Destination @Params; return 0 }
+    catch {
+        if ($_.Exception.Data.Contains('WsHttpStatus')) { return [int]$_.Exception.Data['WsHttpStatus'] }
+        return -1
+    }
+}
+
+$r = Read-WsHttpRequest -Stream (New-RequestStream "GET /x HTTP/1.1`r`nHost: x`r`n`r`n") -HeadersOnly
+Assert-True ($r.Method -ceq 'GET' -and $r.ContentLength -eq -1 -and $r.ContentLength -is [int64] -and $r.BodyPrefix.Length -eq 0 -and $r.Body -ceq '') 'HeadersOnly: no Content-Length -> ContentLength -1, empty BodyPrefix'
+
+$ms = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 6`r`n`r`nabcdef"
+$r = Read-WsHttpRequest -Stream $ms -HeadersOnly
+Assert-True ($r.ContentLength -eq 6 -and $r.ContentLength -is [int64] -and $r.Body -ceq '' -and $utf8.GetString($r.BodyPrefix) -ceq 'abcdef') 'HeadersOnly: Content-Length and BodyPrefix (body already in the buffer)'
+Assert-True ($r.BodyPrefix -is [byte[]] -and $r.Headers['content-length'] -ceq '6') 'HeadersOnly: BodyPrefix is byte[], headers still parsed'
+
+$r = Read-WsHttpRequest -Stream (New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 3`r`n`r`nabcXYZ") -HeadersOnly
+Assert-True ($utf8.GetString($r.BodyPrefix) -ceq 'abc') 'HeadersOnly: BodyPrefix is capped at Content-Length'
+
+$ms = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 5000000`r`n`r`nabc"
+$r = Read-WsHttpRequest -Stream $ms -HeadersOnly
+Assert-True ($r.ContentLength -eq 5000000 -and $r.BodyPrefix.Length -eq 3) 'HeadersOnly: body above MaxBodyBytes is not rejected'
+Assert-True ((Get-ErrorStatus "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 5000000`r`n`r`nabc") -eq 413) 'without -HeadersOnly the same request is still 413'
+Assert-True ((Get-ErrorStatus "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 1x`r`n`r`na" @{ HeadersOnly = $true }) -eq 400) 'HeadersOnly: non-numeric Content-Length -> 400'
+Assert-True ((Get-ErrorStatus "POST /x HTTP/1.1`r`nHost: x`r`nTransfer-Encoding: chunked`r`n`r`n0`r`n`r`n" @{ HeadersOnly = $true }) -eq 400) 'HeadersOnly: Transfer-Encoding -> 400'
+Assert-True ((Get-ErrorStatus "GET / HTTP/1.1`r`nHost: x`r`n" @{ HeadersOnly = $true }) -eq 400) 'HeadersOnly: incomplete header block -> 400'
+$r = Read-Request "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 2`r`n`r`nok"
+Assert-True ($r.Body -ceq 'ok') 'without -HeadersOnly the body is still read into Body'
+
+# Copy-WsHttpBody on MemoryStreams
+$payload = Get-RandomBytes 200000
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: $($payload.Length)`r`n`r`n" $payload
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$dst = New-Object System.IO.MemoryStream
+$st = Get-CopyStatus $src $r $dst
+Assert-True ($st -eq 0 -and (Get-Sha256Hex $dst.ToArray()) -ceq (Get-Sha256Hex $payload) -and $dst.Length -eq $payload.Length) 'Copy-WsHttpBody: 200000 bytes (prefix + several chunks) copied exactly'
+Assert-True ($src.Position -eq $src.Length) 'Copy-WsHttpBody: stream consumed up to the end of the body'
+
+$trail = $utf8.GetBytes('TRAILING')
+$body70k = Get-RandomBytes 70000 7
+$both = New-Object byte[] ($body70k.Length + $trail.Length)
+[Array]::Copy($body70k, 0, $both, 0, $body70k.Length)
+[Array]::Copy($trail, 0, $both, $body70k.Length, $trail.Length)
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 70000`r`n`r`n" $both
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$dst = New-Object System.IO.MemoryStream
+$st = Get-CopyStatus $src $r $dst
+Assert-True ($st -eq 0 -and $dst.Length -eq 70000 -and (Get-Sha256Hex $dst.ToArray()) -ceq (Get-Sha256Hex $body70k)) 'Copy-WsHttpBody: copies exactly Content-Length bytes even if more data follows'
+Assert-True (($src.Length - $src.Position) -eq $trail.Length) 'Copy-WsHttpBody: does not read past Content-Length (trailing bytes stay on the stream)'
+
+# Body completely inside BodyPrefix: the stream is not touched.
+$src = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 4`r`n`r`nWXYZ"
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$posBefore = $src.Position
+$dst = New-Object System.IO.MemoryStream
+$st = Get-CopyStatus $src $r $dst
+Assert-True ($st -eq 0 -and $utf8.GetString($dst.ToArray()) -ceq 'WXYZ' -and $src.Position -eq $posBefore) 'Copy-WsHttpBody: body fully inside BodyPrefix needs no stream read'
+
+# Content-Length 0
+$src = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 0`r`n`r`n"
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$dst = New-Object System.IO.MemoryStream
+Assert-True ((Get-CopyStatus $src $r $dst) -eq 0 -and $dst.Length -eq 0 -and $r.ContentLength -eq 0) 'Copy-WsHttpBody: Content-Length 0 copies nothing'
+
+# stream ends early -> 400 (also: partial data already written is the caller's business)
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 100000`r`n`r`n" (Get-RandomBytes 50000)
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+Assert-True ((Get-CopyStatus $src $r (New-Object System.IO.MemoryStream)) -eq 400) 'Copy-WsHttpBody: stream ends before Content-Length -> 400'
+
+# over MaxBytes -> 413 before anything is read or written
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 1000`r`n`r`n" (Get-RandomBytes 1000)
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+$dst = New-Object System.IO.MemoryStream
+Assert-True ((Get-CopyStatus $src $r $dst @{ MaxBytes = 999 }) -eq 413 -and $dst.Length -eq 0) 'Copy-WsHttpBody: Content-Length above MaxBytes -> 413, nothing written'
+$src = New-BinaryRequestStream "POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 1000`r`n`r`n" (Get-RandomBytes 1000)
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+Assert-True ((Get-CopyStatus $src $r (New-Object System.IO.MemoryStream) @{ MaxBytes = 1000 }) -eq 0) 'Copy-WsHttpBody: Content-Length equal to MaxBytes is accepted'
+
+# no Content-Length -> 400
+$src = New-RequestStream "POST /x HTTP/1.1`r`nHost: x`r`n`r`n"
+$r = Read-WsHttpRequest -Stream $src -HeadersOnly
+Assert-True ((Get-CopyStatus $src $r (New-Object System.IO.MemoryStream)) -eq 400) 'Copy-WsHttpBody: request without Content-Length -> 400'
+
 # ---- Test-WsRequestAllowed ----
 function New-FakeRequest {
     param([string]$Method = 'GET', [hashtable]$H = @{})
@@ -256,6 +361,57 @@ try {
     try { [void](Read-WsHttpRequest -Stream $srv.GetStream() -TimeoutMs 400) }
     catch { if ($_.Exception.Data.Contains('WsHttpStatus')) { $status = [int]$_.Exception.Data['WsHttpStatus'] } }
     Assert-True ($status -eq 408) 'socket: partial header then silence -> 408'
+    $srv.Close(); $srv = $null; $client.Close(); $client = $null
+
+    # ~3 MB upload: headers only, then Copy-WsHttpBody streams the body into a file
+    $upload = Get-RandomBytes 3000017 99
+    $head = $utf8.GetBytes("POST /api/drop/file?drop=x HTTP/1.1`r`nHost: 127.0.0.1:$sockPort`r`nContent-Type: application/octet-stream`r`nContent-Length: $($upload.Length)`r`n`r`n")
+    $wire = New-Object byte[] ($head.Length + $upload.Length)
+    [Array]::Copy($head, 0, $wire, 0, $head.Length)
+    [Array]::Copy($upload, 0, $wire, $head.Length, $upload.Length)
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect('127.0.0.1', $sockPort)
+    $sendTask = $client.GetStream().WriteAsync($wire, 0, $wire.Length)
+    $srv = $listener.AcceptTcpClient()
+    $ss = $srv.GetStream()
+    $upReq = Read-WsHttpRequest -Stream $ss -TimeoutMs 3000 -HeadersOnly
+    $outFile = Join-Path ([IO.Path]::GetTempPath()) ('wsgui-upload-' + [Guid]::NewGuid().ToString('N') + '.bin')
+    $fs = New-Object System.IO.FileStream ($outFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 65536)
+    $upStatus = 0
+    try { Copy-WsHttpBody -Stream $ss -Request $upReq -Destination $fs -MaxBytes 10000000 -IdleTimeoutMs 5000 }
+    catch { $upStatus = -1; if ($_.Exception.Data.Contains('WsHttpStatus')) { $upStatus = [int]$_.Exception.Data['WsHttpStatus'] } }
+    finally { $fs.Dispose() }
+    [void]$sendTask.Wait(5000)
+    try {
+        $gotHash = (Get-FileHash -LiteralPath $outFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        Assert-True ($upStatus -eq 0 -and $upReq.ContentLength -eq $upload.Length -and $gotHash -ceq (Get-Sha256Hex $upload)) 'socket: 3 MB random upload via HeadersOnly + Copy-WsHttpBody arrives bit-identical'
+        Assert-True ((Get-Item -LiteralPath $outFile).Length -eq $upload.Length) 'socket: uploaded file has exactly Content-Length bytes'
+    }
+    finally { Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue }
+    $srv.Close(); $srv = $null; $client.Close(); $client = $null
+
+    # sender stalls after part of the body -> 408 within the idle timeout
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect('127.0.0.1', $sockPort)
+    $partial = $utf8.GetBytes("POST /x HTTP/1.1`r`nHost: x`r`nContent-Length: 100000`r`n`r`n" + ('a' * 10))
+    $client.GetStream().Write($partial, 0, $partial.Length)
+    $srv = $listener.AcceptTcpClient()
+    $ss = $srv.GetStream()
+    $stalled = Read-WsHttpRequest -Stream $ss -TimeoutMs 3000 -HeadersOnly
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $stStatus = Get-CopyStatus $ss $stalled (New-Object System.IO.MemoryStream) @{ IdleTimeoutMs = 400 }
+    Assert-True ($stStatus -eq 408 -and $sw.Elapsed.TotalSeconds -lt 4) 'socket: stalled body -> 408 within IdleTimeoutMs'
+    $srv.Close(); $srv = $null; $client.Close(); $client = $null
+
+    # sender closes mid-body -> 400
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect('127.0.0.1', $sockPort)
+    $client.GetStream().Write($partial, 0, $partial.Length)
+    $srv = $listener.AcceptTcpClient()
+    $ss = $srv.GetStream()
+    $cut = Read-WsHttpRequest -Stream $ss -TimeoutMs 3000 -HeadersOnly
+    $client.Close(); $client = $null
+    Assert-True ((Get-CopyStatus $ss $cut (New-Object System.IO.MemoryStream) @{ IdleTimeoutMs = 2000 }) -eq 400) 'socket: peer closes mid-body -> 400'
 }
 finally {
     if ($null -ne $srv) { try { $srv.Close() } catch { } }

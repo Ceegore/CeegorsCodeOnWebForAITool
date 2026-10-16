@@ -1,6 +1,86 @@
-# WorkspaceShare 3.1
+# WorkspaceShare 3.2
 
 Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüfter ZIP64-Snapshot über einen geheimen Cloudflare-Quick-Tunnel-Link.
+
+## So benutzt du WorkspaceShare
+
+### 1. Herunterladen
+
+Du hast zwei Möglichkeiten:
+
+**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.2.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
+
+```powershell
+Get-FileHash .\WorkspaceShare-3.2.0.zip
+```
+
+Entpacke das ZIP in einen lokalen Ordner, z. B. `C:\Tools\WorkspaceShare`. Es enthält bereits die geprüften Hilfsprogramme (cloudflared, miniserve, gitleaks, 7-Zip) und das Lockfile.
+
+Windows markiert heruntergeladene Dateien (Mark-of-the-Web). Blockiert PowerShell die Skripte, entscheidest du selbst, ob du den entpackten Ordner freigibst – und zwar nur bei einem Download, dem du vertraust. Im entpackten Ordner:
+
+```powershell
+Get-ChildItem -File -Recurse | Unblock-File
+```
+
+**b) git clone (für Entwickler):**
+
+```powershell
+git clone https://github.com/Ceegore/CeegorsCodeOnWebForAITool.git
+cd .\CeegorsCodeOnWebForAITool
+.\Install-Dependencies.ps1
+```
+
+Der Repository-Root ist der Tool-Ordner. `Install-Dependencies.ps1` lädt die festgelegten Hilfsprogramme einmalig und prüft sie. Beim Release-ZIP entfällt dieser Schritt.
+
+### 2. Verknüpfung anlegen (einmalig)
+
+```powershell
+powershell -NoProfile -File "<Pfad>\Install-GuiShortcut.ps1"
+```
+
+Das legt die Verknüpfung „WorkspaceShare“ auf dem Desktop und im Startmenü an.
+
+### 3. Teilen
+
+1. Doppelklick auf die Verknüpfung „WorkspaceShare“ – der Browser öffnet sich.
+2. Ziehe Dateien oder Ordner aus dem Explorer in das Feld „Dateien oder Ordner hierher ziehen“, oder wähle sie mit „Dateien auswählen…“. Alternativ wähle einen Projektordner mit „Ordner wählen…“.
+3. Dauer wählen und auf „Freigeben“ klicken.
+4. Nach etwa einer Minute erscheint der Link. Klicke auf „Link kopieren“ und schicke ihn an den Empfänger – oder füge ihn in den KI-Web-Chat ein.
+
+Der Empfänger lädt über den Link eine ZIP-Datei herunter. Auf seiner Seite muss nichts installiert werden.
+
+### 4. Beenden
+
+- „Freigabe beenden“ beendet die laufende Freigabe sofort.
+- Ohne Eingriff endet sie automatisch nach der gewählten Zeit.
+- „Beenden“ unten auf der Seite schließt WorkspaceShare.
+- Per Drag & Drop übernommene Dateien werden in einen temporären, privaten Ordner kopiert und gelöscht, sobald die Freigabe endet.
+
+### Was passiert im Hintergrund?
+
+- Der Link enthält ein zufälliges 256-Bit-Geheimnis. Wer ihn hat, kann die Datei laden – gib ihn nur an Berechtigte weiter.
+- Geteilt wird ein schreibgeschützter ZIP-Snapshot, nie der Originalordner.
+- Vor der Freigabe läuft ein Geheimnis-Scan mit gitleaks. Schlüsseldateien wie `.env`, `*.pem` oder `id_rsa` blockieren die Freigabe.
+- Zugangsdaten-Ordner wie `.ssh`, `.aws` oder `.npmrc` werden immer ausgelassen.
+- Der Link ist nur erreichbar, solange die Freigabe läuft. Es braucht kein Konto, keine Portweiterleitung und keine Firewall-Regel.
+
+### Kommandozeile
+
+```powershell
+.\Share-Workspace.ps1 -Path "D:\Projekte\MeinProjekt" -Hours 4
+```
+
+Parameter, Ablauf und Fehlercodes stehen in den Abschnitten „Workspace freigeben“, „Wichtige Parameter“ und „Fehlercodes“ weiter unten.
+
+## In English (short)
+
+- WorkspaceShare shares files or a project folder for a limited time as a read-only ZIP, behind a secret, temporary Cloudflare Quick Tunnel link. The original folder is never shared.
+- Step 1: download the release ZIP and compare its SHA-256 hash (or `git clone` and run `.\Install-Dependencies.ps1`).
+- Step 2: run `Install-GuiShortcut.ps1` once to create the "WorkspaceShare" shortcut.
+- Step 3: double-click the shortcut, drop files or folders in, choose the duration, click "Freigeben" and copy the link.
+- Step 4: the recipient downloads a ZIP from the link and installs nothing. The share ends automatically or with "Freigabe beenden".
+- Releases: https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases
+- The UI labels and the rest of this README are in German.
 
 ## Sicherheitsmodell
 
@@ -30,29 +110,22 @@ Der vollständige Link ist ein Bearer-Secret. Jeder Besitzer kann die Datei heru
 
 Keine Domain, kein Cloudflare-Konto, keine Portweiterleitung und keine eingehende Firewallregel sind erforderlich.
 
-## Schnellstart im vorhandenen Ordner
+## Details für Entwickler: Abhängigkeiten und Sicherheitsrichtlinien
 
-Das Tool wird **direkt aus dem Ordner verwendet, in dem diese Dateien bereits
-liegen**. Es muss weder nach `C:\Tools` kopiert noch erneut aus GitHub geladen
-werden.
+Die Kurzanleitung oben genügt für die Nutzung. Dieser Abschnitt erklärt die
+Hintergründe für Entwicklung und Installation aus dem Quellcode. Das Tool läuft
+direkt aus dem Ordner mit den Dateien; es muss nicht kopiert werden.
 
 Öffne PowerShell in diesem Ordner, zum Beispiel:
 
 ```powershell
-Set-Location "<Pfad zum Ordner WorkspaceShare_FINAL>"
+Set-Location "<Pfad zum Ordner mit den Tool-Dateien>"
 ```
 
-Falls die Dateien aus einem ZIP-Archiv stammen und Windows sie blockiert hat,
-hebe die Markierung einmalig auf:
-
-```powershell
-Get-ChildItem -File -Recurse -Filter *.ps1 | Unblock-File
-```
-
-Wenn PowerShell anschließend eine Meldung über „nicht digital signiert“ zeigt,
-gilt auf dem Rechner eine restriktive Ausführungsrichtlinie. Erlaube die Skripte
-nur für das **aktuell geöffnete PowerShell-Fenster**; diese Einstellung geht beim
-Schließen des Fensters automatisch verloren und ändert keine Systemrichtlinie:
+Ausführungsrichtlinie: Meldet PowerShell „nicht digital signiert“, gilt auf dem
+Rechner eine restriktive Richtlinie. Erlaube die Skripte nur für das **aktuell
+geöffnete PowerShell-Fenster**; die Einstellung ändert keine Systemrichtlinie und
+endet mit dem Fenster. (Zur Mark-of-the-Web siehe Schritt 1 der Kurzanleitung.)
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
@@ -144,7 +217,7 @@ powershell.exe -NoProfile -STA -File .\Start-WorkspaceShareGui.ps1
 
 Bedienung:
 
-1. Ordner wählen („Ordner wählen…“) oder den Pfad eintippen.
+1. Dateien oder Ordner per Drag & Drop in das Feld ziehen, „Dateien auswählen…“ klicken, „Ordner wählen…“ klicken oder den Pfad eintippen.
 2. Dauer festlegen.
 3. Optional „Erweitert“ öffnen (Kompression, Build-/Cache-Ordner).
 4. „Freigeben“ klicken. Der Fortschritt zeigt 8 Schritte.
@@ -152,6 +225,14 @@ Bedienung:
 6. „Freigabe beenden“ beendet die laufende Freigabe.
 
 „Beenden“ unten auf der Seite beendet eine laufende Freigabe und schließt den GUI-Dienst.
+
+### Dateien und Ordner per Drag & Drop
+
+Ziehe Dateien oder ganze Ordner aus dem Explorer in das Feld „Dateien oder Ordner hierher ziehen“. Alternativ klickst du „Dateien auswählen…“. Die Auswahl wird zuerst in einen privaten, temporären Ordner kopiert (mit Fortschrittsanzeige). Danach zeigt das Feld den Pfad, eine Zusammenfassung wie „3 Dateien, 12,4 MB“ und den Button „Entfernen“. Wird ein anderer Ordner gewählt oder eingetippt, wird die Auswahl verworfen.
+
+- Grenzen: maximal 4 GiB pro Datei und insgesamt, maximal 10.000 Dateien (Standardwerte).
+- Temporärer Ordner: `%LOCALAPPDATA%\WorkspaceShare\drops`. Er wird gelöscht, sobald die Freigabe endet oder „Entfernen“ geklickt wird.
+- Linux: Dieselbe Drag-&-Drop-Bedienung funktioniert, sobald der Linux-Port existiert, weil sie nur Browser und .NET nutzt. Siehe `docs\LINUX_PLAN.md`.
 
 Sicherheitshinweise:
 
@@ -314,8 +395,8 @@ Nach vollständig bestandener Abnahme:
 Ergebnis:
 
 ```text
-dist\WorkspaceShare-3.1.0-internal.zip
-dist\WorkspaceShare-3.1.0-internal.zip.sha256.txt
+dist\WorkspaceShare-3.2.0.zip
+dist\WorkspaceShare-3.2.0.zip.sha256.txt
 ```
 
 Das ZIP enthält außerdem die `LICENSE` des Projekts.

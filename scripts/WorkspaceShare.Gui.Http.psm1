@@ -7,6 +7,9 @@
 #   408 read timeout (IOException on the stream or TimeoutMs exceeded)
 #   413 Content-Length above MaxBodyBytes
 #   431 header block above MaxHeaderBytes
+# With -HeadersOnly the body is left on the stream (ContentLength / BodyPrefix describe it) and
+# Copy-WsHttpBody streams it to a destination (GUI_CONTRACT section 7.3):
+#   400 stream ended early / no Content-Length, 408 idle timeout, 413 body above MaxBytes
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -42,7 +45,8 @@ function Read-WsHttpRequest {
         [Parameter(Mandatory)][System.IO.Stream]$Stream,
         [int]$MaxHeaderBytes = 16384,
         [int]$MaxBodyBytes = 65536,
-        [int]$TimeoutMs = 5000
+        [int]$TimeoutMs = 5000,
+        [switch]$HeadersOnly
     )
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $buffer = New-Object byte[] 4096
@@ -100,6 +104,31 @@ function Read-WsHttpRequest {
     }
     if ($headers.ContainsKey('Transfer-Encoding')) { throw (New-WsHttpError 400 'Transfer-Encoding is not supported.') }
 
+    if ($HeadersOnly) {
+        # Leave the body on the stream; report its length and the bytes already read past the headers.
+        $contentLength = [int64]-1
+        if ($headers.ContainsKey('Content-Length')) {
+            $lenText = [string]$headers['Content-Length']
+            if ($lenText -notmatch '^[0-9]{1,10}$') { throw (New-WsHttpError 400 'Bad Content-Length.') }
+            $contentLength = [int64]$lenText
+        }
+        $bodyStart = $headerEnd + 4
+        $prefixLen = [int64]($all.Length - $bodyStart)
+        if ($contentLength -ge 0 -and $prefixLen -gt $contentLength) { $prefixLen = $contentLength }
+        if ($contentLength -lt 0) { $prefixLen = 0 }
+        [byte[]]$prefix = New-Object byte[] ([int]$prefixLen)
+        if ($prefixLen -gt 0) { [Array]::Copy($all, $bodyStart, $prefix, 0, [int]$prefixLen) }
+        return [pscustomobject]@{
+            Method        = $method
+            Path          = $path
+            Query         = $query
+            Headers       = $headers
+            Body          = ''
+            ContentLength = $contentLength
+            BodyPrefix    = $prefix
+        }
+    }
+
     # Body: only with Content-Length
     $body = ''
     if ($headers.ContainsKey('Content-Length')) {
@@ -136,6 +165,44 @@ function Read-WsHttpRequest {
     }
 }
 
+function Copy-WsHttpBody {
+    # Copies exactly Request.ContentLength bytes (BodyPrefix first, then the stream, 64 KiB chunks) to Destination.
+    # Never reads past ContentLength. Failures carry Data['WsHttpStatus']: 400 / 408 / 413. Errors of the
+    # destination stream are not translated.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][System.IO.Stream]$Destination,
+        [int64]$MaxBytes = [int64]::MaxValue,
+        [int]$IdleTimeoutMs = 30000
+    )
+    $total = [int64]$Request.ContentLength
+    if ($total -lt 0) { throw (New-WsHttpError 400 'Content-Length is required.') }
+    if ($total -gt $MaxBytes) { throw (New-WsHttpError 413 'Request body too large.') }
+    $done = [int64]0
+    [byte[]]$prefix = $Request.BodyPrefix
+    if ($null -ne $prefix -and $prefix.Length -gt 0) {
+        $take = [int64]$prefix.Length
+        if ($take -gt $total) { $take = $total }
+        $Destination.Write($prefix, 0, [int]$take)
+        $done = $take
+    }
+    if ($done -ge $total) { return }
+    $buffer = New-Object byte[] 65536
+    while ($done -lt $total) {
+        $want = $total - $done
+        if ($want -gt $buffer.Length) { $want = $buffer.Length }
+        if ($Stream.CanTimeout) { $Stream.ReadTimeout = $IdleTimeoutMs }
+        $n = 0
+        try { $n = [int]$Stream.Read($buffer, 0, [int]$want) }
+        catch [System.IO.IOException] { throw (New-WsHttpError 408 'Request timeout.') }
+        if ($n -le 0) { throw (New-WsHttpError 400 'Incomplete request body.') }
+        $Destination.Write($buffer, 0, $n)
+        $done += $n
+    }
+}
+
 function Get-WsReasonPhrase {
     param([int]$Status)
     switch ($Status) {
@@ -149,10 +216,12 @@ function Get-WsReasonPhrase {
         405 { 'Method Not Allowed' }
         408 { 'Request Timeout' }
         409 { 'Conflict' }
+        411 { 'Length Required' }
         413 { 'Payload Too Large' }
         431 { 'Request Header Fields Too Large' }
         500 { 'Internal Server Error' }
         501 { 'Not Implemented' }
+        507 { 'Insufficient Storage' }
         default { 'Unknown' }
     }
 }
@@ -292,4 +361,4 @@ function Get-WsStaticFile {
     return @{ Bytes = [byte[]][System.IO.File]::ReadAllBytes($file); ContentType = $type }
 }
 
-Export-ModuleMember -Function Read-WsHttpRequest, Write-WsHttpResponse, Write-WsJsonResponse, Test-WsRequestAllowed, Get-WsStaticFile, ConvertTo-WsJson
+Export-ModuleMember -Function Read-WsHttpRequest, Copy-WsHttpBody, Write-WsHttpResponse, Write-WsJsonResponse, Test-WsRequestAllowed, Get-WsStaticFile, ConvertTo-WsJson
