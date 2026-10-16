@@ -63,7 +63,7 @@ function Get-ProcessIdentityState {
         if([string]::IsNullOrWhiteSpace($path)){if(Test-WorkspaceZombie -ProcessId $ProcessId){try{$process.Dispose()}catch{};return New-ProcessState Absent $null};try{$process.Dispose()}catch{};return New-ProcessState Unknown $null 'Process path is unavailable.'}
         if((Test-WorkspaceSameExecutable -ActualPath $path -ExpectedPath $ExpectedPath) -and $ticks -eq $ExpectedStartTicks){if($IncludeProcessHandle){return New-ProcessState Match $process};try{$process.Dispose()}catch{};return New-ProcessState Match $null}
         try{$process.Dispose()}catch{}
-        return New-ProcessState Conflict $null 'The PID belongs to another process.'
+        return New-ProcessState Conflict $null ("The PID belongs to another process (path '{0}' start {1}; expected path '{2}' start {3})." -f $path,$ticks,$ExpectedPath,$ExpectedStartTicks)
     }
     catch { try{$process.Dispose()}catch{}; return New-ProcessState Unknown $null $_.Exception.Message }
 }
