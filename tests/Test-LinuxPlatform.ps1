@@ -242,7 +242,7 @@ Invoke-Check 'job: process groups, cross-process stop, kill-on-close' {
     $out = Join-Path $tmp 'group.out'; $err = Join-Path $tmp 'group.err'
     $leader = Start-WorkspaceProcessInJob -Job $job -FilePath '/bin/sh' -Arguments @('-c', 'sleep 60 & sleep 60 & wait') -WorkingDirectory $tmp -StdOutPath $out -StdErrPath $err
     $leaderPid = $leader.Id
-    Assert-True (Wait-Until { (Get-GroupMembers $leaderPid).Count -ge 3 } 10) ('child runs in its own process group with its subprocesses (members: ' + ((Get-GroupMembers $leaderPid) -join ',') + ')')
+    Assert-True (Wait-Until { @(Get-GroupMembers $leaderPid).Count -ge 3 } 10) ('child runs in its own process group with its subprocesses (members: ' + ((Get-GroupMembers $leaderPid) -join ',') + ')')
     $stat = [IO.File]::ReadAllText("/proc/$leaderPid/stat")
     $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
     Assert-True ([int]$fields[2] -eq $leaderPid -and [int]$fields[3] -eq $leaderPid) 'child is group and session leader (setsid)'
@@ -259,7 +259,7 @@ Close-WorkspaceJob -Job `$j
     $helperResult = Invoke-WorkspaceNativeProcess -Job $helperJob -FilePath $pwshPath -Arguments @('-NoProfile', '-NonInteractive', '-File', $helper) -WorkingDirectory $tmp -TimeoutSeconds 60 -ExpectedExitCodes @(0, 1)
     Write-Host ("       helper exit {0} {1} {2}" -f $helperResult.ExitCode, $helperResult.StdOut.Trim(), $helperResult.StdErr.Trim())
     Close-WorkspaceJob -Job $helperJob
-    Assert-True (Wait-Until { (Get-GroupMembers $leaderPid).Count -eq 0 } 10) 'a second process stopped the whole group through Open-WorkspaceJob'
+    Assert-True (Wait-Until { @(Get-GroupMembers $leaderPid).Count -eq 0 } 10) 'a second process stopped the whole group through Open-WorkspaceJob'
     Assert-True ($leader.WaitForExit(5000)) 'the .NET Process object saw the exit'
     $leader.Dispose()
     # kill-on-close: owner close terminates what is left
@@ -320,7 +320,7 @@ Invoke-Check 'watchdog (expiry and parent loss)' {
             '-ExpiresUtc', ([DateTime]::UtcNow.AddSeconds($duration).ToString('o')),
             '-StartTimestamp', [string]$startStamp, '-DurationTicks', [string]$durationTicks,
             '-ExpectedMiniservePath', $serverPath, '-ExpectedCloudflaredPath', $cloudPath)
-        $watchdog = Start-WorkspaceProcessInJob -Job (New-WorkspaceJob -Name ('Local\WorkspaceShare.LinuxWatchHost.' + [Guid]::NewGuid().ToString('N'))) -FilePath $pwshPath -Arguments $arguments -WorkingDirectory $session -StdOutPath (Join-Path $tmp ('watch-' + $scenario + '.out')) -StdErrPath (Join-Path $tmp ('watch-' + $scenario + '.err'))
+        $watchdog = Start-WorkspaceProcessInJob -Job (New-WorkspaceJob -Name ('Local\WorkspaceShare.LinuxWatchHost.' + [Guid]::NewGuid().ToString('N'))) -FilePath $pwshPath -Arguments $arguments -WorkingDirectory $tmp -StdOutPath (Join-Path $tmp ('watch-' + $scenario + '.out')) -StdErrPath (Join-Path $tmp ('watch-' + $scenario + '.err'))
         Assert-True (Wait-Until { Test-Path -LiteralPath $ready } 30) "[$scenario] watchdog publishes readiness"
         Assert-True (Test-PidAlive $cloud.Id) "[$scenario] children are alive while the watchdog waits"
         $t0 = [Diagnostics.Stopwatch]::StartNew()

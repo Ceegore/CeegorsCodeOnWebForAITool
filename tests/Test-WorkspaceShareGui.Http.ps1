@@ -323,13 +323,22 @@ Assert-True ($nj -match '^\{"v":1,"phase":"idle"') 'ordered dictionary keeps key
 Assert-True ((ConvertTo-WsJson -Object @{ q = 'a"b\c' }) -ceq '{"q":"a\"b\\c"}') 'quotes and backslashes escaped'
 
 # ---- Platform module ----
-Assert-True ((Get-WsPlatform) -ceq 'windows') "Get-WsPlatform returns 'windows'"
+$onWindows = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+$expectedPlatform = if ($onWindows) { 'windows' } else { 'linux' }
+Assert-True ((Get-WsPlatform) -ceq $expectedPlatform) "Get-WsPlatform returns '$expectedPlatform'"
 $ps = Get-WsPowerShellHost
-Assert-True ((Test-Path -LiteralPath $ps -PathType Leaf) -and $ps -match 'WindowsPowerShell\\v1\.0\\powershell\.exe$') 'Get-WsPowerShellHost points at powershell.exe'
+if ($onWindows) {
+    Assert-True ((Test-Path -LiteralPath $ps -PathType Leaf) -and $ps -match 'WindowsPowerShell\\v1\.0\\powershell\.exe$') 'Get-WsPowerShellHost points at powershell.exe'
+}
+else {
+    Assert-True ((Test-Path -LiteralPath $ps -PathType Leaf) -and [IO.Path]::GetFileName($ps) -eq 'pwsh') 'Get-WsPowerShellHost points at pwsh'
+}
 $dr = Get-WsDataRoot
-Assert-True ((Test-Path -LiteralPath $dr -PathType Container) -and $dr -match 'WorkspaceShare$') 'Get-WsDataRoot exists and ends with WorkspaceShare'
+$expectedRoot = if ($onWindows) { 'WorkspaceShare$' } else { 'workspaceshare$' }
+Assert-True ((Test-Path -LiteralPath $dr -PathType Container) -and $dr -cmatch $expectedRoot) 'Get-WsDataRoot exists and ends with the data folder name'
 $caps = Get-WsCapabilities
-Assert-True ($caps.ContainsKey('folderPicker') -and $caps.ContainsKey('clipboard') -and $caps.ContainsKey('openBrowser') -and $caps.Count -eq 3 -and $caps.openBrowser -eq $true) 'Get-WsCapabilities has exactly the 3 keys'
+# openBrowser is always true on Windows; on Linux it needs a display and xdg-open.
+Assert-True ($caps.ContainsKey('folderPicker') -and $caps.ContainsKey('clipboard') -and $caps.ContainsKey('openBrowser') -and $caps.Count -eq 3 -and ((-not $onWindows) -or $caps.openBrowser -eq $true)) 'Get-WsCapabilities has exactly the 3 keys'
 Assert-True ((Open-WsBrowser -Url 'https://example.com/') -eq $false -and (Open-WsBrowser -Url 'http://localhost:80/') -eq $false -and (Open-WsBrowser -Url 'file:///C:/Windows/notepad.exe') -eq $false) 'Open-WsBrowser rejects non-127.0.0.1 URLs without starting anything'
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     Assert-True ($null -eq (Show-WsFolderPicker)) 'Show-WsFolderPicker returns $null in a non-STA thread'

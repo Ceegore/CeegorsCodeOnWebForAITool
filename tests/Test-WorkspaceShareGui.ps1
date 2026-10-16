@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($ToolRoot)) { $ToolRoot = Split-Path $PSScriptRoot -Parent }
 
 $script:Pass = 0
+$script:DebugCurl = 0
 $script:Fail = 0
 function Assert-True {
     param($Condition, [string]$Name)
@@ -60,6 +61,7 @@ function Invoke-Api {
     $codeText = (& $curl @cargs) -join ''
     $status = 0
     [void][int]::TryParse($codeText.Trim(), [ref]$status)
+    if ($status -eq 0 -and $script:DebugCurl -lt 3) { $script:DebugCurl++; Write-Host ('[DEBUG] curl exit ' + $LASTEXITCODE + ' out=[' + $codeText + '] args=' + ($cargs -join ' ')) }
     $headers = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
     if (Test-Path -LiteralPath $hf) {
         foreach ($line in [IO.File]::ReadAllLines($hf)) {
