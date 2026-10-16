@@ -15,6 +15,19 @@ function Get-WorkspaceProcessStartTicks {
     return ([int64]$fields[19]+1)
 }
 
+function Get-WorkspaceProcessPath {
+    # Windows: Process.Path (unchanged). Linux: the /proc/<pid>/exe link; Process.Path can report "[vdso]"
+    # for static executables such as miniserve and cloudflared.
+    param([Parameter(Mandatory=$true)][Diagnostics.Process]$Process)
+    if(Test-WorkspaceUnixHost){
+        try{
+            $target=(New-Object IO.FileInfo('/proc/'+$Process.Id+'/exe')).LinkTarget
+            if(-not[string]::IsNullOrWhiteSpace($target)){return $target}
+        }catch{}
+    }
+    return $Process.Path
+}
+
 function Test-WorkspaceZombie {
     # Linux: a terminated child that nobody has reaped yet (no /proc/<pid>/exe any more) counts as gone.
     param([int]$ProcessId)
@@ -58,7 +71,7 @@ function Get-ProcessIdentityState {
     try {
         # Cache the handle before verifying, so a later Kill() acts on this exact process even if the PID is reused.
         try{$null=$process.Handle}catch{}
-        $path=$process.Path
+        $path=Get-WorkspaceProcessPath -Process $process
         $ticks=Get-WorkspaceProcessStartTicks -Process $process
         if([string]::IsNullOrWhiteSpace($path)){if(Test-WorkspaceZombie -ProcessId $ProcessId){try{$process.Dispose()}catch{};return New-ProcessState Absent $null};try{$process.Dispose()}catch{};return New-ProcessState Unknown $null 'Process path is unavailable.'}
         if((Test-WorkspaceSameExecutable -ActualPath $path -ExpectedPath $ExpectedPath) -and $ticks -eq $ExpectedStartTicks){if($IncludeProcessHandle){return New-ProcessState Match $process};try{$process.Dispose()}catch{};return New-ProcessState Match $null}
@@ -91,4 +104,4 @@ function Stop-TrackedProcessConfirmed {
     return ($final.State -in @('Absent','Conflict'))
 }
 
-Export-ModuleMember -Function @('Get-ProcessIdentityState','Stop-TrackedProcessConfirmed','Get-WorkspaceProcessStartTicks')
+Export-ModuleMember -Function @('Get-ProcessIdentityState','Stop-TrackedProcessConfirmed','Get-WorkspaceProcessStartTicks','Get-WorkspaceProcessPath')
