@@ -137,7 +137,7 @@ jobs:
           exit $rc
 
       - name: Full share through a real Quick Tunnel (manual run only)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.public_tunnel }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.public_tunnel }}
         shell: bash
         timeout-minutes: 12
         run: |

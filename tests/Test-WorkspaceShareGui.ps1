@@ -1272,6 +1272,7 @@ try {
     Assert-True ($gotNoise -and $noiseDuringUpload -and $uploadStillRunning) 'X: the chatty share wrote its 200 KB of output while the 20 MB upload was still in progress (children are drained during the upload)'
     $null = $bgUp.Proc.WaitForExit(60000)
     $resUp = Get-BackgroundCurlResult $bgUp
+    if ($resUp.Status -ne 200) { Write-Host ('       [DEBUG] upload status ' + $resUp.Status + ' body=[' + $resUp.Body + ']') }
     Assert-True ($resUp.Status -eq 200 -and $resUp.Json.bytes -eq 20971520) 'X: the 20 MB upload succeeds'
     $shX = Wait-ForShare $X $stX.Id { param($x) $x.phase -eq 'active' }
     Assert-True ($null -ne $shX) 'X: the chatty share reaches active'
