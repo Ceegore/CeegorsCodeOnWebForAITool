@@ -196,7 +196,13 @@ function Start-WorkspaceProcessInJob {
             if ($null -eq $stat -or $process.HasExited) { break }
             $target = $null
             try { $target = (New-Object System.IO.FileInfo('/proc/' + $process.Id + '/exe')).LinkTarget } catch { $target = $null }
-            if ($target -and ($target -eq $expected -or [IO.Path]::GetFileName($target) -eq [IO.Path]::GetFileName($expected))) {
+            $reached = $false
+            if ($target) {
+                $targetName = [IO.Path]::GetFileName($target)
+                if ($target -eq $expected -or $targetName -eq [IO.Path]::GetFileName($expected)) { $reached = $true }
+                elseif ($stat.Pgrp -eq $process.Id -and $targetName -ne 'setsid') { $reached = $true }   # setsid done, target binary is another name (symlink / multi-call)
+            }
+            if ($reached) {
                 if ($stat.Pgrp -eq $process.Id) { $mode = 'g' }
                 break
             }
