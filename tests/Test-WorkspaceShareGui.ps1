@@ -343,7 +343,8 @@ function Get-FileSha {
 function Get-FileCount {
     param([string]$Dir)
     if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
-    return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+    # The Linux single-instance lock file (<data root>/locks) is not a drop file.
+    return @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\/]locks[\\/]' }).Count
 }
 
 function Get-ExpectedBuild {
