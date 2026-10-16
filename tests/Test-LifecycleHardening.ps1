@@ -8,12 +8,13 @@ if ([string]::IsNullOrWhiteSpace($ToolRoot)) { $ToolRoot = Split-Path $PSScriptR
 $failed = 0
 function Assert-True { param([bool]$Condition,[string]$Message) if($Condition){Write-Host "[PASS] $Message"}else{Write-Host "[FAIL] $Message" -ForegroundColor Red;$script:failed++} }
 
-$processModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Process.psm1'
-$curlModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Curl.psm1'
-$healthModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Health.psm1'
-$jobModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Job.psm1'
-$pathModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Path.psm1'
-$dependencyModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Dependency.psm1'
+$scriptsRoot = Join-Path $ToolRoot 'scripts'
+$processModule = Join-Path $scriptsRoot 'WorkspaceShare.Process.psm1'
+$curlModule = Join-Path $scriptsRoot 'WorkspaceShare.Curl.psm1'
+$healthModule = Join-Path $scriptsRoot 'WorkspaceShare.Health.psm1'
+$jobModule = Join-Path $scriptsRoot 'WorkspaceShare.Job.psm1'
+$pathModule = Join-Path $scriptsRoot 'WorkspaceShare.Path.psm1'
+$dependencyModule = Join-Path $scriptsRoot 'WorkspaceShare.Dependency.psm1'
 Assert-True (Test-Path -LiteralPath $processModule -PathType Leaf) 'Shared process module exists'
 Assert-True (Test-Path -LiteralPath $curlModule -PathType Leaf) 'Shared curl module exists'
 Assert-True (Test-Path -LiteralPath $jobModule -PathType Leaf) 'Shared Job Object module exists'
@@ -25,6 +26,7 @@ Import-Module $healthModule -Force
 Import-Module $jobModule -Force
 Import-Module $pathModule -Force
 Import-Module $dependencyModule -Force
+$isWin = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 
 $leaseRoot=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-lease-root-'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $leaseRoot -Force|Out-Null
 try{
@@ -39,11 +41,11 @@ $inspectionFailureState=$null
 try{function global:Get-Process { throw [Microsoft.PowerShell.Commands.ProcessCommandException]::new('simulated access failure') };$inspectionFailureState=Get-ProcessIdentityState -ProcessId 1234 -ExpectedPath $PSHOME -ExpectedStartTicks 1}finally{Remove-Item Function:\Get-Process -Force -ErrorAction SilentlyContinue}
 Assert-True ($inspectionFailureState.State -eq 'Unknown') 'Process inspection errors are never misclassified as absence'
 $self = Get-Process -Id $PID
-for ($index = 0; $index -lt 100; $index++) { [void](Get-ProcessIdentityState -ProcessId $PID -ExpectedPath $self.Path -ExpectedStartTicks $self.StartTime.ToUniversalTime().Ticks) }
+for ($index = 0; $index -lt 100; $index++) { [void](Get-ProcessIdentityState -ProcessId $PID -ExpectedPath $self.Path -ExpectedStartTicks (Get-WorkspaceProcessStartTicks -Process $self)) }
 [GC]::Collect(); [GC]::WaitForPendingFinalizers(); $self.Refresh()
 $handleCountBefore = $self.HandleCount
 for ($index = 0; $index -lt 10000; $index++) {
-    $identity = Get-ProcessIdentityState -ProcessId $PID -ExpectedPath $self.Path -ExpectedStartTicks $self.StartTime.ToUniversalTime().Ticks
+    $identity = Get-ProcessIdentityState -ProcessId $PID -ExpectedPath $self.Path -ExpectedStartTicks (Get-WorkspaceProcessStartTicks -Process $self)
     if ($identity.State -ne 'Match') { throw 'Process identity stress check returned a non-match.' }
 }
 $self.Refresh()
@@ -55,9 +57,12 @@ $canonicalA = Resolve-WorkspaceDirectoryIdentity -Path $ToolRoot
 $canonicalB = Resolve-WorkspaceDirectoryIdentity -Path (Join-Path $ToolRoot '.')
 Assert-True ($canonicalA.Identity -eq $canonicalB.Identity -and $canonicalA.FinalPath -eq $canonicalB.FinalPath) 'Canonical directory identity collapses lexical aliases'
 
+if($isWin){
 $fixtureTarget=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-fixture-target-'+[Guid]::NewGuid().ToString('N'));$fixtureJunction=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-fixture-junction-'+[Guid]::NewGuid().ToString('N'))
 try{New-Item -ItemType Directory -Path $fixtureTarget|Out-Null;$sentinel=Join-Path $fixtureTarget 'sentinel.txt';[IO.File]::WriteAllText($sentinel,'keep');& cmd.exe /d /c mklink /J $fixtureJunction $fixtureTarget|Out-Null;if($LASTEXITCODE -ne 0){throw 'Could not create fixture junction test.'};$fixtureProcess=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f (Join-Path $ToolRoot 'tests\New-TestFixtures.ps1')),'-OutputRoot',('"{0}"' -f $fixtureJunction),'-ForceReset') -WindowStyle Hidden -Wait -PassThru;$fixtureExit=$fixtureProcess.ExitCode;$fixtureProcess.Dispose();Assert-True ($fixtureExit -ne 0 -and (Test-Path -LiteralPath $sentinel -PathType Leaf)) 'Fixture reset refuses a junction root without touching its target'}finally{if(Test-Path -LiteralPath $fixtureJunction){try{[IO.Directory]::Delete($fixtureJunction)}catch{}};Remove-Item -LiteralPath $fixtureTarget -Recurse -Force -ErrorAction SilentlyContinue}
+}else{Write-Host '[SKIP] Windows-only: junction fixtures (mklink) (Linux: symlink checks in tests/Test-LinuxPlatform.ps1)'}
 
+if($isWin){
 $killJob=New-WorkspaceJob -Name ('Local\WorkspaceShare.KillTest.'+[Guid]::NewGuid().ToString('N'))
 $killChild=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 60') -PassThru
 try{Add-ProcessToWorkspaceJob -Job $killJob -ProcessId $killChild.Id;Close-WorkspaceJob -Job $killJob;$killJob=[IntPtr]::Zero;[void]$killChild.WaitForExit(5000);Assert-True $killChild.HasExited 'Kill-on-close Job Object retires a child after owner loss'}finally{if($killJob -ne [IntPtr]::Zero){try{Close-WorkspaceJob -Job $killJob}catch{}};try{if(-not$killChild.HasExited){$killChild.Kill()}}catch{};try{$killChild.Dispose()}catch{}}
@@ -66,22 +71,26 @@ $atomicJob=New-WorkspaceJob -Name ('Local\WorkspaceShare.AtomicTest.'+[Guid]::Ne
 $atomicOut=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-atomic-'+[Guid]::NewGuid().ToString('N')+'.out')
 $atomicErr=$atomicOut+'.err';$atomicChild=$null
 try{$atomicChild=Start-WorkspaceProcessInJob -Job $atomicJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoProfile','-Command','Write-Output atomic-output') -WorkingDirectory $ToolRoot -StdOutPath $atomicOut -StdErrPath $atomicErr;$atomicExited=$atomicChild.WaitForExit(30000);$atomicText=if(Test-Path -LiteralPath $atomicOut -PathType Leaf){([string](Get-Content -LiteralPath $atomicOut -Raw -ErrorAction SilentlyContinue)).Trim()}else{''};Assert-True ($atomicExited -and $atomicChild.HasExited -and $atomicText -eq 'atomic-output') 'Suspended Job launch inherits bounded output handles and resumes'}finally{try{Stop-WorkspaceJob $atomicJob}catch{};try{Close-WorkspaceJob $atomicJob}catch{};try{if($atomicChild){$atomicChild.Dispose()}}catch{};Remove-Item -LiteralPath $atomicOut,$atomicErr -Force -ErrorAction SilentlyContinue}
+}else{Write-Host '[SKIP] Windows-only: Windows Job Object kill-on-close and suspended launch'}
 
 $collisionName='Local\WorkspaceShare.Collision.'+[Guid]::NewGuid().ToString('N');$collisionJob=New-WorkspaceJob -Name $collisionName;$collisionRejected=$false
 try{try{$unexpectedJob=New-WorkspaceJob -Name $collisionName;try{Close-WorkspaceJob $unexpectedJob}catch{}}catch{$collisionRejected=($_.Exception.Message -match 'already exists')};Assert-True $collisionRejected 'Existing named Job collision is rejected'}finally{Close-WorkspaceJob $collisionJob}
 
+if($isWin){
 $resumeJob=New-WorkspaceJob -Name ('Local\WorkspaceShare.ResumeFault.'+[Guid]::NewGuid().ToString('N'));$resumeOut=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-resume-'+[Guid]::NewGuid().ToString('N')+'.out');$resumeErr=$resumeOut+'.err'
 try{$resumeFailed=$false;$resumePid=0;try{Start-WorkspaceProcessInJob -Job $resumeJob -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WorkingDirectory $ToolRoot -StdOutPath $resumeOut -StdErrPath $resumeErr -TestForceResumeFailure|Out-Null}catch{$resumeFailed=$true;$fault=$_.Exception;while($fault -and -not $fault.Data.Contains('ProcessId')){$fault=$fault.InnerException};if($fault){$resumePid=[int]$fault.Data['ProcessId']}};$resumeAbsent=$false;for($attempt=0;$attempt -lt 25;$attempt++){if($resumePid -gt 0 -and -not(Get-Process -Id $resumePid -ErrorAction SilentlyContinue)){$resumeAbsent=$true;break};Start-Sleep -Milliseconds 200};Assert-True ($resumeFailed -and $resumePid -gt 0 -and $resumeAbsent) 'Injected ResumeThread failure terminates the hidden child'}finally{try{Stop-WorkspaceJob $resumeJob}catch{};try{Close-WorkspaceJob $resumeJob}catch{};Remove-Item -LiteralPath $resumeOut,$resumeErr -Force -ErrorAction SilentlyContinue}
+}else{Write-Host '[SKIP] Windows-only: ResumeThread fault injection (Windows suspended-start)'}
 
-$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 60') -PassThru
+if($isWin){$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 60') -PassThru}else{$child = Start-Process -FilePath '/bin/sleep' -ArgumentList @('60') -PassThru}
 try {
     Start-Sleep -Milliseconds 200
-    $ticks = $child.StartTime.ToUniversalTime().Ticks
+    $ticks = Get-WorkspaceProcessStartTicks -Process $child
     $state = Get-ProcessIdentityState -ProcessId $child.Id -ExpectedPath $child.Path -ExpectedStartTicks $ticks
     Assert-True ($state.State -eq 'Match') 'Tracked child process identity matches'
     Assert-True (Stop-TrackedProcessConfirmed -ProcessId $child.Id -ExpectedPath $child.Path -ExpectedStartTicks $ticks -Attempts 5 -WaitMilliseconds 200) 'Tracked child process is confirmed stopped'
 } finally { try { if(-not $child.HasExited){Stop-Process -Id $child.Id -Force} } catch{}; try{$child.Dispose()}catch{} }
 
+if($isWin){
 $watchSession = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-watch-' + [Guid]::NewGuid().ToString('N'))
 $watchCloud = $null; $watchServer = $null; $watchdog = $null; $job=[IntPtr]::Zero
 try {
@@ -110,6 +119,7 @@ try{New-Item -ItemType Directory -Path $faultSession -Force|Out-Null;$shell=Join
 
 $invalidSession=Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-invalid-watch-'+[Guid]::NewGuid().ToString('N'));$invalidChild=$null;$invalidWatch=$null;$invalidJob=[IntPtr]::Zero
 try{New-Item -ItemType Directory -Path $invalidSession -Force|Out-Null;$shell=Join-Path $PSHOME 'powershell.exe';$invalidChild=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -PassThru;$invalidJob=New-WorkspaceJob -Name ('Local\WorkspaceShare.Invalid.'+[Guid]::NewGuid().ToString('N'));Add-ProcessToWorkspaceJob -Job $invalidJob -ProcessId $invalidChild.Id;$invalidArchive=Join-Path $invalidSession 'archive.zip';[IO.File]::WriteAllText($invalidArchive,'test');$parent=Get-Process -Id $PID;$invalidReady=Join-Path $invalidSession 'ready';$invalidStart=[Diagnostics.Stopwatch]::GetTimestamp();$invalidDuration=[int64](60*[Diagnostics.Stopwatch]::Frequency);$invalidWatch=Start-Process -FilePath $shell -ArgumentList @('-NoProfile','-File',('"{0}"' -f (Join-Path $ToolRoot 'scripts\Watch-WorkspaceShare.ps1')),'-ParentPid',$PID,'-ParentStartTicks',$parent.StartTime.ToUniversalTime().Ticks,'-ExpectedParentPath',('"{0}"' -f $parent.Path),'-MiniservePid',$invalidChild.Id,'-MiniserveStartTicks',($invalidChild.StartTime.ToUniversalTime().Ticks+1),'-CloudflaredPid',$invalidChild.Id,'-CloudflaredStartTicks',$invalidChild.StartTime.ToUniversalTime().Ticks,'-SessionPath',('"{0}"' -f $invalidSession),'-ArchivePath',('"{0}"' -f $invalidArchive),'-JobName','missing-job','-NormalExitMarker',('"{0}"' -f (Join-Path $invalidSession 'normal')),'-ReadyMarker',('"{0}"' -f $invalidReady),'-ExpiresUtc',([DateTime]::UtcNow.AddMinutes(1).ToString('o')),'-StartTimestamp',$invalidStart,'-DurationTicks',$invalidDuration,'-ExpectedMiniservePath',('"{0}"' -f $invalidChild.Path),'-ExpectedCloudflaredPath',('"{0}"' -f $invalidChild.Path)) -PassThru;$null=$invalidWatch.Handle;[void]$invalidWatch.WaitForExit(30000);Assert-True ($invalidWatch.HasExited -and $invalidWatch.ExitCode -ne 0 -and -not(Test-Path -LiteralPath $invalidReady)) 'Invalid child identity never publishes watchdog readiness'}finally{foreach($p in @($invalidWatch,$invalidChild)){try{if($p -and -not$p.HasExited){$p.Kill()}}catch{};try{if($p){$p.Dispose()}}catch{}};if($invalidJob -ne [IntPtr]::Zero){try{Close-WorkspaceJob $invalidJob}catch{}};Remove-Item -LiteralPath $invalidSession -Recurse -Force -ErrorAction SilentlyContinue}
+}else{Write-Host '[SKIP] Windows-only: watchdog scenarios with powershell.exe children (Linux: tests/Test-LinuxPlatform.ps1)'}
 
 $token = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 $safe = WorkspaceShare.Curl\Protect-DiagnosticText -Text ("https://x.trycloudflare.com/d/{0} %2Fd%2F{0} %252Fd%252F{0}" -f $token) -KnownSecretUrls @()
@@ -122,12 +132,14 @@ Assert-True ($classification -ne 'DnsMissing') 'Working system DNS is not miscla
 $classification = Get-TunnelClassification -LocalSampleValid $true -EndToEndSampleValid $false -HostnameAvailable $true -HostnameMatches $true -PublicHttpStatus 0 -CloudflareError 0 -PublicCurlExit 6 -OverrideDiagnosticSuccess $false -PublicDnsSuccessCount 0 -DnsChecked $true -SystemDnsSuccess $false -Ready $true
 Assert-True ($classification -eq 'DnsMissing') 'All failed DNS paths are classified as missing'
 
+if($isWin){
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-lock-' + [Guid]::NewGuid().ToString('N'))
 try {
     [IO.File]::WriteAllText($temporary, 'verified bytes')
     $lock = New-Object IO.FileStream($temporary,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try { $blocked = $false; try { $writer = New-Object IO.FileStream($temporary,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite); $writer.Dispose() } catch { $blocked = $true }; Assert-True $blocked 'Archive read lock prevents concurrent writes' } finally { $lock.Dispose() }
 } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}else{Write-Host '[SKIP] Windows-only: read-lock semantics (FileShare) are advisory flock on Linux'}
 
 if($failed -gt 0){exit 1}
 exit 0

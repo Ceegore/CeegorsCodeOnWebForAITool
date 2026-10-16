@@ -17,8 +17,18 @@ function Assert-True {
 }
 
 $testStart = Get-Date
-$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+$isWin = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+# Start-Process -WindowStyle exists only on Windows; the splat is empty on Linux.
+$hiddenWindow = @{}
+if ($isWin) { $hiddenWindow['WindowStyle'] = 'Hidden' }
+if ($isWin) {
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+}
+else {
+    $psExe = Join-Path $PSHOME 'pwsh'
+    $curl = (Get-Command curl -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
 $startScript = Join-Path $ToolRoot 'Start-WorkspaceShareGui.ps1'
 $fakeScript = Join-Path $PSScriptRoot 'Fake-WorkspaceShare.ps1'
 $guiIndex = Join-Path (Join-Path $ToolRoot 'gui') 'index.html'
@@ -199,7 +209,7 @@ function Start-BackgroundCurl {
     $all = @('-s', '--noproxy', '*', '--max-time', '120', '-o', $out, '-w', '%{http_code}') + $CurlArgs
     $quoted = @($all | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_ + '"' } else { $_ } })
     $codeF = $out + '.code'
-    $p = Start-Process -FilePath $curl -ArgumentList $quoted -PassThru -WindowStyle Hidden -RedirectStandardOutput $codeF -RedirectStandardError ($out + '.err')
+    $p = Start-Process -FilePath $curl -ArgumentList $quoted -PassThru @hiddenWindow -RedirectStandardOutput $codeF -RedirectStandardError ($out + '.err')
     $null = $p.Handle
     return [pscustomobject]@{ Proc = $p; Body = $out; CodeFile = $codeF }
 }
@@ -230,7 +240,8 @@ function Start-TestBackend {
     $env:WS_FAKE_SCENARIO = $Scenario
     $env:WS_FAKE_PIDFILE = $pidFile
     $argText = '-NoLogo -NoProfile -STA -File "{0}" -TestMode -NoBrowser -InstanceFile "{1}" -TestShareScript "{2}" -DataRootOverride "{3}" {4}' -f $StartScriptPath, $InstanceFile, $fakeScript, $DataRoot, $ExtraArgs
-    $p = Start-Process -FilePath $psExe -ArgumentList $argText -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    if (-not $isWin) { $argText = $argText.Replace(' -STA', '') }
+    $p = Start-Process -FilePath $psExe -ArgumentList $argText -PassThru @hiddenWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $null = $p.Handle
     $b = [pscustomobject]@{
         Name = $Name; Proc = $p; Instance = $InstanceFile; PidFile = $pidFile; Out = $outFile; Err = $errFile
@@ -373,11 +384,20 @@ try {
     [IO.File]::WriteAllText((Join-Path $shareDir 'a.txt'), 'x', $utf8)
 
     # ---- CLI contract
-    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestShareScript "{1}" -NoBrowser' -f $startScript, $fakeScript) -PassThru -WindowStyle Hidden -Wait
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestShareScript "{1}" -NoBrowser' -f $startScript, $fakeScript) -PassThru @hiddenWindow -Wait
     Assert-True ($p.ExitCode -eq 10) '-TestShareScript without -TestMode exits with 10'
 
     # ---- shortcut installer (never touches the real desktop / start menu)
     $lnkDir = Join-Path $tmp 'lnk'
+    if (-not $isWin) {
+        & $psExe -NoLogo -NoProfile -File (Join-Path $ToolRoot 'Install-GuiShortcut.ps1') -TargetDirectory $lnkDir | Out-Null
+        $desktopFile = Join-Path $lnkDir 'workspaceshare.desktop'
+        $desktopText = if (Test-Path -LiteralPath $desktopFile) { [IO.File]::ReadAllText($desktopFile) } else { '' }
+        Assert-True ($LASTEXITCODE -eq 0 -and $desktopText -match '(?m)^Exec=.*pwsh.*Start-WorkspaceShareGui\.ps1') 'Install-GuiShortcut -TargetDirectory creates workspaceshare.desktop (Exec uses pwsh)'
+        & $psExe -NoLogo -NoProfile -File (Join-Path $ToolRoot 'Install-GuiShortcut.ps1') -Remove -TargetDirectory $lnkDir | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath $desktopFile)) 'Install-GuiShortcut -Remove deletes workspaceshare.desktop'
+    }
+    else {
     & $psExe -NoLogo -NoProfile -File (Join-Path $ToolRoot 'Install-GuiShortcut.ps1') -TargetDirectory $lnkDir | Out-Null
     $lnkCode = $LASTEXITCODE
     $lnk = Join-Path $lnkDir 'WorkspaceShare.lnk'
@@ -392,6 +412,7 @@ try {
     }
     & $psExe -NoLogo -NoProfile -File (Join-Path $ToolRoot 'Install-GuiShortcut.ps1') -Remove -TargetDirectory $lnkDir | Out-Null
     Assert-True (-not (Test-Path -LiteralPath $lnk)) 'Install-GuiShortcut -Remove deletes the shortcut'
+    }
 
     # ================= backend A: success scenario
     $A = Start-TestBackend -Scenario 'success' -Name 'A'
@@ -456,7 +477,7 @@ try {
     # idle state (v2)
     $r = Invoke-Api -Path '/api/state' -B $A -Token $A.Token
     $s = $r.Json
-    Assert-True ($r.Status -eq 200 -and $s.v -eq 2 -and $s.platform -eq 'windows' -and $s.running -eq 0 -and @($s.shares).Count -eq 0) '/api/state with token -> 200, state v2, no shares, running 0'
+    Assert-True ($r.Status -eq 200 -and $s.v -eq 2 -and $s.platform -eq $(if ($isWin) { 'windows' } else { 'linux' }) -and $s.running -eq 0 -and @($s.shares).Count -eq 0) '/api/state with token -> 200, state v2, no shares, running 0'
     Assert-True ($null -eq $s.PSObject.Properties['phase'] -and $null -eq $s.PSObject.Properties['url'] -and $null -eq $s.PSObject.Properties['drop']) 'state v2 has no top-level phase/url/drop (they live in shares[] and draft)'
     Assert-True ($null -ne $s.capabilities -and $null -ne $s.capabilities.folderPicker -and $null -ne $s.capabilities.clipboard -and $null -ne $s.capabilities.openBrowser) 'state has capabilities'
     Assert-True ($null -ne $s.draft -and $null -eq $s.draft.drop -and $s.limits.maxDropBytes -eq 4GB -and $s.limits.maxDropFiles -eq 10000 -and $s.limits.maxShares -eq 5) 'idle state: draft.drop is null, limits carry the defaults (4 GiB, 10000 files, 5 shares)'
@@ -533,7 +554,8 @@ try {
     # single instance: second backend with the same instance file exits 0 quickly, file unchanged
     $before = [IO.File]::ReadAllText($A.Instance)
     $argText = '-NoLogo -NoProfile -STA -File "{0}" -TestMode -NoBrowser -InstanceFile "{1}" -TestShareScript "{2}" -DataRootOverride "{3}"' -f $startScript, $A.Instance, $fakeScript, $A.DataRoot
-    $second = Start-Process -FilePath $psExe -ArgumentList $argText -PassThru -WindowStyle Hidden
+    if (-not $isWin) { $argText = $argText.Replace(' -STA', '') }
+    $second = Start-Process -FilePath $psExe -ArgumentList $argText -PassThru @hiddenWindow
     $null = $second.Handle
     $secondExited = $second.WaitForExit(10000)
     Assert-True ($secondExited -and $second.ExitCode -eq 0) 'second backend with the same instance file exits 0 within 10 s'
@@ -637,7 +659,7 @@ try {
     Assert-True (Wait-Until -TimeoutSec 15 -Condition { -not (Test-PidAlive $fakesD[0].Pid) -and -not (Test-PidAlive $fakesD[1].Pid) }) 'D: both fake shares exit within 15 s after the backend was killed'
 
     # ================= -DataRootOverride is a test-only parameter
-    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -DataRootOverride "{1}" -NoBrowser' -f $startScript, (Join-Path $tmp 'data-x')) -PassThru -WindowStyle Hidden -Wait
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -DataRootOverride "{1}" -NoBrowser' -f $startScript, (Join-Path $tmp 'data-x')) -PassThru @hiddenWindow -Wait
     Assert-True ($p.ExitCode -eq 10 -and -not (Test-Path -LiteralPath (Join-Path $tmp 'data-x'))) '-DataRootOverride without -TestMode exits with 10'
 
     # ================= backend E: drag & drop (GUI_CONTRACT section 7)
@@ -691,8 +713,8 @@ try {
     $r = Invoke-Post $E '/api/drop/finish' @{ dropId = $drop1 }
     $expectedTotal = 1234 + ([IO.FileInfo]$srcUml).Length + 5242880
     Assert-True ($r.Status -eq 200 -and $r.Json.path -eq $leaf1 -and $r.Json.files -eq 3 -and $r.Json.totalBytes -eq $expectedTotal) 'E: drop/finish -> path, files 3, totalBytes'
-    Assert-True ((Test-Path -LiteralPath (Join-Path $leaf1 'sub\ordner\c.bin')) -and (Test-Path -LiteralPath (Join-Path $leaf1 'Bericht ä.txt')) -and (Test-Path -LiteralPath (Join-Path $leaf1 'big.bin'))) 'E: all three files exist in the drop folder with their relative paths'
-    Assert-True ((Get-FileSha (Join-Path $leaf1 'big.bin')) -eq (Get-FileSha $srcBig) -and (Get-FileSha (Join-Path $leaf1 'sub\ordner\c.bin')) -eq (Get-FileSha $srcC) -and (Get-FileSha (Join-Path $leaf1 'Bericht ä.txt')) -eq (Get-FileSha $srcUml)) 'E: uploaded files are bit-identical (SHA-256)'
+    Assert-True ((Test-Path -LiteralPath (Join-Path (Join-Path (Join-Path $leaf1 'sub') 'ordner') 'c.bin')) -and (Test-Path -LiteralPath (Join-Path $leaf1 'Bericht ä.txt')) -and (Test-Path -LiteralPath (Join-Path $leaf1 'big.bin'))) 'E: all three files exist in the drop folder with their relative paths'
+    Assert-True ((Get-FileSha (Join-Path $leaf1 'big.bin')) -eq (Get-FileSha $srcBig) -and (Get-FileSha (Join-Path (Join-Path (Join-Path $leaf1 'sub') 'ordner') 'c.bin')) -eq (Get-FileSha $srcC) -and (Get-FileSha (Join-Path $leaf1 'Bericht ä.txt')) -eq (Get-FileSha $srcUml)) 'E: uploaded files are bit-identical (SHA-256)'
     Assert-True ((Get-FileCount $dropsE) -eq 3) 'E: exactly three files below drops'
     $s = Get-State $E
     Assert-True ($s.draft.drop.finished -eq $true -and $s.draft.drop.files -eq 3 -and $s.draft.drop.totalBytes -eq $expectedTotal -and $s.draft.drop.path -eq $leaf1) 'E: state.draft.drop finished with path, files, totalBytes'
@@ -881,7 +903,7 @@ try {
     Assert-True ((Get-FileCount $dropsF) -eq 0) 'F: quit removed the finished, unused drop'
 
     # ================= build id and static cache (backend G runs from a copy of the repo)
-    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestBuildId abc -NoBrowser' -f $startScript) -PassThru -WindowStyle Hidden -Wait
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestBuildId abc -NoBrowser' -f $startScript) -PassThru @hiddenWindow -Wait
     Assert-True ($p.ExitCode -eq 10) '-TestBuildId without -TestMode exits with 10'
     $copyRoot = Join-Path $tmp 'repo-copy'
     [void](New-Item -ItemType Directory -Path (Join-Path $copyRoot 'scripts') -Force)
@@ -889,9 +911,9 @@ try {
     foreach ($f in @('VERSION', 'Start-WorkspaceShareGui.ps1')) { Copy-Item -LiteralPath (Join-Path $ToolRoot $f) -Destination $copyRoot }
     Copy-Item -Path (Join-Path $ToolRoot 'scripts\*.psm1') -Destination (Join-Path $copyRoot 'scripts')
     Copy-Item -Path (Join-Path $ToolRoot 'gui\*') -Destination (Join-Path $copyRoot 'gui')
-    Remove-Item -LiteralPath (Join-Path $copyRoot 'gui\favicon.svg') -Force   # a missing file contributes its name only
-    $copyApp = Join-Path $copyRoot 'gui\app.js'
-    $copyCss = Join-Path $copyRoot 'gui\app.css'
+    Remove-Item -LiteralPath (Join-Path (Join-Path $copyRoot 'gui') 'favicon.svg') -Force   # a missing file contributes its name only
+    $copyApp = Join-Path (Join-Path $copyRoot 'gui') 'app.js'
+    $copyCss = Join-Path (Join-Path $copyRoot 'gui') 'app.css'
     $appShaAtStart = Get-FileSha $copyApp
     $expectedBuild = Get-ExpectedBuild $copyRoot
     $G = Start-TestBackend -Scenario 'success' -Name 'G' -StartScriptPath (Join-Path $copyRoot 'Start-WorkspaceShareGui.ps1')
@@ -971,10 +993,10 @@ try {
 
     # ================= several shares at the same time (GUI_CONTRACT section 8)
     foreach ($mx in @('0', '11', '-3')) {
-        $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestMode -NoBrowser -MaxShares {1}' -f $startScript, $mx) -PassThru -WindowStyle Hidden -Wait
+        $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestMode -NoBrowser -MaxShares {1}' -f $startScript, $mx) -PassThru @hiddenWindow -Wait
         Assert-True ($p.ExitCode -eq 10) "-MaxShares $mx exits with 10 (allowed range 1..10)"
     }
-    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestPickerResult "0:" -NoBrowser' -f $startScript) -PassThru -WindowStyle Hidden -Wait
+    $p = Start-Process -FilePath $psExe -ArgumentList ('-NoLogo -NoProfile -File "{0}" -TestPickerResult "0:" -NoBrowser' -f $startScript) -PassThru @hiddenWindow -Wait
     Assert-True ($p.ExitCode -eq 10) '-TestPickerResult without -TestMode exits with 10'
 
     $srcTinyN = Join-Path $tmp 'src-tiny-n.txt'
@@ -1280,7 +1302,7 @@ finally {
 
 # ---------------------------------------------------------------- CodeIntegrity (Smart App Control) check
 $blocked = @()
-try {
+if ($isWin) { try {
     $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = 3033, 3077; StartTime = $testStart } -ErrorAction SilentlyContinue)
     $repoTail = $ToolRoot
     if ($repoTail.Length -gt 3 -and $repoTail[1] -eq ':') { $repoTail = $repoTail.Substring(2) }
@@ -1289,7 +1311,8 @@ try {
         if ($m -match '(?i)powershell' -or $m.IndexOf($repoTail, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $blocked += $e }
     }
 }
-catch { }
+catch { } }
+else { Write-Host '[SKIP] CodeIntegrity/Smart-App-Control-Prüfung gibt es nur unter Windows' }
 
 Write-Host ''
 Write-Host "Passed: $($script:Pass)  Failed: $($script:Fail)"
