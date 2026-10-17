@@ -44,6 +44,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           $rc = 0
+          # Child stderr must be logged, not turned into a terminating error by the step's default 'Stop'.
+          $ErrorActionPreference = 'Continue'
           foreach ($suite in @(@('Test-WorkspaceShare', 'test-output'), @('Test-LifecycleHardening', 'lifecycle-output'), @('Test-NativeRunnerSmoke', 'native-runner-output'), @('Test-WorkspaceShareGui.Http', 'gui-http-output'), @('Test-WorkspaceShareGui', 'gui-output'))) {
             $global:LASTEXITCODE = 0
             # Each suite runs in its own process (no state leaks between suites; errors keep their position).
