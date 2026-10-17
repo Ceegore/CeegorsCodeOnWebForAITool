@@ -2,6 +2,9 @@
 
 Teilt einen Ordner oder ein paar Dateien für eine Weile über einen geheimen Link – z. B. um Code in einen KI-Webchat zu geben, ohne ihn auf GitHub zu stellen. Der Empfänger bekommt ein ZIP, mehr nicht. Kein Konto, keine Portfreigabe.
 
+<img width="1461" height="906" alt="grafik" src="https://github.com/user-attachments/assets/90c90d28-531f-4807-b4a6-80471254aee8" />
+
+
 ## Windows
 
 1. ZIP von den [Releases](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases/latest) laden und entpacken.
