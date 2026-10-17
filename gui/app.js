@@ -17,7 +17,7 @@
   var MSG_OUTDATED = 'Der WorkspaceShare-Dienst ist veraltet. Bitte unten auf „Beenden“ klicken und WorkspaceShare über die Verknüpfung neu starten.';
   var MSG_UPDATED = 'WorkspaceShare wurde aktualisiert. Bitte das Fenster schließen und über die Verknüpfung neu öffnen.';
 
-  // Mirrors the exit-code table in README.md.
+  // Mirrors the exit-code table in docs/DETAILS.md.
   var EXIT_TEXTS = {
     10: 'Umgebung oder Parameter ungültig.',
     11: 'Abhängigkeiten oder Lockfile fehlerhaft (Dependency-Lock/Hash).',
