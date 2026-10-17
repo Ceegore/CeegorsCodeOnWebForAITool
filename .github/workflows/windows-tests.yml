@@ -46,8 +46,9 @@ jobs:
           $rc = 0
           foreach ($suite in @(@('Test-WorkspaceShare', 'test-output'), @('Test-LifecycleHardening', 'lifecycle-output'), @('Test-NativeRunnerSmoke', 'native-runner-output'), @('Test-WorkspaceShareGui.Http', 'gui-http-output'), @('Test-WorkspaceShareGui', 'gui-output'))) {
             $global:LASTEXITCODE = 0
-            try { & ".\tests\$($suite[0]).ps1" *>&1 | Tee-Object -FilePath "artifacts\$($suite[1]).txt" }
-            catch { Write-Host "::error::$($suite[0]) threw: $($_.Exception.Message)"; $global:LASTEXITCODE = 1 }
+            # Each suite runs in its own process (no state leaks between suites; errors keep their position).
+            try { & (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -File ".\tests\$($suite[0]).ps1" *>&1 | Tee-Object -FilePath "artifacts\$($suite[1]).txt" }
+            catch { Write-Host "::error::$($suite[0]) threw: $($_.Exception.Message)`n$($_.InvocationInfo.PositionMessage)`n$($_.ScriptStackTrace)"; $global:LASTEXITCODE = 1 }
             if ($LASTEXITCODE -ne 0 -and $rc -eq 0) { $rc = $LASTEXITCODE }
           }
           exit $rc
