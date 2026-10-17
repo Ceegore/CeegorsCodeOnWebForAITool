@@ -29,13 +29,19 @@ if ([string]::IsNullOrWhiteSpace($ToolRoot)) {
     $ToolRoot = Split-Path $PSScriptRoot -Parent
 }
 
+$isWin = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 $bin = Join-Path $ToolRoot 'bin'
-$miniserve = Join-Path $bin 'miniserve.exe'
+if (-not $isWin) { $bin = Join-Path $bin 'linux-x64' }
+$exeSuffix = if ($isWin) { '.exe' } else { '' }
+$miniserve = Join-Path $bin ('miniserve' + $exeSuffix)
+$sevenZipName = if ($isWin) { '7za.exe' } else { '7zz' }
+$nullDevice = if ($isWin) { 'NUL' } else { '/dev/null' }
+$testHost = if ($isWin) { Join-Path $PSHOME 'powershell.exe' } else { Join-Path $PSHOME 'pwsh' }
 $lockPath = Join-Path $ToolRoot 'dependencies.lock.json'
 $shareScript = Join-Path $ToolRoot 'Share-Workspace.ps1'
-$healthModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Health.psm1'
-$curlModule = Join-Path $ToolRoot 'scripts\WorkspaceShare.Curl.psm1'
-$curl = (Get-Command 'curl.exe' -ErrorAction Stop).Source
+$healthModule = Join-Path (Join-Path $ToolRoot 'scripts') 'WorkspaceShare.Health.psm1'
+$curlModule = Join-Path (Join-Path $ToolRoot 'scripts') 'WorkspaceShare.Curl.psm1'
+$curl = (Get-Command $(if ($isWin) { 'curl.exe' } else { 'curl' }) -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('WorkspaceShare-Test-' + [Guid]::NewGuid().ToString('N'))
 $server = $null
 $failed = 0
@@ -135,7 +141,7 @@ function Curl-Status {
 
     $arguments = @(
         '--silent','--show-error',
-        '--output','NUL',
+        '--output',$nullDevice,
         '--write-out','%{http_code}',
         '--max-time','15'
     )
@@ -181,7 +187,7 @@ function Invoke-ShareChild {
     param([string[]]$Arguments, [int]$TimeoutSeconds = 600)
 
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = Join-Path $PSHOME 'powershell.exe'
+    $psi.FileName = $testHost
     $childArguments = @('-NoLogo','-NoProfile','-NonInteractive','-File',$shareScript) + @($Arguments)
     $psi.Arguments = (($childArguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
     $psi.UseShellExecute = $false
@@ -258,12 +264,16 @@ try {
         Assert-True ([int]$lock.schema -eq 2) 'Lockfile-Schema ist 2'
         Assert-True ([bool]$lock.installed) 'Lockfile bestätigt installierte Abhängigkeiten'
         $expectedLockPaths = @{ cloudflared='bin/cloudflared.exe'; miniserve='bin/miniserve.exe'; Gitleaks='bin/gitleaks.exe'; '7-Zip'='bin/7za.exe' }
+        if (-not $isWin) {
+            $expectedLockPaths = @{ cloudflared='bin/linux-x64/cloudflared'; miniserve='bin/linux-x64/miniserve'; Gitleaks='bin/linux-x64/gitleaks'; '7-Zip'='bin/linux-x64/7zz' }
+            Assert-True ([string]$lock.platform -eq 'linux-x64') 'Lockfile-Plattform ist linux-x64'
+        }
         Assert-True (@($lock.dependencies).Count -eq $expectedLockPaths.Count) 'Lockfile enthält exakt die erwartete Abhängigkeitsanzahl'
 
         foreach ($dependency in @($lock.dependencies)) {
             $expectedPath = $expectedLockPaths[[string]$dependency.name]
             Assert-True ($null -ne $expectedPath -and ([string]$dependency.file).Replace('\','/') -eq $expectedPath) ('Lockpfad stimmt: ' + $dependency.name)
-            $path = Join-Path $ToolRoot $expectedPath.Replace('/', '\')
+            $path = Join-Path $ToolRoot $expectedPath.Replace('/', [string][IO.Path]::DirectorySeparatorChar)
             $exists = Test-Path -LiteralPath $path -PathType Leaf
             Assert-True $exists ("Lockdatei vorhanden: " + $dependency.name)
             if ($exists) {
@@ -347,10 +357,10 @@ try {
         Assert-True ($hostnameOnlySanitized -notmatch 'unit-test\.trycloudflare\.com') 'Diagnosesanitizer entfernt auch hostname-only Felder'
     }
     if($excludeAst -and $manifestAst){
-        Import-Module (Join-Path $ToolRoot 'scripts\WorkspaceShare.Path.psm1') -Force
+        Import-Module (Join-Path (Join-Path $ToolRoot 'scripts') 'WorkspaceShare.Path.psm1') -Force
         Invoke-Expression $excludeAst.Extent.Text;Invoke-Expression $manifestAst.Extent.Text
         $readPatterns={param($file)@(Get-Content -LiteralPath $file|ForEach-Object{$_.Trim()}|Where-Object{$_ -and -not $_.StartsWith('#')})}
-        $mandatoryPatterns=@(& $readPatterns (Join-Path $ToolRoot 'config\mandatory-excludes.txt'));$generatedPatterns=@(& $readPatterns (Join-Path $ToolRoot 'config\generated-excludes.txt'))
+        $mandatoryPatterns=@(& $readPatterns (Join-Path (Join-Path $ToolRoot 'config') 'mandatory-excludes.txt'));$generatedPatterns=@(& $readPatterns (Join-Path (Join-Path $ToolRoot 'config') 'generated-excludes.txt'))
         Assert-True ($mandatoryPatterns.Count -gt 0 -and $generatedPatterns.Count -gt 0) 'Ausschlussmuster werden aus config\ geladen'
         $allPatterns=@($mandatoryPatterns)+@($generatedPatterns)
         $isExcluded={param($relative,$patterns)Test-SourcePathExcluded -RelativePath $relative -Name ([IO.Path]::GetFileName($relative)) -Patterns $patterns}
@@ -362,9 +372,10 @@ try {
         Assert-True (& $isExcluded 'pages\[id]\page.tsx' @('pages\[id]\*')) 'Klammermuster pages\[id]\* trifft den literalen Pfad'
         Assert-True (-not(& $isExcluded 'pages\i\page.tsx' @('pages\[id]\*'))) 'Klammermuster pages\[id]\* wird nicht als Zeichenklasse interpretiert'
         $manifestRoot=Join-Path $temp 'manifest-fixture';New-Item -ItemType Directory -Path (Join-Path $manifestRoot 'node_modules') -Force|Out-Null
-        Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'one';Set-Content -LiteralPath (Join-Path $manifestRoot 'node_modules\cache.txt') -Value 'one'
+        $manifestCache=Join-Path (Join-Path $manifestRoot 'node_modules') 'cache.txt'
+        Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'one';Set-Content -LiteralPath $manifestCache -Value 'one'
         $manifestOne=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
-        Set-Content -LiteralPath (Join-Path $manifestRoot 'node_modules\cache.txt') -Value 'two'
+        Set-Content -LiteralPath $manifestCache -Value 'two'
         $manifestTwo=@(Get-SourceConsistencyManifest -Root $manifestRoot -ExclusionPatterns @('node_modules'))
         Assert-True (-not(Compare-Object $manifestOne $manifestTwo)) 'Änderungen an ausgeschlossenen Dateien ändern das Konsistenzmanifest nicht'
         Set-Content -LiteralPath (Join-Path $manifestRoot 'included.txt') -Value 'two'
@@ -418,28 +429,41 @@ try {
         exit 1
     }
     $resolveLine='resolve = "fake.example:{0}:127.0.0.1"' -f $port
-    $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output','NUL','--write-out','%{http_code}') -PrivateConfigLines @($resolveLine)
+    $resolvedResult=WorkspaceShare.Curl\Invoke-CurlWithPrivateUrl -CurlPath $curl -Url ("http://fake.example:{0}/d/{1}/" -f $port,$token) -Arguments @('--silent','--show-error','--noproxy','*','--head','--output',$nullDevice,'--write-out','%{http_code}') -PrivateConfigLines @($resolveLine)
     Assert-True ($resolvedResult.ExitCode -eq 0 -and ((($resolvedResult.StdOut | Select-Object -Last 1) | Out-String).Trim()) -eq '200') 'Private resolve-Konfiguration ist gültig, wird angewendet und bleibt aus argv'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/" -Extra @('--head')) -in @(401,403,404)) 'Root ohne Token liefert eine explizite 4xx-Ablehnung'
     Assert-True ((Curl-Status -Url "http://127.0.0.1:$port/d/$(New-Token)/" -Extra @('--head')) -in @(401,403,404)) 'Falsches Token liefert eine explizite 4xx-Ablehnung'
 
     try {
-        $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($server.Id)").CommandLine
+        if ($isWin) { $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($server.Id)").CommandLine }
+        else { $commandLine = ([IO.File]::ReadAllText("/proc/$($server.Id)/cmdline")) -replace "`0",' ' }
         Assert-True ($commandLine -notmatch [regex]::Escape($token)) 'Token fehlt in miniserve-Prozesskommandozeile'
     }
     catch {
         Assert-True $false "Prozesskommandozeile nicht prüfbar: $($_.Exception.Message)"
     }
 
-    try {
-        $connections = @(Get-NetTCPConnection -OwningProcess $server.Id -State Listen -ErrorAction Stop)
-        Assert-True ($connections.Count -gt 0) 'miniserve besitzt einen Listening-Socket'
-        foreach ($connection in $connections) {
-            Assert-True ($connection.LocalAddress -in @('127.0.0.1','::1')) 'Listening-Socket ist nur Loopback'
+    if ($isWin) {
+        try {
+            $connections = @(Get-NetTCPConnection -OwningProcess $server.Id -State Listen -ErrorAction Stop)
+            Assert-True ($connections.Count -gt 0) 'miniserve besitzt einen Listening-Socket'
+            foreach ($connection in $connections) {
+                Assert-True ($connection.LocalAddress -in @('127.0.0.1','::1')) 'Listening-Socket ist nur Loopback'
+            }
+        }
+        catch {
+            Assert-True $false "Loopback-Listen-Bindung nicht prüfbar: $($_.Exception.Message)"
         }
     }
-    catch {
-        Assert-True $false "Loopback-Listen-Bindung nicht prüfbar: $($_.Exception.Message)"
+    else {
+        # Linux: ss -ltn lists the listening sockets; the port must be bound to loopback only.
+        $ssCommand = Get-Command ss -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($ssCommand) {
+            $listening = @(& $ssCommand.Source -H -ltn 2>$null | Where-Object { $_ -match (':{0}\s' -f $port) })
+            Assert-True ($listening.Count -gt 0) 'miniserve besitzt einen Listening-Socket'
+            Assert-True (@($listening | Where-Object { $_ -notmatch '127\.0\.0\.1:|\[::1\]:' }).Count -eq 0) 'Listening-Socket ist nur Loopback'
+        }
+        else { Write-Host '[SKIP] ss nicht verfügbar: Listening-Socket-Prüfung übersprungen' }
     }
 
     $rangeFile = Join-Path $temp 'range.bin'
@@ -495,7 +519,7 @@ try {
     Assert-True (-not (Compare-Object $beforeFiles $afterFiles)) 'Mutation-Probes erzeugen keine zusätzlichen Dateien'
 
     $headers = Join-Path $temp 'local-headers.txt'
-    [void](Invoke-TestCurl -Url $localUrl -Arguments @('--silent','--head','--dump-header',$headers,'--output','NUL'))
+    [void](Invoke-TestCurl -Url $localUrl -Arguments @('--silent','--head','--dump-header',$headers,'--output',$nullDevice))
     $headerText = if(Test-Path -LiteralPath $headers -PathType Leaf){Get-Content -LiteralPath $headers -Raw}else{''}
     Assert-True ($headerText -match '(?im)^cache-control:.*no-store') 'Lokales Cache-Control enthält no-store'
 
@@ -527,7 +551,7 @@ try {
         Assert-True ((Get-Item -LiteralPath $publicRange).Length -eq 1024) 'Öffentliche Range liefert 1024 Bytes'
 
         $publicHeaders = Join-Path $temp 'public-headers.txt'
-        [void](Invoke-TestCurl -Url $PublicUrl -Arguments @('--silent','--head','--dump-header',$publicHeaders,'--output','NUL'))
+        [void](Invoke-TestCurl -Url $PublicUrl -Arguments @('--silent','--head','--dump-header',$publicHeaders,'--output',$nullDevice))
         $publicHeaderText = Get-Content -LiteralPath $publicHeaders -Raw
         Assert-True ($publicHeaderText -match '(?im)^cache-control:.*no-store') 'Öffentliches Cache-Control enthält no-store'
         Assert-True ($publicHeaderText -notmatch '(?im)^cf-cache-status:\s*HIT\s*$') 'Cloudflare meldet keinen Cache-HIT'
@@ -545,10 +569,10 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $snapshotWorkspace '.git') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $snapshotWorkspace 'node_modules') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'hello.txt') -Value 'hello' -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'sub\readme.md') -Value '# readme' -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'sub\.npmrc') -Value 'registry=https://example.invalid/' -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $snapshotWorkspace '.git\config') -Value '[core]' -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $snapshotWorkspace 'node_modules\x.js') -Value 'x' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path (Join-Path $snapshotWorkspace 'sub') 'readme.md') -Value '# readme' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path (Join-Path $snapshotWorkspace 'sub') '.npmrc') -Value 'registry=https://example.invalid/' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path (Join-Path $snapshotWorkspace '.git') 'config') -Value '[core]' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path (Join-Path $snapshotWorkspace 'node_modules') 'x.js') -Value 'x' -Encoding ASCII
 
     $keptSessionPath = $null
     try {
@@ -583,7 +607,7 @@ try {
         }
         Assert-True ($null -ne $zipItem) '-KeepArchive erhält das ZIP im gemeldeten Sitzungsordner'
         if ($zipItem) {
-            $sevenZip = Join-Path $bin '7za.exe'
+            $sevenZip = Join-Path $bin $sevenZipName
             $zipListing = @(& $sevenZip l -ba $zipItem.FullName)
             Assert-True ($LASTEXITCODE -eq 0) '7-Zip kann das erhaltene ZIP auflisten'
             $zipText = ($zipListing -join "`n")
@@ -626,8 +650,15 @@ try {
     }
     finally {
         # Nur den eigenen, per Event gemeldeten Sitzungsordner unterhalb des Sitzungsbasisordners löschen.
-        if ($keptSessionPath -and $env:LOCALAPPDATA) {
-            $sessionRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions')).TrimEnd('\') + '\'
+        $sessionBaseForCleanup = $null
+        if ($isWin) { if ($env:LOCALAPPDATA) { $sessionBaseForCleanup = Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions' } }
+        else {
+            $dataHome = $env:XDG_DATA_HOME
+            if ([string]::IsNullOrWhiteSpace($dataHome)) { $dataHome = Join-Path (Join-Path $env:HOME '.local') 'share' }
+            $sessionBaseForCleanup = Join-Path (Join-Path $dataHome 'workspaceshare') 'sessions'
+        }
+        if ($keptSessionPath -and $sessionBaseForCleanup) {
+            $sessionRoot = [IO.Path]::GetFullPath($sessionBaseForCleanup).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
             $fullKept = [IO.Path]::GetFullPath($keptSessionPath)
             if ($fullKept.StartsWith($sessionRoot, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $fullKept -Leaf) -match '^\d{8}-\d{6}-[0-9a-f]{8}$') {
                 Remove-Item -LiteralPath $fullKept -Recurse -Force -ErrorAction SilentlyContinue

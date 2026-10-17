@@ -18,3 +18,9 @@ dist/
 
 # Local test fixtures can contain intentionally unsafe samples.
 tests/fixtures/
+
+# Linux dependencies (experimental)
+bin/linux-x64/
+
+# Local Claude Code state and agent worktrees.
+.claude/

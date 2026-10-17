@@ -3,9 +3,15 @@
 param([switch]$KeepArchives)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Continue'
-try{Import-Module (Join-Path $PSScriptRoot 'scripts\WorkspaceShare.Process.psm1') -Force -ErrorAction Stop}catch{[Console]::Error.WriteLine("Shared process module could not be loaded: $($_.Exception.Message)");exit 1}
-try{Import-Module (Join-Path $PSScriptRoot 'scripts\WorkspaceShare.Job.psm1') -Force -ErrorAction Stop}catch{[Console]::Error.WriteLine("Shared Job module could not be loaded: $($_.Exception.Message)");exit 1}
+try{Import-Module (Join-Path (Join-Path $PSScriptRoot 'scripts') 'WorkspaceShare.Process.psm1') -Force -ErrorAction Stop}catch{[Console]::Error.WriteLine("Shared process module could not be loaded: $($_.Exception.Message)");exit 1}
+try{Import-Module (Join-Path (Join-Path $PSScriptRoot 'scripts') 'WorkspaceShare.Job.psm1') -Force -ErrorAction Stop}catch{[Console]::Error.WriteLine("Shared Job module could not be loaded: $($_.Exception.Message)");exit 1}
+if([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT){
+    try{Import-Module (Join-Path (Join-Path $PSScriptRoot 'scripts') 'WorkspaceShare.Platform.psm1') -Force -ErrorAction Stop}catch{[Console]::Error.WriteLine("Platform module could not be loaded: $($_.Exception.Message)");exit 1}
+    $sessionBase=Join-Path (Get-WsDataRoot) 'sessions'
+}
+else{
 $sessionBase=if($env:LOCALAPPDATA){Join-Path $env:LOCALAPPDATA 'WorkspaceShare\sessions'}else{Join-Path ([IO.Path]::GetTempPath()) 'WorkspaceShare\sessions'}
+}
 $exitCode=0
 function Test-SafeSession($Session){
     $required=@('magic','schema','phase','launcherPid','launcherPath','launcherStartTicks','cloudflaredPid','cloudflaredPath','cloudflaredStartTicks','miniservePid','miniservePath','miniserveStartTicks','watchdogPid','watchdogPath','watchdogStartTicks','archivePath','keepArchive','jobName')

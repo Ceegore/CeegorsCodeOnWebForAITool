@@ -25,8 +25,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Process.psm1') -Force -ErrorAction Stop
-Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts') 'WorkspaceShare.Process.psm1') -Force -ErrorAction Stop
+Import-Module (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts') 'WorkspaceShare.Job.psm1') -Force -ErrorAction Stop
 
 function Get-State([int]$Id,[string]$Path,[long]$Ticks){Get-ProcessIdentityState -ProcessId $Id -ExpectedPath $Path -ExpectedStartTicks $Ticks}
 function Test-Gone($State){$State.State -in @('Absent','Conflict')}
@@ -44,7 +44,7 @@ try {
     $parentState=Get-State $ParentPid $ExpectedParentPath $ParentStartTicks
     $serverState=Get-State $MiniservePid $ExpectedMiniservePath $MiniserveStartTicks
     $cloudState=Get-State $CloudflaredPid $ExpectedCloudflaredPath $CloudflaredStartTicks
-    if($parentState.State -ne 'Match' -or $serverState.State -ne 'Match' -or $cloudState.State -ne 'Match'){throw 'Tracked process identity validation failed.'}
+    if($parentState.State -ne 'Match' -or $serverState.State -ne 'Match' -or $cloudState.State -ne 'Match'){throw ('Tracked process identity validation failed. parent={0} [{1}] miniserve={2} [{3}] cloudflared={4} [{5}]' -f $parentState.State,$parentState.Message,$serverState.State,$serverState.Message,$cloudState.State,$cloudState.Message)}
     $job=Open-WorkspaceJob -Name $JobName
     $archiveLock=New-Object IO.FileStream($ArchivePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     New-Item -ItemType File -Path $ReadyMarker -Force -ErrorAction Stop|Out-Null
@@ -78,6 +78,8 @@ try {
 }
 catch {
     $exitCode=50
+    # Reason for the log of whoever started the watchdog (no secrets in these messages).
+    try { [Console]::Error.WriteLine('Watchdog: ' + $_.Exception.Message) } catch { }
 }
 finally {
     if(-not $normalCompletion -and $job -ne [IntPtr]::Zero){try{Stop-WorkspaceJob -Job $job}catch{}}

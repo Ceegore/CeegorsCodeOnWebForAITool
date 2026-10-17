@@ -1,7 +1,8 @@
-# WorkspaceShare on Linux – Plan (not implemented)
+# WorkspaceShare on Linux – Plan and status
 
-Status: plan only, 2026-10-16. Windows remains the primary product. The GUI is already
-built so that this port needs no second code base (see `docs/GUI_CONTRACT.md` §1 and §3).
+Status: stage 1 implemented, 2026-10-16 (**experimental**, only exercised on GitHub Actions
+`ubuntu-latest` so far). Windows remains the primary product and stays on Windows PowerShell 5.1.
+The GUI is built so that this port needs no second code base (see `docs/GUI_CONTRACT.md` §1 and §3).
 
 ## 1. Decision: one PowerShell code base, PowerShell 7 on Linux
 
@@ -25,50 +26,79 @@ Why the current stack is *not* too complicated for Linux:
 The Windows build keeps running on Windows PowerShell 5.1, which is the measured SAC-safe
 host. Linux has no SAC, so there are no code-integrity constraints there.
 
-## 2. Windows-specific pieces and their Linux replacement
+## 2. Windows-specific pieces and their Linux replacement (as implemented)
 
-| Area | Windows today | Linux replacement | Where |
+| Area | Windows | Linux (implemented) | Where |
 |---|---|---|---|
-| Process lifetime | Job Object with kill-on-close via P/Invoke (`WorkspaceShare.Job.psm1`) | each child started with `setsid`; kill the process group (`kill -TERM -<pgid>`, then `-KILL`); the watchdog checks the parent via `/proc/<pid>/stat` start time | new `WorkspaceShare.Job.Linux.psm1` with the same exported function names |
-| Child start with private stdin/env | `CreateProcess` suspended + stdin pipe | `System.Diagnostics.Process` with `RedirectStandardInput` (curl reads its config from stdin, same as now) | same module |
-| Path identity, reparse points | `GetFileInformationByHandle`, reparse attribute (`WorkspaceShare.Path.psm1`) | `stat -c '%d:%i'` or `[IO.File]::ResolveLinkTarget`; reject symlinks (`LinkTarget -ne $null`) | new `WorkspaceShare.Path.Linux.psm1` |
-| Process identity | `Process.StartTime` + path | same .NET API works; path from `/proc/<pid>/exe` | `WorkspaceShare.Process.psm1` (small branch) |
-| DNS checks | `Resolve-DnsName` (Windows-only cmdlet) | `[System.Net.Dns]::GetHostAddresses` for the system resolver; `dig +short @1.1.1.1` (optional) for the public resolvers | `Share-Workspace.ps1` DNS helpers behind one function |
-| Keep awake | `SetThreadExecutionState` (P/Invoke) | `systemd-inhibit --what=sleep --why=WorkspaceShare sleep infinity` as a tracked child; skip if missing | platform module |
-| Clipboard | WinForms DataObject | `wl-copy` / `xclip -selection clipboard`; capability false if neither exists | platform module (already stubbed) |
-| Folder picker | `FolderBrowserDialog` | `zenity --file-selection --directory` or `kdialog --getexistingdirectory`; capability false otherwise (the GUI then shows only the text field) | platform module (already stubbed) |
-| Open browser | `Start-Process <url>` | `xdg-open <url>` | platform module (already stubbed) |
-| Data folder | `%LOCALAPPDATA%\WorkspaceShare` | `$XDG_DATA_HOME/workspaceshare` or `~/.local/share/workspaceshare` | platform module (`Get-WsDataRoot`, done) |
-| Named mutexes | `Threading.Mutex` named `Local\…` | .NET named mutexes work on Linux only inside one session, so use an exclusive lock file (`[IO.File]::Open(..., FileShare.None)`) | `WorkspaceShare.Dependency.psm1`, installer, GUI single instance |
-| Executable names | `bin\cloudflared.exe` etc. | `bin/linux-x64/cloudflared` etc.; the lockfile gets a `platform` field (already present: `windows-x64`) | `Install-Dependencies.ps1` asset table per platform |
-| Archive listing paths | `\` separators | normalise to `/` when comparing on Linux | `Test-SourcePathExcluded`, manifest |
-| Shortcut | `.lnk` to `powershell.exe` | `~/.local/share/applications/workspaceshare.desktop` with `Exec=pwsh -NoProfile -File …/Start-WorkspaceShareGui.ps1` | `Install-GuiShortcut.ps1` branch |
-| Tests | `cmd.exe`, `ping -n`, junctions via `mklink` | `/bin/sh -c`, `sleep`, `ln -s` | test helpers |
+| Process lifetime | Job Object with kill-on-close (P/Invoke) | every child starts through `/bin/sh -c 'umask 077; exec setsid …'` (own session and process group, stdout/stderr redirected to files, stdin `/dev/null` or a private pipe); a "job" is a registry file under `~/.local/share/workspaceshare/jobs/` listing `pid starttime mode`; `Stop-WorkspaceJob` sends `kill -s TERM -- -<pgid>`, waits 2 s, then `KILL`; a process is only signalled while `/proc/<pid>/stat` still shows the recorded start time and `pgrp == pid`; the owner's `Close-WorkspaceJob` kills what is left | `scripts/WorkspaceShare.Job.Linux.ps1` (loaded by `WorkspaceShare.Job.psm1`, same function names) |
+| Child environment | allowlist (`SystemRoot`, `TEMP`, …) | allowlist (`PATH`, `HOME`, `USER`, `LANG`/`LC_ALL`, `TMPDIR`, `TZ`, `SSL_CERT_*`) | same file |
+| Path identity, reparse points | `GetFileInformationByHandle` | `realpath -e` + `stat -L -c %d:%i`; symlinks carry `FileAttributes.ReparsePoint` in .NET, so the existing gates reject them unchanged | `scripts/WorkspaceShare.Path.Linux.ps1` |
+| Process identity | `Process.StartTime` + path | start time = `/proc/<pid>/stat` field 22 (+1) in **every** process (`Process.StartTime` derives from the wall clock and differs by ms between processes); path from `/proc/<pid>/exe`, compared after `realpath` when the plain paths differ | `WorkspaceShare.Process.psm1` (`Get-WorkspaceProcessStartTicks`), `WorkspaceShare.Platform.psm1` (`Get-WsProcessStartTicks`) |
+| DNS checks | `Resolve-DnsName` | `[System.Net.Dns]` (system resolver); public resolvers 1.1.1.1/8.8.8.8/9.9.9.9 through `dig` – **without `dig` the public-resolver comparison is skipped** (HTTP gates stay authoritative) | `Get-WsResolvedAddress`, `Test-WsPublicResolverSupport` |
+| Keep awake | `SetThreadExecutionState` | `systemd-inhibit … tail --pid=<launcher> -f /dev/null`; silently skipped when missing | `Start-WsKeepAwake` |
+| Clipboard | WinForms | `wl-copy` (Wayland) / `xclip` / `xsel` when a display exists; capability false otherwise | `Set-WsClipboardText`, `Clear-WsClipboardText` |
+| Folder picker | `FolderBrowserDialog` | `zenity --file-selection --directory` or `kdialog --getexistingdirectory` when a display exists; otherwise capability false and the GUI shows only the text field | `Show-WsFolderPicker` |
+| Open browser | `Start-Process <url>` | `xdg-open <url>` (only `http://127.0.0.1:<port>/…`) | `Open-WsBrowser` |
+| Data folder | `%LOCALAPPDATA%\WorkspaceShare` | `$XDG_DATA_HOME/workspaceshare` or `~/.local/share/workspaceshare`, mode 700; sessions below `sessions/` | `Get-WsDataRoot` |
+| Private folders | `icacls` | `chmod 700`, files created with `umask 077` | `Set-WsPrivateDirectory` |
+| Named mutexes | `Threading.Mutex` | GUI single instance: exclusive lock file (`FileShare.None` = `flock`) in `<data root>/locks`; installer: the dependency lease file is enough | `New-WsInstanceLock` |
+| Executables | `bin\*.exe` | `bin/linux-x64/{cloudflared,miniserve,gitleaks,7zz}`; lockfile `platform: linux-x64` | `Install-Dependencies.ps1` asset table |
+| Archive paths | `\`, lower-cased manifest | `/`, case kept (names that differ only in case are legal); 7-Zip gets `-spd` so names are matched literally | `Share-Workspace.ps1` |
+| Watchdog | `powershell.exe` | `pwsh`, started under `setsid` so a Ctrl+C / hangup aimed at the launcher does not reach it | `Start-Watchdog` |
+| Shortcut | `.lnk` | `~/.local/share/applications/workspaceshare.desktop` (`Exec="…/pwsh" -NoLogo -NoProfile -File "…/Start-WorkspaceShareGui.ps1"`) | `Install-GuiShortcut.ps1` |
 
-## 3. Port phases (when it is started)
+Known differences / limits on Linux:
 
-1. **Parse gate:** CI job `ubuntu-latest` that only parses every `.ps1`/`.psm1` with `pwsh`.
-   This is cheap and keeps new code portable from day one. It can be added already.
-2. **Installer:** per-platform asset table (URLs + SHA-256 for linux-x64), extraction of
-   `.tar.gz` / `.tar.xz` with `tar`, `chmod +x`, lockfile `platform: linux-x64`.
-3. **Platform modules:** `Job.Linux`, `Path.Linux`, DNS helper, keep-awake. Module loader
-   picks the implementation by `Get-WsPlatform`; exported names stay identical.
-4. **Launcher branches:** replace the remaining direct Windows calls in `Share-Workspace.ps1`
-   (about 15 call sites: DNS, keep-awake, clipboard, `System32` paths, path separators).
-5. **Tests on Linux:** run the existing suites with `pwsh` on `ubuntu-latest`. The GUI HTTP
-   tests and the snapshot-stage end-to-end test need no network and should pass unchanged.
-6. **GUI:** implement the three stubs (`Open-WsBrowser`, `Show-WsFolderPicker`, clipboard) and
-   the `.desktop` shortcut. The front end needs no change (it already hides the folder
-   button when `capabilities.folderPicker` is false).
+- No kill-on-close when the launcher is killed with SIGKILL – the watchdog (own session) covers it, exactly as on Windows
+  where the watchdog is the second line of defence.
+- The archive "read lock" is advisory on Linux (`flock`); the session folder is `chmod 700`, the archive is only
+  reachable for the same user.
+- The per-file identity (file index) in the source consistency manifest is not collected on Linux (size, mtime and SHA-256 still are).
+- Only x64 (glibc or musl host). arm64 and macOS are not supported.
+- Without a display (SSH, CI) the GUI works in the browser you open yourself; folder picker and clipboard are off.
 
-Estimate: phases 1–2 one day, phase 3 two to three days, phase 4 one to two days,
-phases 5–6 two days.
+## 3. Port phases and status
 
-## 4. Rules that keep the port cheap (apply now)
+| Phase | Scope | Status |
+|---|---|---|
+| 1 Parse gate | CI job on `ubuntu-latest` parses every `.ps1`/`.psm1` with `pwsh` | **done** (`.github/workflows/linux-tests.yml`) |
+| 2 Installer | per-platform asset table (linux-x64 URLs + SHA-256), `tar` extraction, `chmod +x`, lockfile `platform: linux-x64`, licenses | **done**, hashes cross-checked with the GitHub asset digests and the upstream gitleaks checksum file; version checks run in CI only |
+| 3 Platform modules | `Job.Linux`, `Path.Linux`, DNS helper, keep-awake, process identity | **done**, untested outside CI |
+| 4 Launcher branches | `Share-Workspace.ps1`, `Watch-WorkspaceShare.ps1`, `Stop-WorkspaceShare.ps1` | **done**; a full share through a real tunnel is only covered by the optional manual workflow input |
+| 5 Tests on Linux | `tests/Test-LinuxPlatform.ps1` (new), existing suites made platform-aware ([SKIP] for Windows-only checks) | **partly** – see the CI result of the current commit; `Test-LifecycleHardening` runs only its portable subset |
+| 6 GUI | `Open-WsBrowser`, `Show-WsFolderPicker`, clipboard, `.desktop` file, lock-file instance lock | **done**, folder picker / clipboard untested on a real desktop |
+| 7 Real-world soak | long Quick Tunnel run, desktop session, different distributions | **open** |
+
+## 4. How to run on Linux
+
+Requirements: x64 Linux, PowerShell 7.4+ (`pwsh`), `curl`, `tar` with `xz`, `setsid` (util-linux), outbound internet.
+Optional: `dig` (public DNS comparison), `systemd-inhibit` (keep awake), `xdg-open` + `zenity`/`kdialog`
++ `wl-copy`/`xclip` (desktop integration).
+
+```bash
+git clone https://github.com/Ceegore/CeegorsCodeOnWebForAITool.git
+cd CeegorsCodeOnWebForAITool
+pwsh ./Install-Dependencies.ps1          # downloads and verifies the four tools into bin/linux-x64/
+
+# command line
+pwsh ./Share-Workspace.ps1 -Path ~/projects/demo -Hours 4
+
+# browser GUI (drag & drop, tabs)
+pwsh ./Start-WorkspaceShareGui.ps1       # opens the browser with xdg-open if possible
+pwsh ./Install-GuiShortcut.ps1           # optional: menu entry (workspaceshare.desktop)
+
+# stop everything that is still running
+pwsh ./Stop-WorkspaceShare.ps1
+```
+
+Tests: `pwsh tests/Test-LinuxPlatform.ps1`, `pwsh tests/Test-WorkspaceShareGui.Http.ps1`,
+`pwsh tests/Test-WorkspaceShare.ps1`, `pwsh tests/Test-WorkspaceShareGui.ps1` (the CI workflow runs all of them and uploads the logs).
+
+## 5. Rules that keep the port cheap (apply to all new code)
 
 - New code follows `docs/GUI_CONTRACT.md` §1: shared PowerShell 5.1/7 syntax, no runtime
-  C# compilation, OS calls only through the platform module.
-- Build paths with `Join-Path`, never with hard-coded `\`.
-- Never hard-code `powershell.exe`; use `Get-WsPowerShellHost`.
-- Keep the security gates platform-neutral; only the mechanics (processes, paths, DNS)
-  get per-OS implementations.
+  C# compilation on Windows paths, OS calls only through the platform layer.
+- Build paths with `Join-Path` (one segment per call), never with hard-coded `\`.
+- Never hard-code `powershell.exe`; use `Get-WsPowerShellHost` (or `Get-WatchdogHostPath` in the launcher).
+- Never read `Process.StartTime` for identity; use `Get-WorkspaceProcessStartTicks` / `Get-WsProcessStartTicks`.
+- Keep the security gates platform-neutral; only the mechanics (processes, paths, DNS) get per-OS implementations.

@@ -1,4 +1,4 @@
-# WorkspaceShare 3.3
+# WorkspaceShare 3.4
 
 Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüfter ZIP64-Snapshot über einen geheimen Cloudflare-Quick-Tunnel-Link.
 
@@ -8,10 +8,10 @@ Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüf
 
 Du hast zwei Möglichkeiten:
 
-**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.3.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
+**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.4.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
 
 ```powershell
-Get-FileHash .\WorkspaceShare-3.3.0.zip
+Get-FileHash .\WorkspaceShare-3.4.0.zip
 ```
 
 Entpacke das ZIP in einen lokalen Ordner, z. B. `C:\Tools\WorkspaceShare`. Es enthält bereits die geprüften Hilfsprogramme (cloudflared, miniserve, gitleaks, 7-Zip) und das Lockfile.
@@ -74,6 +74,22 @@ Der Empfänger lädt über den Link eine ZIP-Datei herunter. Auf seiner Seite mu
 ```
 
 Parameter, Ablauf und Fehlercodes stehen in den Abschnitten „Workspace freigeben“, „Wichtige Parameter“ und „Fehlercodes“ weiter unten.
+
+## Linux (experimentell)
+
+WorkspaceShare läuft mit demselben Code auch unter Linux x64 – dort mit **PowerShell 7 (`pwsh`)**; Windows bleibt das Hauptprodukt und nutzt weiter Windows PowerShell 5.1. Der Linux-Port ist neu und bisher nur in GitHub Actions (`ubuntu-latest`) getestet.
+
+Voraussetzungen: `pwsh` 7.4+, `curl`, `tar` mit `xz`, `setsid` (util-linux), Internetzugang. Optional: `dig` (Vergleich mit öffentlichen DNS-Resolvern), `systemd-inhibit` (Rechner wach halten), `xdg-open`, `zenity`/`kdialog`, `wl-copy`/`xclip` (Browser starten, Ordnerauswahl, Zwischenablage).
+
+```bash
+pwsh ./Install-Dependencies.ps1                              # lädt cloudflared, miniserve, gitleaks, 7-Zip nach bin/linux-x64/
+pwsh ./Share-Workspace.ps1 -Path ~/projekte/demo -Hours 4    # Kommandozeile
+pwsh ./Start-WorkspaceShareGui.ps1                           # Browser-Oberfläche (Drag & Drop, Tabs)
+pwsh ./Install-GuiShortcut.ps1                               # optional: Menüeintrag workspaceshare.desktop
+pwsh ./Stop-WorkspaceShare.ps1                               # alles Laufende beenden
+```
+
+Unterschiede zu Windows: Prozesse laufen je in einer eigenen Prozessgruppe (`setsid`) und werden mit `kill -TERM/-KILL` auf die Gruppe beendet; Sitzungsordner sind `chmod 700` unter `~/.local/share/workspaceshare`; Symlinks im Workspace werden wie Junctions abgelehnt; ohne Desktop-Sitzung entfallen Ordnerauswahl und Zwischenablage. Einzelheiten und offene Punkte: `docs/LINUX_PLAN.md`.
 
 ## In English (short)
 
@@ -238,7 +254,7 @@ Ziehe Dateien oder ganze Ordner aus dem Explorer in das Feld „Dateien oder Ord
 
 - Grenzen: maximal 4 GiB pro Datei und insgesamt, maximal 10.000 Dateien (Standardwerte).
 - Temporärer Ordner: `%LOCALAPPDATA%\WorkspaceShare\drops`. Er wird gelöscht, sobald die Freigabe endet oder „Entfernen“ geklickt wird.
-- Linux: Dieselbe Drag-&-Drop-Bedienung funktioniert, sobald der Linux-Port existiert, weil sie nur Browser und .NET nutzt. Siehe `docs\LINUX_PLAN.md`.
+- Linux (experimentell): Dieselbe Drag-&-Drop-Bedienung funktioniert auch unter Linux, weil sie nur Browser und .NET nutzt. Siehe den Abschnitt „Linux (experimentell)“ weiter unten und `docs/LINUX_PLAN.md`.
 
 Sicherheitshinweise:
 
@@ -257,7 +273,7 @@ Tests (ohne Netzwerk):
 .\tests\Test-WorkspaceShareGui.ps1
 ```
 
-Technische Details stehen in `docs\GUI_PLAN.md` und `docs\GUI_CONTRACT.md`. Der Linux-Plan liegt in `docs\LINUX_PLAN.md` und ist noch nicht umgesetzt.
+Technische Details stehen in `docs\GUI_PLAN.md` und `docs\GUI_CONTRACT.md`. Der Linux-Port (Plan, Status, Einschränkungen) ist in `docs/LINUX_PLAN.md` beschrieben.
 
 ## Wichtige Parameter
 
@@ -405,8 +421,8 @@ Nach vollständig bestandener Abnahme:
 Ergebnis:
 
 ```text
-dist\WorkspaceShare-3.3.0.zip
-dist\WorkspaceShare-3.3.0.zip.sha256.txt
+dist\WorkspaceShare-3.4.0.zip
+dist\WorkspaceShare-3.4.0.zip.sha256.txt
 ```
 
 Das ZIP enthält außerdem die `LICENSE` des Projekts.

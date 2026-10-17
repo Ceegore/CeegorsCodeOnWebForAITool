@@ -49,3 +49,8 @@ hineinkopiert und keine veränderten Binärdateien verteilt.
 Diese Datei ist eine technische Compliance-Checkliste und keine Rechtsberatung.
 Vor externer kommerzieller Weitergabe sollte die konkrete Binärdistribution samt
 Lizenzdateien geprüft werden.
+
+## Linux x64 (experimentell)
+
+Unter Linux werden dieselben Versionen als offizielle Linux-Assets verwendet (cloudflared-linux-amd64, miniserve x86_64-unknown-linux-musl, gitleaks linux_x64, 7-Zip linux-x64 mit dem Programm 7zz). Lizenzen und Hinweise gelten wie oben; Install-Dependencies.ps1 legt sie unter bin/linux-x64/licenses/ ab.
+

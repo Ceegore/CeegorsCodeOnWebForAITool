@@ -68,9 +68,22 @@ Set-WsClipboardText -Text <string>       -> $true/$false; excludes Win+V history
 Clear-WsClipboardText -Expected <string> -> clears only if the clipboard still equals Expected; $true/$false
 ```
 
-Linux/macOS branches exist but report "unsupported" (`$null` / `$false`, capabilities
-`$false`, `Get-WsPowerShellHost` returns the `pwsh` path) until the Linux port
-(`docs/LINUX_PLAN.md`).
+Linux (experimental, `docs/LINUX_PLAN.md`): `Open-WsBrowser` uses `xdg-open`, `Show-WsFolderPicker` uses
+`zenity`/`kdialog`, the clipboard functions use `wl-copy`/`xclip`/`xsel`; each capability is `$true` only when a
+display and the tool exist. `Get-WsPowerShellHost` returns the running `pwsh`. `Get-WsDataRoot` is
+`$XDG_DATA_HOME/workspaceshare` (default `~/.local/share/workspaceshare`). macOS reports "unsupported"
+(`$null` / `$false`).
+
+Additional helpers (used by the launcher, the watchdog and the tests; the Windows branches reproduce the old behaviour):
+
+```
+Get-WsProcessStartTicks -ProcessId <int>  -> stable start identity (Windows: UTC ticks of StartTime; Linux: /proc start time)
+Set-WsPrivateDirectory -Path <s>          -> Linux chmod 700 (Windows callers keep their icacls code)
+New-WsInstanceLock -Name -Directory       -> Linux lock file with WaitOne/ReleaseMutex/Dispose (replaces the named mutex)
+Start-WsKeepAwake / Stop-WsKeepAwake      -> Linux systemd-inhibit helper (or $null)
+Get-WsResolvedAddress, Test-WsPublicResolverSupport -> DNS lookups (Resolve-DnsName on Windows, .NET / dig on Linux)
+Invoke-WsTool, Test-WsCommand, Get-WsCommandPath    -> small process helpers
+```
 
 ## 4. HTTP module `scripts\WorkspaceShare.Gui.Http.psm1`
 

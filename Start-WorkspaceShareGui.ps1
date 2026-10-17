@@ -101,7 +101,7 @@ function Test-ProcessAlive {
     try {
         $p = [Diagnostics.Process]::GetProcessById([int]$ProcessId)
         if ($p.HasExited) { return $false }
-        return ($p.StartTime.ToUniversalTime().Ticks -eq [long]$StartTicks)
+        return ((Get-WsProcessStartTicks -ProcessId ([int]$ProcessId)) -eq [long]$StartTicks)
     }
     catch { return $false }
 }
@@ -280,6 +280,8 @@ function New-GuiToken {
 
 $script:Platform = Get-WsPlatform
 $script:Caps = Get-WsCapabilities
+# Test hook: the folder-picker answer is simulated, so the capability does not depend on the desktop session.
+if ($TestMode -and -not [string]::IsNullOrEmpty($TestPickerResult)) { $script:Caps.folderPicker = $true }
 $script:Shares = New-Object 'System.Collections.Generic.List[object]'
 $script:ShareListCap = 20
 $script:LastPath = $null
@@ -484,6 +486,10 @@ function Stop-ChildTree {
             Start-Process -FilePath $tk -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') -WindowStyle Hidden -Wait
         }
         catch { }
+    }
+    else {
+        # Linux: the whole process tree (the launcher's children run in their own sessions but keep it as parent).
+        try { $p.Kill($true) } catch { }
     }
     try { $p.Kill() } catch { }
 }
@@ -1078,8 +1084,10 @@ function Invoke-ApiPickFolder {
     $async = $null
     try {
         $rs = [runspacefactory]::CreateRunspace()
-        $rs.ApartmentState = [System.Threading.ApartmentState]::STA
-        $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        if ($script:Platform -eq 'windows') {
+            $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+            $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        }
         $rs.Open()
         $ps = [powershell]::Create()
         $ps.Runspace = $rs
@@ -1595,7 +1603,8 @@ if ($TestMode) {
     $hex = (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
     $mutexName = $mutexName + '.' + $hex.Substring(0, 16)
 }
-$mutex = New-Object System.Threading.Mutex($false, $mutexName)
+if ($script:Platform -eq 'windows') { $mutex = New-Object System.Threading.Mutex($false, $mutexName) }
+else { $mutex = New-WsInstanceLock -Name $mutexName -Directory (Join-Path $DataRoot 'locks') }   # Linux: lock file
 $script:BuildId = Get-BuildIdentity
 $script:Static = New-Object 'System.Collections.Generic.Dictionary[string,object]'
 $script:DrainChildren = { Update-AllChildren }
@@ -1634,7 +1643,7 @@ try {
     $listener.Start()
     $script:BoundPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
 
-    $startTicks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+    $startTicks = Get-WsProcessStartTicks -ProcessId $PID
     $instanceJson = ConvertTo-WsJson -Object ([ordered]@{ pid = $PID; startTicks = $startTicks; port = $script:BoundPort; token = $script:Token; build = $script:BuildId })
     $instanceDir = Split-Path -Parent $InstanceFile
     if (-not (Test-Path -LiteralPath $instanceDir -PathType Container)) { [void](New-Item -ItemType Directory -Path $instanceDir -Force) }

@@ -1,0 +1,168 @@
+name: Linux tests (experimental)
+
+# The Linux port runs the same PowerShell scripts with PowerShell 7 (docs/LINUX_PLAN.md).
+# Every step prints what it does; every suite writes a log to artifacts/ (uploaded always).
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_tunnel:
+        description: 'Also run a full share through a real Cloudflare Quick Tunnel (needs network, can be flaky)'
+        type: boolean
+        default: false
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Environment
+        shell: bash
+        run: |
+          set -x
+          uname -a
+          cat /etc/os-release | head -4
+          pwsh --version
+          for tool in sh setsid kill tar xz curl realpath stat ss dig systemd-inhibit xdg-open sleep; do
+            printf '%-16s %s\n' "$tool" "$(command -v "$tool" || echo '-')"
+          done
+          id
+          df -h . /tmp | cat
+          echo "HOME=$HOME XDG_DATA_HOME=${XDG_DATA_HOME:-} DISPLAY=${DISPLAY:-} LANG=${LANG:-}"
+
+      - name: Install helper packages (dig for the public-resolver checks)
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dnsutils xz-utils curl
+          command -v dig
+
+      - name: Parse PowerShell (pwsh)
+        shell: pwsh
+        run: |
+          $failed = $false
+          $count = 0
+          Get-ChildItem -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object {
+            $count++
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($parseError in @($errors)) {
+              $failed = $true
+              Write-Host "::error file=$($parseError.Extent.File),line=$($parseError.Extent.StartLineNumber)::$($parseError.Message)"
+            }
+          }
+          Write-Host "parsed $count files"
+          if ($failed) { exit 1 }
+
+      - name: Install dependencies (linux-x64)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./Install-Dependencies.ps1 -Force
+          Get-ChildItem -Recurse bin/linux-x64 | Format-Table Mode, Length, FullName -AutoSize | Out-String -Width 200
+          Get-Content dependencies.lock.json
+          foreach ($tool in 'cloudflared --version', 'miniserve --version', 'gitleaks version', '7zz i') {
+            $parts = $tool -split ' '
+            Write-Host "== $tool"
+            & "./bin/linux-x64/$($parts[0])" $parts[1] 2>&1 | Select-Object -First 3
+          }
+
+      - name: Snapshot end-to-end check (no network)
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          ws="$(mktemp -d)/workspace"
+          mkdir -p "$ws/sub" "$ws/.git" "$ws/node_modules"
+          echo hello > "$ws/hello.txt"
+          echo '# readme' > "$ws/sub/readme.md"
+          echo 'registry=https://example.invalid/' > "$ws/sub/.npmrc"
+          echo '[core]' > "$ws/.git/config"
+          echo x > "$ws/node_modules/x.js"
+          set +e
+          pwsh -NoLogo -NoProfile -NonInteractive -File ./Share-Workspace.ps1 -Path "$ws" -TestMode -TestStopAfterSnapshot -EventStream -Minutes 1 -NoClipboard -KeepArchive 2>&1 | tee e2e.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit code: $code"
+          test "$code" -eq 0
+          session="$(grep -a '"type":"session"' e2e.log | sed -E 's/.*"path":"([^"]+)".*/\1/' | head -1)"
+          echo "session: $session"
+          test -d "$session"
+          zip="$(ls "$session"/workspace-*.zip | head -1)"
+          ./bin/linux-x64/7zz l -ba "$zip" | tee zip-listing.txt
+          grep -q ' hello.txt$' zip-listing.txt
+          grep -q 'sub/readme.md$' zip-listing.txt
+          ! grep -q '.npmrc' zip-listing.txt
+          ! grep -q 'node_modules' zip-listing.txt
+          ! grep -Eq '(^|[ /])\.git(/|$)' zip-listing.txt
+          rm -rf "$session"
+          echo "snapshot e2e ok"
+
+      - name: Test suites
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          mkdir -p artifacts
+          : > artifacts/summary.txt
+          rc=0
+          for suite in Test-LinuxPlatform Test-WorkspaceShareGui.Http Test-WorkspaceShare Test-NativeRunnerSmoke Test-LifecycleHardening Test-WorkspaceShareGui; do
+            echo "::group::$suite"
+            set +e
+            timeout 1200 pwsh -NoLogo -NoProfile -File "tests/$suite.ps1" 2>&1 | tee "artifacts/$suite.txt"
+            code=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            echo "$suite exit=$code passed=$(grep -ac '^\[PASS\]' "artifacts/$suite.txt") failed=$(grep -ac '^\[FAIL\]' "artifacts/$suite.txt") skipped=$(grep -ac '^\[SKIP\]' "artifacts/$suite.txt")" | tee -a artifacts/summary.txt
+            if [ "$code" -ne 0 ]; then
+              rc=1
+              echo "::error::$suite exited with $code"
+              grep -a -B1 -A3 '^\[FAIL\]' "artifacts/$suite.txt" | head -80 || true
+            fi
+          done
+          { echo '### Linux suites'; echo '```'; cat artifacts/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Full share through a real Quick Tunnel (manual run only)
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.public_tunnel }}
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          mkdir -p artifacts
+          set +e
+          timeout 600 pwsh -NoLogo -NoProfile -File tests/Test-LinuxPublicShare.ps1 2>&1 | tee artifacts/Test-LinuxPublicShare.txt
+          code=${PIPESTATUS[0]}
+          exit "$code"
+
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts/diag
+          cp e2e.log zip-listing.txt artifacts/diag/ 2>/dev/null || true
+          ls -laR "${XDG_DATA_HOME:-$HOME/.local/share}/workspaceshare" > artifacts/diag/data-root.txt 2>&1 || true
+          cp -r "${XDG_DATA_HOME:-$HOME/.local/share}/workspaceshare/diagnostics" artifacts/diag/diagnostics 2>/dev/null || true
+          ps -eo pid,ppid,pgid,sid,stat,etime,args | grep -Ei 'cloudflared|miniserve|Watch-WorkspaceShare|Share-Workspace' | grep -v grep > artifacts/diag/leftover-processes.txt || true
+          cat artifacts/diag/leftover-processes.txt || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-tests-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: ignore
+          retention-days: 7

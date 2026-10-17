@@ -1,5 +1,11 @@
 ﻿Set-StrictMode -Version Latest
 
+# Non-Windows hosts (PowerShell 7 on Linux) use the platform implementation with the same function names.
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    . (Join-Path $PSScriptRoot 'WorkspaceShare.Path.Linux.ps1')
+    return
+}
+
 if (-not ('WorkspaceShare.NativePath' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

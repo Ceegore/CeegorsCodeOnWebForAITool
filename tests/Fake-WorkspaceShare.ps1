@@ -90,7 +90,7 @@ for ($n = 1; $n -le 8; $n++) {
     Start-Sleep -Milliseconds 100
 }
 
-$session = Join-Path $env:TEMP ('ws-fake-session-' + [Guid]::NewGuid().ToString('N'))
+$session = Join-Path ([IO.Path]::GetTempPath()) ('ws-fake-session-' + [Guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $session -Force)
 if (-not [string]::IsNullOrWhiteSpace($pidFile)) {
     [IO.File]::WriteAllText($pidFile + '.session', $session, (New-Object System.Text.UTF8Encoding($false)))
