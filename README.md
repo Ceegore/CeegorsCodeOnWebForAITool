@@ -1,4 +1,4 @@
-# WorkspaceShare 3.3
+# WorkspaceShare 3.4
 
 Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüfter ZIP64-Snapshot über einen geheimen Cloudflare-Quick-Tunnel-Link.
 
@@ -8,10 +8,10 @@ Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüf
 
 Du hast zwei Möglichkeiten:
 
-**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.3.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
+**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.4.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
 
 ```powershell
-Get-FileHash .\WorkspaceShare-3.3.0.zip
+Get-FileHash .\WorkspaceShare-3.4.0.zip
 ```
 
 Entpacke das ZIP in einen lokalen Ordner, z. B. `C:\Tools\WorkspaceShare`. Es enthält bereits die geprüften Hilfsprogramme (cloudflared, miniserve, gitleaks, 7-Zip) und das Lockfile.
@@ -421,8 +421,8 @@ Nach vollständig bestandener Abnahme:
 Ergebnis:
 
 ```text
-dist\WorkspaceShare-3.3.0.zip
-dist\WorkspaceShare-3.3.0.zip.sha256.txt
+dist\WorkspaceShare-3.4.0.zip
+dist\WorkspaceShare-3.4.0.zip.sha256.txt
 ```
 
 Das ZIP enthält außerdem die `LICENSE` des Projekts.
