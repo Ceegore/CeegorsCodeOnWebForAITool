@@ -135,7 +135,8 @@ try {
     $textFiles = @(
         Get-ChildItem -LiteralPath $ToolRoot -File -Recurse |
         Where-Object {
-            $_.FullName.Substring($ToolRoot.TrimEnd('\').Length) -notmatch '(?i)^[\\/](bin|dist|docs)[\\/]' -and
+            # Local tool state (.git, .claude agent worktrees) never ships and is not checked.
+            $_.FullName.Substring($ToolRoot.TrimEnd('\').Length) -notmatch '(?i)^[\\/](bin|dist|docs|\.git|\.claude)[\\/]' -and
             $_.Extension -in @('.ps1','.psm1','.cmd','.json','.toml','.txt','.md')
         }
     )
