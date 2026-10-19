@@ -1183,6 +1183,58 @@ try {
     Test-GuiQuit $M 'M (2 active shares)'
     Assert-True ((Wait-Until -TimeoutSec 5 -Condition { -not (Test-PidAlive $fM2.Pid) -and -not (Test-PidAlive $fM3.Pid) })) 'M: quit stopped both running shares (both fakes exited)'
 
+    # ---- backend K: gitleaks findings are shown compactly and can be released explicitly (GUI_CONTRACT 8.6)
+    $K = Start-TestBackend -Scenario 'findings' -Name 'K'
+    if ($K.Port -le 0) { throw 'Backend K did not start.' }
+    $fakeDigest = 'ab' * 32
+    $dirK = New-ShareDir 'findings-share'
+    $stK = Start-Share $K $dirK 5
+    $shK = Wait-ForShare $K $stK.Id { param($x) $x.phase -eq 'error' }
+    Assert-True ($null -ne $shK -and $shK.exitCode -eq 22 -and $shK.reason -eq 'SecretFindings') 'K: findings end the share with 22 / SecretFindings'
+    if ($null -ne $shK) {
+        $fK = $shK.findings
+        Assert-True ($null -ne $fK -and $fK.digest -ceq $fakeDigest -and $fK.total -eq 421 -and $fK.fileCount -eq 30 -and $fK.accepted -eq $false) 'K: the state carries the findings summary with digest and counts'
+        Assert-True ($null -ne $fK -and @($fK.files).Count -eq 2 -and @($fK.files)[0].path -ceq 'locales/ru/Spiel-5.1.2.po' -and @(@($fK.files)[0].lines).Count -eq 10 -and @($fK.files)[0].moreLines -eq 408) 'K: findings are grouped per file with the first lines and the number of further lines'
+        Assert-True ($null -ne $fK -and @($fK.rules).Count -eq 2 -and @($fK.rules)[0].description.Length -gt 0) 'K: rule descriptions are passed on'
+        Assert-True ($null -eq $shK.acceptedFindings) 'K: acceptedFindings is null before a confirmation'
+    }
+    $r = Invoke-Post $K "/api/shares/$($stK.Id)/override" @{ digest = ('cd' * 32) }
+    Assert-True ($r.Status -eq 409) 'K: override with another digest -> 409'
+    $r = Invoke-Post $K "/api/shares/$($stK.Id)/override" $null
+    Assert-True ($r.Status -eq 409) 'K: override without digest -> 409'
+    $r = Invoke-Api -Method POST -Path "/api/shares/$($stK.Id)/override" -B $K -Token $K.Token -BodyText 'kein json'
+    Assert-True ($r.Status -eq 400) 'K: override with invalid JSON -> 400'
+    $r = Invoke-Api -Method GET -Path "/api/shares/$($stK.Id)/override" -B $K -Token $K.Token
+    Assert-True ($r.Status -eq 405) 'K: GET override -> 405'
+    $r = Invoke-Post $K "/api/shares/$($stK.Id)/override" @{ digest = $fakeDigest }
+    Assert-True ($r.Status -eq 200 -and $r.Json.ok -eq $true -and $r.Json.shareId -ceq $stK.Id) 'K: override with the shown digest -> 200, same share'
+    $shK2 = Wait-ForShare $K $stK.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($null -ne $shK2 -and $shK2.acceptedFindings -eq 421 -and $null -eq $shK2.findings) 'K: the share runs again and becomes active with acceptedFindings 421'
+    $fakeK = @(Get-Fakes $K | Where-Object { $_.Path -ceq $dirK })
+    $acceptArgs = @($fakeK | ForEach-Object { $a = $_.File + '.accept'; if (Test-Path -LiteralPath $a) { ([IO.File]::ReadAllText($a)).Trim() } else { '' } })
+    Assert-True ($fakeK.Count -eq 2 -and $acceptArgs[0] -eq '' -and $acceptArgs[1] -ceq $fakeDigest) 'K: only the second run got -AcceptSecretFindings with exactly that digest'
+    $r = Invoke-Post $K "/api/shares/$($stK.Id)/override" @{ digest = $fakeDigest }
+    Assert-True ($r.Status -eq 409) 'K: override of an active share -> 409'
+    $r = Invoke-Post $K "/api/shares/$($stK.Id)/stop" $null
+    $null = Wait-ForShare $K $stK.Id { param($x) $x.phase -eq 'ended' }
+
+    # a dropped share keeps its drop folder while the findings can still be confirmed
+    $dK = New-DropShare $K @('notes.po')
+    $shD = Wait-ForShare $K $dK.Id { param($x) $x.phase -eq 'error' }
+    Assert-True ($null -ne $shD -and $null -ne $shD.findings -and (Test-Path -LiteralPath $dK.Leaf)) 'K: a dropped share blocked by findings keeps its drop folder'
+    $r = Invoke-Post $K "/api/shares/$($dK.Id)/override" @{ digest = $fakeDigest }
+    $shD2 = Wait-ForShare $K $dK.Id { param($x) $x.phase -eq 'active' }
+    Assert-True ($r.Status -eq 200 -and $null -ne $shD2 -and $shD2.dropFiles -eq 1 -and $null -ne (Get-FakeByPath $K $dK.Leaf)) 'K: override of a dropped share runs again on the same drop folder'
+    $null = Invoke-Post $K "/api/shares/$($dK.Id)/stop" $null
+    $null = Wait-ForShare $K $dK.Id { param($x) $x.phase -eq 'ended' }
+    Assert-True (Wait-Until -TimeoutSec 5 -Condition { -not (Test-Path -LiteralPath $dK.Root) }) 'K: the drop folder is deleted when the released share ends'
+
+    $dK2 = New-DropShare $K @('other.po')
+    $null = Wait-ForShare $K $dK2.Id { param($x) $x.phase -eq 'error' }
+    $r = Invoke-Post $K "/api/shares/$($dK2.Id)/dismiss" $null
+    Assert-True ($r.Status -eq 200 -and (Wait-Until -TimeoutSec 5 -Condition { -not (Test-Path -LiteralPath $dK2.Root) })) 'K: dismissing a share with unconfirmed findings deletes its drop folder'
+    Test-GuiQuit $K 'K'
+
     # ---- backend L: the list holds at most 20 shares (the oldest ended/error one is dismissed automatically)
     $L = Start-TestBackend -Scenario 'fail22' -Name 'L'
     if ($L.Port -le 0) { throw 'Backend L did not start.' }

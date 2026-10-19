@@ -45,6 +45,11 @@ param(
 
     [switch]$IncludeGenerated,
     [switch]$UnsafeSkipSecretScan,
+
+    # Releases exactly the gitleaks findings with this digest (printed and sent as "findings" event on a block).
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$AcceptSecretFindings,
+
     [switch]$TestMode,
     [switch]$KeepArchive,
     [switch]$KeepClipboard,
@@ -206,7 +211,7 @@ function Write-ShareEvent {
             }
             $evt[[string]$key] = $value
         }
-        $json = ConvertTo-Json -InputObject $evt -Compress -Depth 5
+        $json = ConvertTo-Json -InputObject $evt -Compress -Depth 8
         $json = [regex]::Replace($json, '[^\x00-\x7E]', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ('\u{0:x4}' -f [int][char]$m.Value) })
         [Console]::Out.WriteLine('@@WSEVENT@@ ' + $json)
         [Console]::Out.Flush()
@@ -1139,6 +1144,135 @@ function Assert-FreeDiskSpace {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Gitleaks findings: compact summary and confirmation digest
+# ---------------------------------------------------------------------------
+# The summary groups the (redacted) findings per file, so a user sees at a glance what was reported.
+# The digest binds an explicit "share anyway" to exactly these findings in exactly these file contents:
+# SHA-256 over the sorted lines "<relative path>|<rule>|<lines/columns>|<SHA-256 of the scanned file>".
+# A changed file or a new finding gives another digest, so the share is blocked again.
+
+$script:MaxFindingsReportBytes = 64MB
+
+function ConvertTo-GitleaksRelativePath {
+    param([AllowEmptyString()][string]$File, [Parameter(Mandatory = $true)][string]$Root)
+    $normalized = $File.Replace('\', '/')
+    $rootPrefix = $Root.Replace('\', '/').TrimEnd('/') + '/'
+    if ($normalized.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $normalized.Substring($rootPrefix.Length) }
+    $marker = '/archive-verification/'
+    $index = $normalized.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase)
+    if ($index -ge 0) { return $normalized.Substring($index + $marker.Length) }
+    return $normalized
+}
+
+function ConvertTo-FindingExcerpt {
+    param([AllowNull()][string]$Text, [int]$MaxLength = 120)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $flat = ([regex]::Replace($Text, '[\x00-\x1F\x7F]+', ' ')).Trim()
+    if ($flat.Length -gt $MaxLength) { $flat = $flat.Substring(0, $MaxLength - 3) + '...' }
+    return $flat
+}
+
+function Get-GitleaksFindingSummary {
+    param([Parameter(Mandatory = $true)][string]$ReportPath, [Parameter(Mandatory = $true)][string]$SourceRoot)
+    if (-not (Test-Path -LiteralPath $ReportPath -PathType Leaf)) { return $null }
+    if ((Get-Item -LiteralPath $ReportPath).Length -gt $script:MaxFindingsReportBytes) { return $null }
+    $parsed = [IO.File]::ReadAllText($ReportPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $findings = @($parsed | Where-Object { $null -ne $_ })
+    if ($findings.Count -eq 0) { return $null }
+
+    $fileHashes = @{}
+    $digestLines = New-Object 'System.Collections.Generic.List[string]'
+    $files = [ordered]@{}
+    $rules = [ordered]@{}
+    foreach ($finding in $findings) {
+        $relative = ConvertTo-GitleaksRelativePath -File ([string]$finding.File) -Root $SourceRoot
+        $rule = [string]$finding.RuleID
+        $startLine = [int]$finding.StartLine
+        # Findings inside scanned archives are reported as "<archive>!<member>"; the archive is the file on disk.
+        $diskRelative = ($relative -split '!', 2)[0]
+        if (-not $fileHashes.ContainsKey($diskRelative)) {
+            $diskPath = Join-Path $SourceRoot $diskRelative
+            $fileHashes[$diskRelative] = if (Test-Path -LiteralPath $diskPath -PathType Leaf) { (Get-FileHash -LiteralPath $diskPath -Algorithm SHA256).Hash } else { '-' }
+        }
+        $digestLines.Add(('{0}|{1}|{2}:{3}-{4}:{5}|{6}' -f $relative, $rule, $startLine, [int]$finding.StartColumn, [int]$finding.EndLine, [int]$finding.EndColumn, $fileHashes[$diskRelative]))
+
+        if (-not $files.Contains($relative)) { $files[$relative] = @{ count = 0; rules = [ordered]@{}; lines = New-Object 'System.Collections.Generic.SortedSet[int]'; samples = New-Object 'System.Collections.Generic.List[object]'; sampleKeys = New-Object 'System.Collections.Generic.HashSet[string]' } }
+        $entry = $files[$relative]
+        $entry.count++
+        if ($entry.rules.Contains($rule)) { $entry.rules[$rule]++ } else { $entry.rules[$rule] = 1 }
+        [void]$entry.lines.Add($startLine)
+        # Up to three examples per file, each showing a different (redacted) match.
+        $excerpt = ConvertTo-FindingExcerpt ([string]$finding.Match)
+        if ($entry.samples.Count -lt 3 -and -not $entry.sampleKeys.Contains($rule + '|' + $excerpt)) {
+            [void]$entry.sampleKeys.Add($rule + '|' + $excerpt)
+            $entry.samples.Add([ordered]@{ line = $startLine; rule = $rule; match = $excerpt })
+        }
+
+        if (-not $rules.Contains($rule)) { $rules[$rule] = @{ count = 0; description = (ConvertTo-FindingExcerpt ([string]$finding.Description) 200) } }
+        $rules[$rule].count++
+    }
+
+    $sortedDigestLines = $digestLines.ToArray()
+    [Array]::Sort($sortedDigestLines, [StringComparer]::Ordinal)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digestBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($sortedDigestLines -join "`n"))) } finally { $sha.Dispose() }
+    $digest = (($digestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+
+    $fileList = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in $files.Keys) {
+        $entry = $files[$path]
+        $ruleList = @(foreach ($id in $entry.rules.Keys) { [ordered]@{ id = $id; count = [int]$entry.rules[$id] } })
+        $fileList.Add([ordered]@{ path = [string]$path; count = [int]$entry.count; rules = $ruleList; lines = [int[]]@($entry.lines); samples = $entry.samples.ToArray() })
+    }
+    $sortedFiles = @($fileList | Sort-Object -Property @{ Expression = { $_.count }; Descending = $true }, @{ Expression = { $_.path }; Descending = $false })
+    $ruleList = @(foreach ($id in $rules.Keys) { [ordered]@{ id = $id; count = [int]$rules[$id].count; description = $rules[$id].description } })
+    $ruleSummary = @($ruleList | Sort-Object -Property @{ Expression = { $_.count }; Descending = $true }, @{ Expression = { $_.id }; Descending = $false })
+    return [pscustomobject]@{ Total = $findings.Count; FileCount = $sortedFiles.Count; Digest = $digest; Files = $sortedFiles; Rules = $ruleSummary }
+}
+
+function Format-FindingCountText {
+    param([Parameter(Mandatory = $true)]$Summary)
+    $what = if ($Summary.Total -eq 1) { '1 mögliches Geheimnis' } else { '{0} mögliche Geheimnisse' -f $Summary.Total }
+    $where = if ($Summary.FileCount -eq 1) { '1 Datei' } else { '{0} Dateien' -f $Summary.FileCount }
+    return ('{0} in {1}' -f $what, $where)
+}
+
+function Format-GitleaksFindingSummary {
+    # ASCII apart from the German umlauts, so the text survives the console code page.
+    param([Parameter(Mandatory = $true)]$Summary, [int]$MaxFiles = 10, [int]$MaxLines = 8, [int]$MaxSamples = 1)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $out.Add('Gitleaks: ' + (Format-FindingCountText $Summary))
+    foreach ($file in @($Summary.Files | Select-Object -First $MaxFiles)) {
+        $out.Add('  ' + $file.path)
+        $ruleText = (@($file.rules | ForEach-Object { '{0}x {1}' -f $_.count, $_.id }) -join ', ')
+        $lines = @($file.lines)
+        $lineText = (@($lines | Select-Object -First $MaxLines) -join ', ')
+        if ($lines.Count -gt $MaxLines) { $lineText += (' ... (+{0})' -f ($lines.Count - $MaxLines)) }
+        $label = if ($lines.Count -eq 1) { 'Zeile' } else { 'Zeilen' }
+        $out.Add(('    {0} - {1} {2}' -f $ruleText, $label, $lineText))
+        foreach ($sample in @($file.samples | Select-Object -First $MaxSamples)) {
+            if ($sample.match) { $out.Add(('    Zeile {0}: {1}' -f $sample.line, $sample.match)) }
+        }
+    }
+    if ($Summary.FileCount -gt $MaxFiles) { $out.Add(('  ... und {0} weitere Datei(en)' -f ($Summary.FileCount - $MaxFiles))) }
+    $out.Add('Regeln:')
+    foreach ($rule in @($Summary.Rules)) { $out.Add(('  {0} ({1}x): {2}' -f $rule.id, $rule.count, $rule.description)) }
+    return $out.ToArray()
+}
+
+function Write-FindingsEvent {
+    param([Parameter(Mandatory = $true)]$Summary, [bool]$Accepted)
+    $eventFiles = @(foreach ($file in @($Summary.Files | Select-Object -First 25)) {
+        $lines = @($file.lines)
+        [ordered]@{ path = $file.path; count = $file.count; rules = @($file.rules); lines = [int[]]@($lines | Select-Object -First 10); moreLines = [Math]::Max(0, $lines.Count - 10); samples = @($file.samples) }
+    })
+    Write-ShareEvent -Type 'findings' -Fields ([ordered]@{
+        total = [int]$Summary.Total; fileCount = [int]$Summary.FileCount; digest = $Summary.Digest; accepted = $Accepted
+        files = $eventFiles; rules = @($Summary.Rules | Select-Object -First 20)
+    })
+}
+
 function Invoke-GitleaksScan {
     param(
         [Parameter(Mandatory = $true)][string]$SourceRoot,
@@ -1164,10 +1298,34 @@ function Invoke-GitleaksScan {
     $code = $result.ExitCode
 
     if ($code -eq 20) {
-        Stop-WithError -Code 22 -Message (
-            "Gitleaks hat mögliche Geheimnisse gefunden. " +
-            'Der redigierte Bericht wird mit den sicheren Diagnoseinformationen aufbewahrt.'
-        )
+        $summary = $null
+        try { $summary = Get-GitleaksFindingSummary -ReportPath $ReportPath -SourceRoot $SourceRoot }
+        catch { $summary = $null; Write-Warning ('Der Gitleaks-Bericht konnte nicht ausgewertet werden: ' + (Protect-DiagnosticText $_.Exception.Message)) }
+        if ($null -eq $summary) {
+            # Without a readable summary there is nothing the user could confirm: fail closed.
+            Stop-WithError -Code 22 -Message (
+                'Gitleaks hat mögliche Geheimnisse gefunden; der Bericht ist nicht auswertbar, daher ist kein Freigeben trotz Funden möglich. ' +
+                'Der redigierte Bericht wird mit den sicheren Diagnoseinformationen aufbewahrt.'
+            )
+        }
+        try {
+            (Format-GitleaksFindingSummary -Summary $summary -MaxFiles 100000 -MaxLines 500 -MaxSamples 3) |
+                Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'gitleaks-findings.txt') -Encoding UTF8
+        }
+        catch { }
+        $accepted = (-not [string]::IsNullOrEmpty($AcceptSecretFindings)) -and ($AcceptSecretFindings.ToLowerInvariant() -ceq $summary.Digest)
+        Write-FindingsEvent -Summary $summary -Accepted $accepted
+        foreach ($line in (Format-GitleaksFindingSummary -Summary $summary)) { Write-Host ('      ' + $line) }
+        if ($accepted) {
+            Write-Warning ('Freigabe trotz Gitleaks-Funden ausdrücklich bestätigt: ' + (Format-FindingCountText $summary) + '.')
+            return
+        }
+        if (-not [string]::IsNullOrEmpty($AcceptSecretFindings)) {
+            Write-Warning 'Die Bestätigung passt nicht zu den aktuellen Funden (Inhalt geändert oder neue Funde). Bitte die Funde erneut prüfen.'
+        }
+        $script:StopReason = 'SecretFindings'
+        Write-Host ('      Trotzdem freigeben (nur nach Prüfung): -AcceptSecretFindings ' + $summary.Digest)
+        Stop-WithError -Code 22 -Message ('Gitleaks hat {0} gefunden. Die Freigabe wurde angehalten.' -f (Format-FindingCountText $summary))
     }
 
     if ($code -ne 0) {
@@ -1506,7 +1664,7 @@ function Save-FailureDiagnostics {
         foreach ($source in @($CloudflaredStdOut, $CloudflaredStdErr, $script:HealthLogPath, (Join-Path $script:SessionDirectory 'public-headers.txt'), (Join-Path $script:SessionDirectory 'volatile-cloudflared-ready.txt'))) {
             if ($source) { $sources.Add($source) }
         }
-        foreach ($name in @('gitleaks-redacted.json','7zip-create.log','7zip-test.log','archive.sha256.txt')) {
+        foreach ($name in @('gitleaks-findings.txt','gitleaks-redacted.json','7zip-create.log','7zip-test.log','archive.sha256.txt')) {
             $candidate = Join-Path $script:SessionDirectory $name
             if (Test-Path -LiteralPath $candidate -PathType Leaf) { $sources.Add($candidate) }
         }
@@ -2004,6 +2162,10 @@ try {
             "-UnsafeSkipSecretScan ist ausschließlich zusammen mit -TestMode zulässig. " +
             "Im normalen Betrieb ist der Secret-Scan verpflichtend."
         )
+    }
+
+    if ($UnsafeSkipSecretScan -and -not [string]::IsNullOrEmpty($AcceptSecretFindings)) {
+        Stop-WithError -Code 10 -Message '-AcceptSecretFindings setzt den Secret-Scan voraus und ist mit -UnsafeSkipSecretScan nicht kombinierbar.'
     }
 
     if ($TestStopAfterSnapshot -and -not $TestMode) {

@@ -164,6 +164,7 @@
     <section id="view-active" class="view" hidden>
       <h3 class="view-title">Freigabe aktiv</h3>
       <p id="shared-from" class="shared-from" hidden></p>
+      <p id="accepted-findings" class="hint hint-danger" hidden></p>
       <div class="field">
         <label for="share-url">Download-Link</label>
         <input type="text" id="share-url" class="url-input" readonly spellcheck="false">
@@ -214,6 +215,32 @@
           <summary>Details</summary>
           <pre id="error-log" class="log"></pre>
         </details>
+      </div>
+
+      <!-- Gitleaks findings, grouped per file (built by app.js); outside the alert so it is not read out as a whole -->
+      <section id="findings" class="findings" aria-labelledby="findings-title" hidden>
+        <h3 id="findings-title" class="findings-title">Gefundene Stellen</h3>
+        <ul id="findings-files" class="findings-files"></ul>
+        <p id="findings-more" class="findings-more muted" hidden></p>
+        <details class="details">
+          <summary>Was melden die Regeln?</summary>
+          <dl id="findings-rules" class="findings-rules"></dl>
+        </details>
+      </section>
+
+      <!-- Share anyway: only for findings of the secret scan, only after an explicit confirmation -->
+      <div id="override" class="override" hidden>
+        <p class="override-title">Fehlalarm?</p>
+        <p class="override-text">Oft sind solche Funde harmlos, z. B. Übersetzungs-, Beispiel- oder Testdateien. Bitte die Stellen oben prüfen. Alternativ die Dateien aus dem Ordner entfernen oder in <code>.workspace-share.exclude.txt</code> eintragen.</p>
+        <p class="override-text">„Trotzdem freigeben“ erstellt den Snapshot neu und lässt nur genau diese Funde zu. Ändert sich der Inhalt, wird wieder angehalten.</p>
+        <div class="check">
+          <input type="checkbox" id="override-confirm">
+          <label for="override-confirm">Ich habe die Funde geprüft – es sind keine echten Zugangsdaten.</label>
+        </div>
+        <p id="override-error" class="inline-error" role="alert" hidden></p>
+        <div class="actions">
+          <button type="button" id="btn-override" class="btn btn-danger" disabled>Trotzdem freigeben</button>
+        </div>
       </div>
 
       <div class="actions">

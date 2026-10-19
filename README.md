@@ -4,7 +4,7 @@ Teilt einen Ordner oder ein paar Dateien für eine Weile über einen geheimen Li
 
 ## Windows
 
-1. ZIP von den [Releases](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases/latest) laden und entpacken.
+1. `WorkspaceShare-<Version>.zip` von den [Releases](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases/latest) laden und entpacken.
 2. PowerShell im entpackten Ordner öffnen und einmalig:
 
    ```powershell
@@ -16,12 +16,15 @@ Teilt einen Ordner oder ein paar Dateien für eine Weile über einen geheimen Li
 
 ## Linux (experimentell)
 
+`WorkspaceShare-<Version>-linux-x64.tar.gz` von den [Releases](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases/latest) laden (enthält die geprüften Programme), dann:
+
 ```bash
-git clone https://github.com/Ceegore/CeegorsCodeOnWebForAITool.git && cd CeegorsCodeOnWebForAITool
-pwsh ./Install-Dependencies.ps1 && pwsh ./Start-WorkspaceShareGui.ps1
+tar -xzf WorkspaceShare-*-linux-x64.tar.gz && cd WorkspaceShare
+pwsh ./Install-GuiShortcut.ps1   # optional: Menüeintrag
+pwsh ./Start-WorkspaceShareGui.ps1
 ```
 
-Braucht PowerShell 7 (`pwsh`).
+Oder aus dem Quellcode: `git clone` dieses Repos, dann `pwsh ./Install-Dependencies.ps1 && pwsh ./Start-WorkspaceShareGui.ps1`. Braucht PowerShell 7 (`pwsh`).
 
 ## Gut zu wissen
 
@@ -32,4 +35,4 @@ Alles Weitere (Kommandozeile, Parameter, Tests): [docs/DETAILS.md](docs/DETAILS.
 
 ## Sicherheit
 
-Es wird nicht einfach ein Ordner ins Netz gehängt: Das Tool baut eine Kopie, wirft `.env`, Schlüsseldateien und Ordner wie `.ssh`/`.aws` raus, scannt den Rest nach Passwörtern und Tokens (gitleaks) und bricht bei Funden ab. Geteilt wird nur dieses eine geprüfte ZIP, nur lesend, hinter einem zufälligen 256-Bit-Link, der mit der Freigabe verfällt. Wer den Link hat, kann das ZIP laden – also nur an die richtigen Leute geben.
+Es wird nicht einfach ein Ordner ins Netz gehängt: Das Tool baut eine Kopie, wirft `.env`, Schlüsseldateien und Ordner wie `.ssh`/`.aws` raus, scannt den Rest nach Passwörtern und Tokens (gitleaks) und hält bei Funden an. Die GUI zeigt dann kurz, welche Datei, Zeile und Regel betroffen ist (das Geheimnis selbst geschwärzt); Fehlalarme lassen sich nach ausdrücklicher Bestätigung trotzdem freigeben – nur genau die gesehenen Funde. Geteilt wird nur dieses eine geprüfte ZIP, nur lesend, hinter einem zufälligen 256-Bit-Link, der mit der Freigabe verfällt. Wer den Link hat, kann das ZIP laden – also nur an die richtigen Leute geben.

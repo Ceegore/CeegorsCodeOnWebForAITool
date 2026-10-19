@@ -80,6 +80,10 @@
     endedBox: $('ended-box'), endedText: $('ended-text'),
     errorBox: $('error-box'), errorTitle: $('error-title'), errorHint: $('error-hint'),
     errorMessage: $('error-message'), errorDetails: $('error-details'), errorLog: $('error-log'),
+    findings: $('findings'), findingsFiles: $('findings-files'), findingsMore: $('findings-more'),
+    findingsRules: $('findings-rules'),
+    override: $('override'), overrideConfirm: $('override-confirm'), overrideError: $('override-error'),
+    btnOverride: $('btn-override'), acceptedFindings: $('accepted-findings'),
     btnDismiss: $('btn-dismiss'),
     form: $('form'), folder: $('folder'), btnPick: $('btn-pick'), nameInput: $('name-input'),
     minutes: $('minutes'), compression: $('compression'), includeGenerated: $('include-generated'),
@@ -241,9 +245,27 @@
         step: sh.step, total: TOTAL_STEPS, stepText: sh.step ? STEP_TEXTS[sh.step - 1] : null,
         steps: sh.steps.slice(), url: sh.url, expiresUtc: sh.expiresUtc, sizeBytes: sh.sizeBytes, sha256: sh.sha256,
         remainingMinutes: rem, health: sh.health, exitCode: sh.exitCode, reason: sh.reason, message: sh.message,
-        log: sh.log.slice(), request: sh.request, dropFiles: sh.dropFiles
+        log: sh.log.slice(), request: sh.request, dropFiles: sh.dropFiles,
+        findings: sh.findings || null, acceptedFindings: sh.acceptedFindings || null
       };
     }
+
+    // A folder path containing "geheim" is blocked by mock gitleaks findings until they are confirmed.
+    var MOCK_FINDINGS = {
+      total: 421, fileCount: 2, digest: '5d41402abc4b2a76b9719d911017c592ae26b0c1f2c8d4bd8f5e0f6c1a2b3c4d', accepted: false,
+      files: [
+        { path: 'locales/ru/Meerkat_Game-5.1.2.po', count: 418, rules: [{ id: 'generic-api-key', count: 418 }],
+          lines: [1167, 1181, 1195, 1209, 1223, 1237, 1251, 1265, 1279, 1293], moreLines: 408,
+          samples: [{ line: 1167, rule: 'generic-api-key', match: 'Key: REDACTED' }] },
+        { path: 'src/config/settings.py', count: 3, rules: [{ id: 'generic-api-key', count: 2 }, { id: 'aws-access-token', count: 1 }],
+          lines: [12, 13, 40], moreLines: 0,
+          samples: [{ line: 12, rule: 'generic-api-key', match: 'api_key = "REDACTED"' }, { line: 40, rule: 'aws-access-token', match: 'REDACTED' }] }
+      ],
+      rules: [
+        { id: 'generic-api-key', count: 420, description: 'Detected a Generic API Key, potentially exposing access to various services and sensitive operations.' },
+        { id: 'aws-access-token', count: 1, description: 'Identified a pattern that may indicate AWS credentials, risking unauthorized cloud resource access and data breaches on AWS platforms.' }
+      ]
+    };
 
     function snapshot() {
       return {
@@ -269,13 +291,22 @@
 
     function startRun(req, name, dropFiles) {
       var sh = {
-        id: randomHex(8), name: name, createdUtc: new Date().toISOString(), phase: 'starting',
-        step: 0, steps: [], url: null, expiresUtc: null, sizeBytes: null, sha256: null, health: null,
-        exitCode: null, reason: null, message: null, log: ['[mock] Start: ' + req.path],
+        id: randomHex(8), name: name, createdUtc: new Date().toISOString(),
         request: req, dropFiles: dropFiles, timer: null, healthTimer: null
       };
-      var failAt = /fehler/i.test(req.path) ? 4 : 0;
       shares.push(sh);
+      runShare(sh, false);
+      return sh;
+    }
+
+    function runShare(sh, accepted) {
+      var req = sh.request;
+      sh.phase = 'starting'; sh.step = 0; sh.steps = []; sh.url = null; sh.expiresUtc = null;
+      sh.sizeBytes = null; sh.sha256 = null; sh.health = null; sh.exitCode = null; sh.reason = null; sh.message = null;
+      sh.findings = null; sh.acceptedFindings = accepted ? MOCK_FINDINGS.total : null;
+      sh.log = ['[mock] Start: ' + req.path];
+      var failAt = /fehler/i.test(req.path) ? 4 : 0;
+      var leakAt = !accepted && /geheim/i.test(req.path) ? 4 : 0;
       sh.timer = window.setInterval(function () {
         sh.step += 1;
         sh.steps.push({ n: sh.step, text: STEP_TEXTS[sh.step - 1] });
@@ -285,6 +316,14 @@
           sh.phase = 'error'; sh.exitCode = 22; sh.reason = 'SecretScan';
           sh.message = 'Verbotene Datei gefunden: .env (Mock)';
           sh.log.push('[mock] FEHLER: Verbotene Datei gefunden');
+          return;
+        }
+        if (leakAt && sh.step === leakAt) {
+          clearTimers(sh);
+          sh.phase = 'error'; sh.exitCode = 22; sh.reason = 'SecretFindings';
+          sh.message = 'Gitleaks hat 421 mögliche Geheimnisse in 2 Dateien gefunden. Die Freigabe wurde angehalten.';
+          sh.findings = MOCK_FINDINGS;
+          sh.log.push('[mock] Gitleaks: 421 mögliche Geheimnisse in 2 Dateien');
           return;
         }
         if (sh.step >= TOTAL_STEPS) {
@@ -301,7 +340,6 @@
           }, 12000);
         }
       }, 700);
-      return sh;
     }
 
     // Mock of the /api/drop/* endpoints (body of /api/drop/file is the File). Allowed while shares run.
@@ -364,6 +402,13 @@
         shares.splice(shares.indexOf(sh), 1);
         return { status: 200, data: { ok: true } };
       }
+      if (act === 'override') {
+        if (sh.phase !== 'error' || !sh.findings) { return { status: 409, data: { error: 'Für diese Freigabe gibt es keine Funde zu bestätigen.' } }; }
+        if (b.digest !== sh.findings.digest) { return { status: 409, data: { error: 'Die Funde haben sich geändert. Bitte die aktuelle Liste prüfen.' } }; }
+        if (runningCount() >= MOCK_LIMITS.maxShares) { return { status: 409, data: { error: 'Maximal ' + MOCK_LIMITS.maxShares + ' Freigaben gleichzeitig.' } }; }
+        runShare(sh, true);
+        return { status: 200, data: { ok: true, shareId: sh.id } };
+      }
       return { status: 404, data: { error: 'Unbekannt' } };
     }
 
@@ -375,7 +420,7 @@
         // ~300 ms per uploaded file
         window.setTimeout(function () {
           var r = { status: 200, data: {} };
-          var m = /^\/api\/shares\/([0-9a-f]{8})\/(stop|copy|rename|dismiss)$/.exec(path);
+          var m = /^\/api\/shares\/([0-9a-f]{8})\/(stop|copy|rename|dismiss|override)$/.exec(path);
           if (path.indexOf('/api/drop/') === 0) {
             r = mockDrop(path, query, body);
           } else if (m) {
@@ -876,11 +921,98 @@
     showCopyError('');
     if (copyTimer) { window.clearTimeout(copyTimer); copyTimer = null; }
     setText(els.btnCopy, 'Link kopieren');
+    findingsSig = '';
+  }
+
+  // ---------------------------------------------------------------- gitleaks findings (contract 8.6)
+  var findingsSig = '';
+
+  function findingsOf(sh) {
+    var f = sh && sh.phase === 'error' ? sh.findings : null;
+    return f && typeof f === 'object' && typeof f.digest === 'string' && Array.isArray(f.files) ? f : null;
+  }
+
+  function plural(n, one, many) { return n.toLocaleString('de-DE') + ' ' + (n === 1 ? one : many); }
+
+  function findingsSummary(f) {
+    return plural(num(f.total), 'mögliches Geheimnis', 'mögliche Geheimnisse') + ' in ' + plural(num(f.fileCount), 'Datei', 'Dateien');
+  }
+
+  // gitleaks redacts the secret itself; the rest of the match shows what triggered the rule.
+  function redactedText(s) { return String(s == null ? '' : s).replace(/REDACTED/g, '[geschwärzt]'); }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) { e.className = cls; }
+    if (text != null) { e.textContent = text; }
+    return e;
+  }
+
+  function buildFindingItem(file) {
+    var li = el('li', 'finding');
+    var head = el('div', 'finding-head');
+    head.appendChild(el('span', 'finding-path', String(file.path || '')));
+    var count = num(file.count);
+    head.appendChild(el('span', 'finding-count', count.toLocaleString('de-DE') + '×'));
+    li.appendChild(head);
+
+    // With a single rule the badge already shows its count.
+    var fileRules = Array.isArray(file.rules) ? file.rules : [];
+    var rules = fileRules.map(function (r) {
+      return (fileRules.length > 1 && num(r.count) > 1 ? num(r.count).toLocaleString('de-DE') + '× ' : '') + String(r.id || '');
+    }).join(', ');
+    var lines = (Array.isArray(file.lines) ? file.lines : []).filter(function (n) { return typeof n === 'number'; });
+    var more = num(file.moreLines);
+    var where = lines.length ? (lines.length + more === 1 ? 'Zeile ' : 'Zeilen ') + lines.join(', ') +
+      (more ? ' … (+' + more.toLocaleString('de-DE') + ' weitere)' : '') : '';
+    li.appendChild(el('p', 'finding-meta', [rules, where].filter(function (x) { return x; }).join(' · ')));
+
+    (Array.isArray(file.samples) ? file.samples : []).forEach(function (s) {
+      if (!s || !s.match) { return; }
+      li.appendChild(el('code', 'finding-sample', 'Zeile ' + num(s.line) + ': ' + redactedText(s.match)));
+    });
+    return li;
+  }
+
+  function renderFindings(sh) {
+    var f = findingsOf(sh);
+    setHidden(els.findings, !f);
+    setHidden(els.override, !f);
+    if (!f) { findingsSig = ''; return; }
+    var sig = sh.id + '|' + f.digest;
+    if (sig === findingsSig) { return; }
+    findingsSig = sig;
+
+    while (els.findingsFiles.firstChild) { els.findingsFiles.removeChild(els.findingsFiles.firstChild); }
+    f.files.forEach(function (file) { if (file) { els.findingsFiles.appendChild(buildFindingItem(file)); } });
+    var hidden = num(f.fileCount) - f.files.length;
+    setText(els.findingsMore, hidden > 0
+      ? 'Dazu ' + plural(hidden, 'weitere Datei', 'weitere Dateien') + ' mit Funden; die vollständige Liste steht in den Diagnosedaten (gitleaks-findings.txt, Pfad unter „Details“).'
+      : '');
+    setHidden(els.findingsMore, hidden <= 0);
+
+    while (els.findingsRules.firstChild) { els.findingsRules.removeChild(els.findingsRules.firstChild); }
+    (Array.isArray(f.rules) ? f.rules : []).forEach(function (r) {
+      if (!r) { return; }
+      els.findingsRules.appendChild(el('dt', null, String(r.id || '') + ' (' + num(r.count).toLocaleString('de-DE') + '×)'));
+      els.findingsRules.appendChild(el('dd', null, String(r.description || '')));
+    });
+
+    // New findings always need a new confirmation.
+    els.overrideConfirm.checked = false;
+    els.btnOverride.disabled = true;
+    showOverrideError('');
+  }
+
+  function showOverrideError(text) {
+    setText(els.overrideError, text);
+    setHidden(els.overrideError, !text);
   }
 
   function renderDone(sh) {
     var ended = sh.phase === 'ended';
     var failed = sh.phase === 'error';
+    var f = findingsOf(sh);
 
     setHidden(els.endedBox, !ended);
     if (ended) {
@@ -890,13 +1022,21 @@
     setHidden(els.errorBox, !failed);
     if (failed) {
       var code = sh.exitCode;
-      setText(els.errorTitle, 'Freigabe fehlgeschlagen' + (code != null ? ' (Exit-Code ' + code + ')' : ''));
-      setText(els.errorHint, EXIT_TEXTS[code] || '');
-      setText(els.errorMessage, sh.message || '');
+      if (f) {
+        setText(els.errorTitle, 'Freigabe angehalten: mögliche Geheimnisse gefunden');
+        setText(els.errorHint, 'Gitleaks meldet ' + findingsSummary(f) + '. Nichts wurde veröffentlicht.');
+        setText(els.errorMessage, '');
+      } else {
+        setText(els.errorTitle, 'Freigabe fehlgeschlagen' + (code != null ? ' (Exit-Code ' + code + ')' : ''));
+        setText(els.errorHint, EXIT_TEXTS[code] || '');
+        setText(els.errorMessage, sh.message || '');
+      }
       var log = Array.isArray(sh.log) ? sh.log : [];
       setHidden(els.errorDetails, log.length === 0);
       setText(els.errorLog, log.join('\n'));
     }
+    renderFindings(sh);
+    if (f) { return 'Freigabe angehalten: Gitleaks meldet ' + findingsSummary(f) + '.'; }
     return failed ? 'Freigabe fehlgeschlagen. ' + (EXIT_TEXTS[sh.exitCode] || '') : 'Freigabe beendet.';
   }
 
@@ -953,6 +1093,12 @@
     }
     setText(els.sharedFrom, from);
     setHidden(els.sharedFrom, !from);
+
+    var accepted = num(sh.acceptedFindings);
+    setText(els.acceptedFindings, accepted
+      ? 'Freigegeben trotz ' + plural(accepted, 'bestätigtem Gitleaks-Fund', 'bestätigter Gitleaks-Funde') + '.'
+      : '');
+    setHidden(els.acceptedFindings, !accepted);
 
     if (els.shareUrl.value !== (sh.url || '')) { els.shareUrl.value = sh.url || ''; }
     setText(els.factUntil, sh.expiresUtc ? formatUntil(sh.expiresUtc) : '–');
@@ -1200,6 +1346,26 @@
     els.btnStop.disabled = true;
     action(shareApi(id, 'stop'), {}).then(function (r) {
       if (r.status !== 200 && selected === id) { els.btnStop.disabled = false; }
+      refreshSoon();
+    }).catch(function () {});
+  });
+
+  els.overrideConfirm.addEventListener('change', function () {
+    els.btnOverride.disabled = !els.overrideConfirm.checked;
+    showOverrideError('');
+  });
+
+  els.btnOverride.addEventListener('click', function () {
+    var id = selected;
+    var f = findingsOf(findShare(id));
+    if (!f || !els.overrideConfirm.checked) { return; }
+    els.btnOverride.disabled = true;
+    showOverrideError('');
+    action(shareApi(id, 'override'), { digest: f.digest }).then(function (r) {
+      if (r.status !== 200 && selected === id) {
+        showOverrideError(errorFromResponse(r, 'Die Freigabe konnte nicht neu gestartet werden.'));
+        els.btnOverride.disabled = !els.overrideConfirm.checked;
+      }
       refreshSoon();
     }).catch(function () {});
   });

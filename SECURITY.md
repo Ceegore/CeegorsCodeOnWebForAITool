@@ -30,6 +30,7 @@ Nicht vorgesehen:
 13. Ein unerwarteter Watchdog-Fehler nach Bereitschaft beendet das gesamte Job Object und wartet auf das bestätigte Ende der Kinder.
 14. Die installierte Dependency-Menge wird mit einer Leser-/Schreiber-Lease und einem wiederherstellbaren Transaktionsjournal geschützt.
 15. Die finale Archivrichtlinie wird auch in isolierten Tests mit deaktiviertem Gitleaks-Scan immer ausgeführt.
+16. Gitleaks-Funde werden nur nach ausdrücklicher Bestätigung freigegeben, und nur genau der angezeigte Fundsatz: Der Bestätigungs-Digest umfasst Pfad, Regel und Position jedes Fundes sowie den SHA-256 jeder betroffenen Datei; jede Änderung verlangt eine neue Bestätigung. Ein nicht auswertbarer Bericht blockiert ohne Bestätigungsmöglichkeit. Verbotene Schlüsseldateien sind nie per Bestätigung freigebbar.
 
 ## Konsistenzgrenze
 
