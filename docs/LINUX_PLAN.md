@@ -91,6 +91,11 @@ pwsh ./Install-GuiShortcut.ps1           # optional: menu entry (workspaceshare.
 pwsh ./Stop-WorkspaceShare.ps1
 ```
 
+Release package: every published GitHub release gets `WorkspaceShare-<version>-linux-x64.tar.gz` (+ `.sha256.txt`)
+from `.github/workflows/release-linux.yml`: it checks out the tag, installs the pinned tools, runs the Linux
+suites and packs with `scripts/Build-LinuxRelease.ps1` (tools must match `dependencies.lock.json`). Unpack it and
+run `pwsh ./Start-WorkspaceShareGui.ps1` in the `WorkspaceShare` folder; `Install-Dependencies.ps1` is not needed.
+
 Tests: `pwsh tests/Test-LinuxPlatform.ps1`, `pwsh tests/Test-WorkspaceShareGui.Http.ps1`,
 `pwsh tests/Test-WorkspaceShare.ps1`, `pwsh tests/Test-WorkspaceShareGui.ps1` (the CI workflow runs all of them and uploads the logs).
 

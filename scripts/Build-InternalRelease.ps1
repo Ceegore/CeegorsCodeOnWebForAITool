@@ -184,6 +184,7 @@ try {
         'SECURITY.md',
         'THIRD_PARTY_NOTICES.md',
         'LICENSE',
+        'docs\DETAILS.md',
         'dependencies.lock.json',
         'config\mandatory-excludes.txt','config\generated-excludes.txt','config\gitleaks-workspaceshare.toml',
         'scripts\WorkspaceShare.Process.psm1','scripts\WorkspaceShare.Curl.psm1','scripts\WorkspaceShare.Health.psm1','scripts\WorkspaceShare.Job.psm1','scripts\WorkspaceShare.Path.psm1','scripts\WorkspaceShare.Dependency.psm1','scripts\Watch-WorkspaceShare.ps1','scripts\Test-TunnelSoak.ps1','scripts\Test-QuickTunnelDns.ps1',
