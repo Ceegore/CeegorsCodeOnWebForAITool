@@ -41,10 +41,15 @@ One event per line on **stdout**, written with `[Console]::Out.WriteLine(...)` f
 | `status` | `remainingMinutes`, `text` | where the "Verbleibend" line is printed |
 | `health` | `state` (`ok`/`degraded`/`recovered`), `text` | where the monitor reports an outage or a recovery |
 | `warning` | `text` | for the launcher's own `Write-Warning` calls |
+| `findings` | `total`, `fileCount`, `digest`, `accepted`, `files`, `rules` | when gitleaks reported findings (§8.6); before `ended` |
 | `ended` | `exitCode`, `reason`, `message` | exactly once, at the very end (also on failure) |
 
 All `text`/`message` fields go through `Protect-DiagnosticText`. Without `-EventStream`
 the console behaviour is unchanged.
+
+`-AcceptSecretFindings <64 hex>`: releases exactly the gitleaks findings whose digest is given (§8.6).
+Without it, or with another digest, findings end the run with exit 22 and `ended.reason` `SecretFindings`.
+Not combinable with `-UnsafeSkipSecretScan` (exit 10).
 
 `-ParentProcessId <int>`: at start the launcher records that process's start time. If the
 process disappears later (or the PID then has another start time), `Test-StopRequested`
@@ -312,6 +317,7 @@ lease is shared, stale-session cleanup only touches dead sessions older than 48 
 | `POST /api/shares/<id>/copy` | `{}` | `{"ok":true}`; 409 if no link |
 | `POST /api/shares/<id>/rename` | `{"name":".."}` | `{"ok":true,"name":".."}` |
 | `POST /api/shares/<id>/dismiss` | `{}` | `{"ok":true}`; 409 unless ended/error |
+| `POST /api/shares/<id>/override` | `{"digest":".."}` | `{"ok":true,"shareId":".."}` – §8.6 |
 | `POST /api/pick-folder` | `{}` | as v1, but allowed in every situation (see 8.4); 409 only while another picker is open |
 | `POST /api/drop/*` | as §7.2 | as §7.2, but allowed while shares run; 409 while an upload into the draft is in progress from another request |
 | `POST /api/quit` | `{}` | `{"ok":true}`; stops **all** running shares first |
@@ -372,3 +378,41 @@ With several shares, a blocking call would starve the other children's stdout/st
 - Keyboard: tabs follow the ARIA tabs pattern (arrow keys move, Enter/Space selects).
 - Works at 360 px: the tab bar scrolls horizontally inside itself, no page-level horizontal scroll.
 - Token and reload: `app.js` stores the token from `location.hash` in `sessionStorage` (`ws.token`, this browser tab only, never `localStorage`/cookie/query string) before removing it from the address bar, so F5 keeps working; a hash token always replaces a stored one, and a 401 from `/api/state` deletes the stored token.
+
+### 8.6 Gitleaks findings: compact summary and "share anyway" (contract v2.1)
+
+Goal: a share blocked by gitleaks shows *what* was found in a few lines, and the user can release
+exactly those findings after reviewing them. Forbidden key files (`.env`, `*.pem`, …) stay a hard block.
+
+**Launcher.** On gitleaks exit 20 the redacted JSON report (`--redact=100`, at most 64 MiB) is
+summarised: findings grouped by relative path inside the ZIP (archive members as `<archive>!<member>`),
+per file the count, rules with counts, sorted line numbers and up to three examples with distinct
+(redacted) `Match` text (control characters flattened, at most 120 chars); per rule the gitleaks
+description. The **digest** is SHA-256 (lowercase hex) over the ordinally sorted lines
+`<path>|<rule>|<startLine>:<startColumn>-<endLine>:<endColumn>|<SHA-256 of the scanned file>` joined
+with `
+`. Then:
+
+- `findings` event: `total`, `fileCount`, `digest`, `accepted` (bool), `files` (at most 25, most
+  findings first: `path`, `count`, `rules` [`id`, `count`], `lines` (first 10), `moreLines`,
+  `samples` [`line`, `rule`, `match`]) and `rules` (at most 20: `id`, `count`, `description`);
+- the same summary on the console, and in full as `gitleaks-findings.txt` (copied to the diagnostics);
+- `-AcceptSecretFindings` equal to the digest: warning "Freigabe trotz Gitleaks-Funden ausdrücklich
+  bestätigt", the run continues; otherwise exit 22, reason `SecretFindings`, message
+  "Gitleaks hat N mögliche Geheimnisse in M Dateien gefunden. …", and the console prints the parameter.
+- A report that cannot be summarised fails closed (exit 22, no digest, no override possible).
+
+**Backend.** Share fields `findings` (the validated, bounded event data, only while the share is in
+phase `error` with exit 22, else `null`) and `acceptedFindings` (`total` of an accepted `findings`
+event, else `null`). A share with `findings` keeps its drop folder until it is dismissed, run again or
+the backend quits. `POST /api/shares/<id>/override {"digest":".."}`: 409 unless phase `error` with
+`findings`, 409 if the digest differs from `findings.digest`, 409 at `MaxShares`, 400 if the folder is
+gone; otherwise the **same share** (same id, name and drop) starts again with
+`-AcceptSecretFindings <digest>` (phase `starting`, steps/log/result fields reset).
+
+**Front end.** Error view of such a share: title "Freigabe angehalten: mögliche Geheimnisse
+gefunden", a list per file (path, count badge, rules and lines, examples with `REDACTED` shown as
+`[geschwärzt]`), "Was melden die Regeln?" with the descriptions, and a box "Fehlalarm?" with a
+checkbox "Ich habe die Funde geprüft – es sind keine echten Zugangsdaten." that enables
+"Trotzdem freigeben". New findings (another digest) clear the checkbox. The active view shows
+"Freigegeben trotz N bestätigter Gitleaks-Funde." when `acceptedFindings` is set.

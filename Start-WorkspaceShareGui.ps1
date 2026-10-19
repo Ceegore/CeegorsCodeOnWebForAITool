@@ -312,6 +312,9 @@ function New-Share {
         remainingMinutes = $null; health = $null
         exitCode = $null; reason = $null; message = $null
         request = $Request; dropFiles = $dropFiles
+        # Gitleaks findings that blocked the last run (contract 8.6), and the number of findings a run was
+        # explicitly started with ("share anyway").
+        findings = $null; acceptedFindings = $null
         log = (New-Object 'System.Collections.Generic.List[string]')
         sessionPath = $null; stopRequested = $false; endedGot = $false
         # runtime: child process, async line readers, timers
@@ -395,6 +398,67 @@ function ConvertTo-StrictInt {
     return $null
 }
 
+function ConvertTo-LimitedText {
+    param([AllowNull()]$Value, [int]$MaxLength)
+    $text = Protect-Text ([string]$Value)
+    if ($text.Length -gt $MaxLength) { $text = $text.Substring(0, $MaxLength) }
+    return $text
+}
+
+function ConvertTo-FindingsState {
+    # Validates a "findings" event and keeps a bounded copy for the state object; $null if it is unusable.
+    param($Ev)
+    $digest = Get-EventProp $Ev 'digest'
+    if ($digest -isnot [string] -or $digest -cnotmatch '^[0-9a-f]{64}$') { return $null }
+    $total = ConvertTo-StrictInt (Get-EventProp $Ev 'total')
+    $fileCount = ConvertTo-StrictInt (Get-EventProp $Ev 'fileCount')
+    if ($null -eq $total -or $total -lt 1 -or $null -eq $fileCount -or $fileCount -lt 1) { return $null }
+    $files = @()
+    foreach ($f in @(Get-EventProp $Ev 'files' | Select-Object -First 25)) {
+        if ($null -eq $f) { continue }
+        $fileRules = @()
+        foreach ($r in @(Get-EventProp $f 'rules' | Select-Object -First 10)) {
+            if ($null -eq $r) { continue }
+            $fileRules += , ([ordered]@{ id = (ConvertTo-LimitedText (Get-EventProp $r 'id') 100); count = [int](ConvertTo-StrictInt (Get-EventProp $r 'count')) })
+        }
+        $lines = @()
+        foreach ($l in @(Get-EventProp $f 'lines' | Select-Object -First 10)) {
+            $n = ConvertTo-StrictInt $l
+            if ($null -ne $n) { $lines += [int]$n }
+        }
+        $samples = @()
+        foreach ($sm in @(Get-EventProp $f 'samples' | Select-Object -First 3)) {
+            if ($null -eq $sm) { continue }
+            $samples += , ([ordered]@{
+                line = [int](ConvertTo-StrictInt (Get-EventProp $sm 'line'))
+                rule = (ConvertTo-LimitedText (Get-EventProp $sm 'rule') 100)
+                match = (ConvertTo-LimitedText (Get-EventProp $sm 'match') 160)
+            })
+        }
+        $files += , ([ordered]@{
+            path = (ConvertTo-LimitedText (Get-EventProp $f 'path') 400)
+            count = [int](ConvertTo-StrictInt (Get-EventProp $f 'count'))
+            rules = $fileRules
+            lines = $lines
+            moreLines = [int](ConvertTo-StrictInt (Get-EventProp $f 'moreLines'))
+            samples = $samples
+        })
+    }
+    $rules = @()
+    foreach ($r in @(Get-EventProp $Ev 'rules' | Select-Object -First 20)) {
+        if ($null -eq $r) { continue }
+        $rules += , ([ordered]@{
+            id = (ConvertTo-LimitedText (Get-EventProp $r 'id') 100)
+            count = [int](ConvertTo-StrictInt (Get-EventProp $r 'count'))
+            description = (ConvertTo-LimitedText (Get-EventProp $r 'description') 300)
+        })
+    }
+    return [ordered]@{
+        total = [int]$total; fileCount = [int]$fileCount; digest = $digest
+        accepted = ((Get-EventProp $Ev 'accepted') -is [bool] -and (Get-EventProp $Ev 'accepted')); files = $files; rules = $rules
+    }
+}
+
 function Set-ShareEvent {
     param($Share, $Ev)
     $s = $Share
@@ -447,6 +511,12 @@ function Set-ShareEvent {
         'warning' {
             $text = [string](Get-EventProp $Ev 'text')
             if ($text) { Add-LogLine $s ('Warnung: ' + $text) }
+        }
+        'findings' {
+            $f = ConvertTo-FindingsState $Ev
+            if ($null -eq $f) { return }
+            if ($f.accepted) { $s.acceptedFindings = [int]$f.total; $s.findings = $null }
+            else { $s.findings = $f }
         }
         'ended' {
             $s.endedGot = $true
@@ -564,8 +634,11 @@ function Complete-Share {
     $s.stopSw = $null
     $s.killSent = $false
     Clear-ShareClipboard $s
-    # The share is over: the drop folder it owned is not needed any more.
-    if ($null -ne $s.drop) {
+    # Findings stay confirmable only when the run failed because of them.
+    if ($s.phase -ne 'error' -or $s.exitCode -ne 22) { $s.findings = $null }
+    # The share is over: the drop folder it owned is not needed any more - unless the user may still
+    # confirm the findings and run it again (then dismiss/quit deletes it).
+    if ($null -ne $s.drop -and $null -eq $s.findings) {
         $d = $s.drop
         $s.drop = $null
         Remove-DropDirectory $d.Root
@@ -692,6 +765,8 @@ function Get-ShareObject {
         log = [string[]]$s.log.ToArray()
         request = $s.request
         dropFiles = $s.dropFiles
+        findings = $s.findings
+        acceptedFindings = $s.acceptedFindings
     }
 }
 
@@ -950,9 +1025,30 @@ function Invoke-ApiStart {
     if ($useDrop) { $drop = $script:CurrentDrop }
     if ($null -eq $name) { $name = Get-DefaultShareName $fullPath $drop }
 
+    $request = [ordered]@{
+        path = $fullPath; minutes = [int]$minutes; compression = [string]$compression; includeGenerated = [bool]$include
+    }
+    $proc = Start-ShareProcess $request $null
+    if ($null -eq $proc) { return (New-ApiResult 500 @{ error = 'Der Freigabeprozess konnte nicht gestartet werden.' }) }
+
+    # The share now owns the drop; the draft form starts empty again.
+    if ($useDrop) { $script:CurrentDrop = $null }
+    else { $script:LastPath = $fullPath }
+    Invoke-ShareListCap
+    $sh = New-Share (New-ShareId) $name $request $drop
+    Connect-ShareProcess $sh $proc
+    $script:Shares.Add($sh)
+    return (New-ApiResult 200 ([ordered]@{ ok = $true; shareId = $sh.id }))
+}
+
+function Start-ShareProcess {
+    # Starts Share-Workspace.ps1 for a validated request; $AcceptDigest releases exactly those gitleaks findings.
+    # Returns the process, or $null if it could not be started.
+    param($Request, [string]$AcceptDigest)
     $argList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $ShareScript,
-        '-Path', $fullPath, '-Minutes', [string]$minutes, '-Compression', [string]$compression)
-    if ($include) { $argList += '-IncludeGenerated' }
+        '-Path', [string]$Request.path, '-Minutes', [string]$Request.minutes, '-Compression', [string]$Request.compression)
+    if ($Request.includeGenerated) { $argList += '-IncludeGenerated' }
+    if (-not [string]::IsNullOrEmpty($AcceptDigest)) { $argList += @('-AcceptSecretFindings', $AcceptDigest) }
     $argList += @('-NoClipboard', '-EventStream', '-ParentProcessId', [string]$PID)
 
     $encoding = [Text.Encoding]::UTF8
@@ -980,26 +1076,66 @@ function Invoke-ApiStart {
     catch {
         try { $proc.Dispose() } catch { }
         Write-ConsoleLog ('Start fehlgeschlagen: ' + $_.Exception.Message)
-        return (New-ApiResult 500 @{ error = 'Der Freigabeprozess konnte nicht gestartet werden.' })
+        return $null
     }
+    return $proc
+}
 
-    # The share now owns the drop; the draft form starts empty again.
-    if ($useDrop) { $script:CurrentDrop = $null }
-    else { $script:LastPath = $fullPath }
-    Invoke-ShareListCap
-    $request = [ordered]@{
-        path = $fullPath; minutes = [int]$minutes; compression = [string]$compression; includeGenerated = [bool]$include
+function Connect-ShareProcess {
+    param($Share, $Proc)
+    $Share.proc = $Proc
+    $Share.readers.out = $Proc.StandardOutput
+    $Share.readers.err = $Proc.StandardError
+    $Share.tasks.out = $Proc.StandardOutput.ReadLineAsync()
+    $Share.tasks.err = $Proc.StandardError.ReadLineAsync()
+    $Share.eof.out = $false
+    $Share.eof.err = $false
+}
+
+function Invoke-ApiShareOverride {
+    # "Trotzdem freigeben" (contract 8.6): runs the same share again, releasing exactly the findings shown.
+    param($Share, $Req)
+    if ($script:QuitRequested) {
+        return (New-ApiResult 409 @{ error = 'WorkspaceShare wird gerade beendet.' })
     }
-    $sh = New-Share (New-ShareId) $name $request $drop
-    $sh.proc = $proc
-    $sh.readers.out = $proc.StandardOutput
-    $sh.readers.err = $proc.StandardError
-    $sh.tasks.out = $proc.StandardOutput.ReadLineAsync()
-    $sh.tasks.err = $proc.StandardError.ReadLineAsync()
-    $sh.eof.out = $false
-    $sh.eof.err = $false
-    $script:Shares.Add($sh)
-    return (New-ApiResult 200 ([ordered]@{ ok = $true; shareId = $sh.id }))
+    $f = $Share.findings
+    if ($Share.phase -ne 'error' -or $null -eq $f) {
+        return (New-ApiResult 409 @{ error = 'Für diese Freigabe gibt es keine Funde zu bestätigen.' })
+    }
+    $obj = $null
+    try { $obj = $Req.Body | ConvertFrom-Json } catch { $obj = $null }
+    if ($null -eq $obj -or $obj -isnot [pscustomobject]) {
+        return (New-ApiResult 400 @{ error = 'Ungültige Anfrage (kein gültiges JSON-Objekt).' })
+    }
+    $digest = Get-EventProp $obj 'digest'
+    if ($digest -isnot [string] -or $digest -cne [string]$f.digest) {
+        return (New-ApiResult 409 @{ error = 'Die Funde haben sich geändert. Bitte die aktuelle Liste prüfen.' })
+    }
+    if ((Get-RunningCount) -ge $MaxShares) {
+        return (New-ApiResult 409 @{ error = ('Es laufen bereits {0} Freigaben (Maximum). Bitte zuerst eine Freigabe beenden.' -f $MaxShares) })
+    }
+    $path = [string]$Share.request.path
+    if ($null -ne $Share.dropFiles -and $null -eq $Share.drop) {
+        return (New-ApiResult 409 @{ error = 'Die abgelegten Dateien sind nicht mehr vorhanden. Bitte neu ablegen.' })
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+        return (New-ApiResult 400 @{ error = 'Der Ordner existiert nicht mehr.' })
+    }
+    $proc = Start-ShareProcess $Share.request ([string]$f.digest)
+    if ($null -eq $proc) { return (New-ApiResult 500 @{ error = 'Der Freigabeprozess konnte nicht gestartet werden.' }) }
+
+    $s = $Share
+    $s.phase = 'starting'; $s.step = 0; $s.total = 8; $s.stepText = $null
+    $s.steps.Clear()
+    $s.url = $null; $s.expiresUtc = $null; $s.sizeBytes = $null; $s.sha256 = $null
+    $s.remainingMinutes = $null; $s.health = $null
+    $s.exitCode = $null; $s.reason = $null; $s.message = $null
+    $s.findings = $null; $s.acceptedFindings = $null
+    $s.sessionPath = $null; $s.stopRequested = $false; $s.endedGot = $false
+    $s.log.Clear()
+    Add-LogLine $s ('Freigabe trotz {0} Gitleaks-Fund(en) bestätigt; Snapshot und Prüfung laufen erneut.' -f [int]$f.total)
+    Connect-ShareProcess $s $proc
+    return (New-ApiResult 200 ([ordered]@{ ok = $true; shareId = $s.id }))
 }
 
 function Invoke-ApiShareStop {
@@ -1462,7 +1598,7 @@ function Complete-RequestBody {
 function Invoke-ShareRoute {
     # /api/shares/<id>/<action>: unknown id -> 404, GET -> 405.
     param($Req, $Stream, [string]$IdText, [string]$Action)
-    if ($Action -cnotin @('stop', 'copy', 'rename', 'dismiss')) { Send-ErrorJson $Stream 404; return }
+    if ($Action -cnotin @('stop', 'copy', 'rename', 'dismiss', 'override')) { Send-ErrorJson $Stream 404; return }
     if ($Req.Method -cne 'POST') { Send-ErrorJson $Stream 405; return }
     $sh = $null
     if ($IdText -cmatch '^[0-9a-f]{8}$') { $sh = Get-ShareById $IdText }
@@ -1473,6 +1609,7 @@ function Invoke-ShareRoute {
         'copy' { $result = Invoke-ApiShareCopy $sh }
         'rename' { $result = Invoke-ApiShareRename $sh $Req }
         'dismiss' { $result = Invoke-ApiShareDismiss $sh }
+        'override' { $result = Invoke-ApiShareOverride $sh $Req }
     }
     Write-WsJsonResponse -Stream $Stream -Status $result.Status -Object $result.Body
 }

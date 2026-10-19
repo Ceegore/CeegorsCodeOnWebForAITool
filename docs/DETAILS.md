@@ -8,10 +8,10 @@ Temporäre, read-only Freigabe eines lokalen Windows-Code-Workspaces als geprüf
 
 Du hast zwei Möglichkeiten:
 
-**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.4.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
+**a) GitHub Release (empfohlen):** Lade `WorkspaceShare-3.5.0.zip` von der [Releases-Seite](https://github.com/Ceegore/CeegorsCodeOnWebForAITool/releases) herunter. Vergleiche den SHA-256-Wert mit der Prüfsumme auf der Release-Seite:
 
 ```powershell
-Get-FileHash .\WorkspaceShare-3.4.0.zip
+Get-FileHash .\WorkspaceShare-3.5.0.zip
 ```
 
 Entpacke das ZIP in einen lokalen Ordner, z. B. `C:\Tools\WorkspaceShare`. Es enthält bereits die geprüften Hilfsprogramme (cloudflared, miniserve, gitleaks, 7-Zip) und das Lockfile.
@@ -63,7 +63,8 @@ Der Empfänger lädt über den Link eine ZIP-Datei herunter. Auf seiner Seite mu
 
 - Der Link enthält ein zufälliges 256-Bit-Geheimnis. Wer ihn hat, kann die Datei laden – gib ihn nur an Berechtigte weiter.
 - Geteilt wird ein schreibgeschützter ZIP-Snapshot, nie der Originalordner.
-- Vor der Freigabe läuft ein Geheimnis-Scan mit gitleaks. Schlüsseldateien wie `.env`, `*.pem` oder `id_rsa` blockieren die Freigabe.
+- Vor der Freigabe läuft ein Geheimnis-Scan mit gitleaks. Bei Funden hält die Freigabe an und zeigt pro Datei, welche Regel in welchen Zeilen anschlägt (das Geheimnis selbst ist geschwärzt). Sind es Fehlalarme, gibt „Trotzdem freigeben“ nach ausdrücklicher Bestätigung genau diese Funde frei – siehe [Gitleaks-Funde prüfen](#gitleaks-funde-prüfen-und-bewusst-freigeben).
+- Schlüsseldateien wie `.env`, `*.pem` oder `id_rsa` blockieren die Freigabe immer.
 - Zugangsdaten-Ordner wie `.ssh`, `.aws` oder `.npmrc` werden immer ausgelassen.
 - Der Link ist nur erreichbar, solange die Freigabe läuft. Es braucht kein Konto, keine Portweiterleitung und keine Firewall-Regel.
 
@@ -80,6 +81,8 @@ Parameter, Ablauf und Fehlercodes stehen in den Abschnitten „Workspace freigeb
 WorkspaceShare läuft mit demselben Code auch unter Linux x64 – dort mit **PowerShell 7 (`pwsh`)**; Windows bleibt das Hauptprodukt und nutzt weiter Windows PowerShell 5.1. Der Linux-Port ist neu und bisher nur in GitHub Actions (`ubuntu-latest`) getestet.
 
 Voraussetzungen: `pwsh` 7.4+, `curl`, `tar` mit `xz`, `setsid` (util-linux), Internetzugang. Optional: `dig` (Vergleich mit öffentlichen DNS-Resolvern), `systemd-inhibit` (Rechner wach halten), `xdg-open`, `zenity`/`kdialog`, `wl-copy`/`xclip` (Browser starten, Ordnerauswahl, Zwischenablage).
+
+Fertiges Paket: `WorkspaceShare-<Version>-linux-x64.tar.gz` von der Releases-Seite (enthält die geprüften Programme; Prüfsumme mit `sha256sum -c WorkspaceShare-<Version>-linux-x64.tar.gz.sha256.txt`). Entpacken, in den Ordner `WorkspaceShare` wechseln und `pwsh ./Start-WorkspaceShareGui.ps1` starten. Aus dem Quellcode:
 
 ```bash
 pwsh ./Install-Dependencies.ps1                              # lädt cloudflared, miniserve, gitleaks, 7-Zip nach bin/linux-x64/
@@ -109,7 +112,7 @@ WorkspaceShare gibt niemals das Originalverzeichnis frei. Der Ablauf ist:
 1. Workspace vollständig prüfen.
 2. offensichtliche Schlüsseldateien und Reparse-Points blockieren;
 3. bereinigtes ZIP64 aus den eingeschlossenen Dateien erzeugen und die Quelle davor/danach vergleichen;
-4. das fertige ZIP extrahieren, die Ausschlussregeln erneut erzwingen und genau diesen Inhalt mit Gitleaks scannen;
+4. das fertige ZIP extrahieren, die Ausschlussregeln erneut erzwingen und genau diesen Inhalt mit Gitleaks scannen; Funde stoppen die Freigabe, außer genau dieser Fundsatz wurde ausdrücklich bestätigt;
 5. exakt dieses eine Archiv mit miniserve auf `127.0.0.1` bereitstellen;
 6. 256-Bit-Capability-Token als geheimen Route-Prefix setzen;
 7. Cloudflare Quick Tunnel starten;
@@ -288,6 +291,7 @@ Technische Details stehen in `docs\GUI_PLAN.md` und `docs\GUI_CONTRACT.md`. Der 
 | `-KeepArchive` | behält lokalen Sitzungsordner nach Ende |
 | `-NoClipboard` | kopiert den Link nicht |
 | `-KeepClipboard` | leert den Link nach Ende nicht automatisch |
+| `-AcceptSecretFindings <Digest>` | gibt trotz Gitleaks-Funden frei, aber nur genau den Fundsatz mit diesem Digest (wird bei einem Fund ausgegeben); siehe „Gitleaks-Funde prüfen und bewusst freigeben“ |
 | `-UnsafeSkipSecretScan -TestMode` | ausschließlich für isolierte Tests; im normalen Betrieb verboten |
 | `-TunnelProtocol auto\|quic\|http2` | Cloudflared-Transport; Standard `auto` mit QUIC-/HTTP2-Fallback |
 | `-TunnelEdgeIpVersion auto\|4\|6` | Edge-IP-Modus; Standard `auto` |
@@ -367,6 +371,35 @@ Private-Key- und Passwortdatenbank-Dateien (`*.pem`, `*.key`, `*.pfx`, `*.ppk`,
 `*.kdbx`, `id_rsa`, `id_ecdsa`, `id_dsa`, `id_ed25519`, `.env`) blockieren die
 Freigabe mit Exit 22. Beispieldateien wie `.env.example` sind davon ausgenommen.
 
+## Gitleaks-Funde prüfen und bewusst freigeben
+
+Gitleaks meldet auch Fehlalarme, z. B. Schlüssel-Spalten in Übersetzungsdateien (`.po`) oder
+Beispielwerte in Tests. Findet der Scan etwas, wird **nichts** veröffentlicht (Exit 22, Grund
+`SecretFindings`). Statt eines langen Berichts gibt es eine kompakte Übersicht:
+
+- pro Datei (relativer Pfad im ZIP): Anzahl, Regel(n), die ersten Zeilennummern und bis zu drei
+  Beispieltreffer mit Kontext – das Geheimnis selbst ist immer geschwärzt (`[geschwärzt]` / `REDACTED`);
+- dazu je Regel die Beschreibung von gitleaks.
+
+**GUI:** Die Übersicht erscheint im Tab der Freigabe. Nach dem Häkchen „Ich habe die Funde geprüft …“
+startet „Trotzdem freigeben“ dieselbe Freigabe neu (auch bei per Drag & Drop abgelegten Dateien). Die
+aktive Freigabe zeigt danach „Freigegeben trotz N bestätigter Gitleaks-Funde“.
+
+**Kommandozeile:** Die Übersicht steht in der Konsole, gefolgt von
+`Trotzdem freigeben (nur nach Prüfung): -AcceptSecretFindings <Digest>`. Denselben Befehl mit diesem
+Parameter erneut ausführen.
+
+Der Digest ist ein SHA-256 über alle Funde (Pfad, Regel, Zeile/Spalte) und den SHA-256 jeder
+betroffenen Datei. Die Bestätigung gilt also nur für genau die gesehenen Funde in genau diesem Inhalt:
+Ändert sich eine betroffene Datei oder kommt ein Fund hinzu, hält die Freigabe wieder an und zeigt die
+neue Liste. Der Snapshot wird bei der Bestätigung komplett neu erstellt und geprüft.
+
+Die vollständige Liste (alle Dateien und Zeilen) liegt bei jedem Fund als `gitleaks-findings.txt` in
+den Diagnosedaten (`%LOCALAPPDATA%\WorkspaceShare\diagnostics\<Session-ID>\`).
+
+Dauerhaft harmlose Dateien besser über `.workspace-share.exclude.txt` ausschließen. Verbotene
+Schlüsseldateien (`.env`, `*.pem`, `id_rsa` …) lassen sich **nicht** per Bestätigung freigeben.
+
 ## Snapshot-Konsistenz
 
 WorkspaceShare verwendet keine Volume Shadow Copy. Der Snapshot ist deshalb eine
@@ -421,11 +454,13 @@ Nach vollständig bestandener Abnahme:
 Ergebnis:
 
 ```text
-dist\WorkspaceShare-3.4.0.zip
-dist\WorkspaceShare-3.4.0.zip.sha256.txt
+dist\WorkspaceShare-3.5.0.zip
+dist\WorkspaceShare-3.5.0.zip.sha256.txt
 ```
 
 Das ZIP enthält außerdem die `LICENSE` des Projekts.
+
+Das Linux-Paket baut der Workflow `.github/workflows/release-linux.yml` automatisch, sobald ein GitHub-Release veröffentlicht wird (oder manuell mit dem Tag): Er installiert die gepinnten Programme, führt die Linux-Testsuiten aus, ruft `pwsh ./scripts/Build-LinuxRelease.ps1` auf und hängt `WorkspaceShare-<Version>-linux-x64.tar.gz` samt `.sha256.txt` an das Release.
 
 ## Laufzeitdaten
 
@@ -460,5 +495,5 @@ Exit-Code 1 ohne Meldung deutet auf einen PowerShell-Startfehler (z. B. Ausführ
 - Linkbesitzer können die Datei speichern oder weitergeben.
 - Cloudflare verarbeitet den Klartext technisch am HTTPS-Endpunkt.
 - Quick Tunnels sind ein temporärer Test-/Entwicklungsdienst ohne Produktiv-SLA.
-- Secret-Scanner können False Positives und False Negatives haben.
+- Secret-Scanner können False Positives und False Negatives haben. Fehlalarme lassen sich gezielt bestätigen; ein Scan ohne Funde ist keine Garantie, dass nichts Vertrauliches enthalten ist.
 - Das Tool ist für interne, kurzzeitige Send-only-Freigaben gedacht, nicht für dauerhaftes Hosting.

@@ -135,7 +135,8 @@ try {
     $textFiles = @(
         Get-ChildItem -LiteralPath $ToolRoot -File -Recurse |
         Where-Object {
-            $_.FullName.Substring($ToolRoot.TrimEnd('\').Length) -notmatch '(?i)^[\\/](bin|dist|docs)[\\/]' -and
+            # Local tool state (.git, .claude agent worktrees) never ships and is not checked.
+            $_.FullName.Substring($ToolRoot.TrimEnd('\').Length) -notmatch '(?i)^[\\/](bin|dist|docs|\.git|\.claude)[\\/]' -and
             $_.Extension -in @('.ps1','.psm1','.cmd','.json','.toml','.txt','.md')
         }
     )
@@ -184,6 +185,7 @@ try {
         'SECURITY.md',
         'THIRD_PARTY_NOTICES.md',
         'LICENSE',
+        'docs\DETAILS.md',
         'dependencies.lock.json',
         'config\mandatory-excludes.txt','config\generated-excludes.txt','config\gitleaks-workspaceshare.toml',
         'scripts\WorkspaceShare.Process.psm1','scripts\WorkspaceShare.Curl.psm1','scripts\WorkspaceShare.Health.psm1','scripts\WorkspaceShare.Job.psm1','scripts\WorkspaceShare.Path.psm1','scripts\WorkspaceShare.Dependency.psm1','scripts\Watch-WorkspaceShare.ps1','scripts\Test-TunnelSoak.ps1','scripts\Test-QuickTunnelDns.ps1',

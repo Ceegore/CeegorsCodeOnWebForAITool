@@ -647,6 +647,60 @@ try {
         # (f) Elternprozess existiert nicht -> Exit 10.
         $runF = Invoke-ShareChild -Arguments @('-Path',$snapshotWorkspace,'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard','-ParentProcessId','2147483000')
         Assert-True ($runF.ExitCode -eq 10) "Nicht vorhandene -ParentProcessId endet mit Exit 10 (war $($runF.ExitCode))"
+
+        # (g) Gitleaks-Fund -> Exit 22 mit findings-Event (Zusammenfassung pro Datei + Digest).
+        Write-Host ''
+        Write-Host 'Gitleaks-Funde: Zusammenfassung und Freigabe trotz Funden'
+        Write-Host '----------------------------------------------------------'
+        $leakWorkspace = Join-Path $temp 'snapshot-workspace-leak'
+        $leakFile = Join-Path (Join-Path $leakWorkspace 'cfg') 'settings.py'
+        New-Item -ItemType Directory -Path (Split-Path $leakFile -Parent) -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $leakWorkspace 'hello.txt') -Value 'hello' -Encoding ASCII
+        # Built at runtime, so this test file itself contains no finding.
+        $fakeToken = 'Zx9Qw7Er5Ty3' + 'Ui1Op8As6Df4'
+        Set-Content -LiteralPath $leakFile -Value ('secret_token = "' + $fakeToken + '"') -Encoding ASCII
+        $leakArgs = @('-Path',$leakWorkspace,'-TestMode','-TestStopAfterSnapshot','-EventStream','-Minutes','1','-NoClipboard')
+        $runG = Invoke-ShareChild -Arguments $leakArgs
+        $eventsG = @((Get-ShareEvents $runG.Lines).Events)
+        $findingsG = @($eventsG | Where-Object { $_.type -eq 'findings' })
+        $endedG = @($eventsG | Where-Object { $_.type -eq 'ended' })
+        Assert-True ($runG.ExitCode -eq 22) "Gitleaks-Fund endet mit Exit 22 (war $($runG.ExitCode))"
+        Assert-True ($endedG.Count -eq 1 -and $endedG[0].reason -eq 'SecretFindings' -and $endedG[0].message -match '1 mögliches Geheimnis in 1 Datei') 'ended-Event: reason SecretFindings, kurze Meldung mit Anzahl'
+        $digestG = ''
+        if ($findingsG.Count -eq 1) { $digestG = [string]$findingsG[0].digest }
+        Assert-True ($findingsG.Count -eq 1 -and $findingsG[0].total -eq 1 -and $findingsG[0].fileCount -eq 1 -and $findingsG[0].accepted -eq $false -and $digestG -cmatch '^[0-9a-f]{64}$') 'Genau ein findings-Event mit Anzahl, accepted=false und Digest'
+        if ($findingsG.Count -eq 1) {
+            $fileG = @($findingsG[0].files)[0]
+            Assert-True ($fileG.path -ceq 'cfg/settings.py' -and @($fileG.lines) -contains 1 -and @($fileG.rules).Count -ge 1) 'Fund nennt den relativen Pfad im Archiv, die Zeile und die Regel'
+            Assert-True ([string]@($fileG.samples)[0].match -match 'secret_token' -and [string]@($fileG.samples)[0].match -match 'REDACTED') 'Beispieltreffer zeigt den Kontext, das Geheimnis selbst ist geschwärzt'
+            Assert-True (@($findingsG[0].rules)[0].description.Length -gt 0) 'Regelbeschreibung wird mitgeliefert'
+        }
+        Assert-True (@($runG.Lines | Where-Object { $_.Contains($fakeToken) }).Count -eq 0) 'Das gefundene Geheimnis erscheint nirgends in der Ausgabe'
+        Assert-True (@($runG.Lines | Where-Object { $_ -match ('-AcceptSecretFindings ' + $digestG) }).Count -eq 1) 'Konsole nennt den Bestätigungsparameter mit Digest'
+
+        # (h) Falscher Digest -> weiterhin Exit 22.
+        $runH = Invoke-ShareChild -Arguments ($leakArgs + @('-AcceptSecretFindings', ('0' * 64)))
+        Assert-True ($runH.ExitCode -eq 22) "Falscher Digest gibt nicht frei (Exit $($runH.ExitCode))"
+
+        # (i) Passender Digest -> Snapshot wird freigegeben (Exit 0), findings-Event mit accepted=true.
+        if ($digestG) {
+            $runI = Invoke-ShareChild -Arguments ($leakArgs + @('-AcceptSecretFindings', $digestG))
+            $eventsI = @((Get-ShareEvents $runI.Lines).Events)
+            $findingsI = @($eventsI | Where-Object { $_.type -eq 'findings' })
+            Assert-True ($runI.ExitCode -eq 0) "Passender Digest gibt genau diese Funde frei (Exit $($runI.ExitCode))"
+            Assert-True ($findingsI.Count -eq 1 -and $findingsI[0].accepted -eq $true -and $findingsI[0].digest -ceq $digestG) 'findings-Event meldet accepted=true'
+            Assert-True (@($eventsI | Where-Object { $_.type -eq 'warning' -and $_.text -match 'trotz Gitleaks-Funden' }).Count -eq 1) 'Freigabe trotz Funden wird als Warnung gemeldet'
+
+            # (j) Geänderter Inhalt -> der alte Digest passt nicht mehr.
+            Add-Content -LiteralPath $leakFile -Value ('api_key = "' + $fakeToken.Substring(3) + 'Qp2"') -Encoding ASCII
+            $runJ = Invoke-ShareChild -Arguments ($leakArgs + @('-AcceptSecretFindings', $digestG))
+            $findingsJ = @((Get-ShareEvents $runJ.Lines).Events | Where-Object { $_.type -eq 'findings' })
+            Assert-True ($runJ.ExitCode -eq 22 -and $findingsJ.Count -eq 1 -and $findingsJ[0].digest -cne $digestG -and $findingsJ[0].accepted -eq $false) 'Nach einer Änderung blockiert der alte Digest wieder (neuer Digest)'
+        }
+
+        # (k) -AcceptSecretFindings zusammen mit -UnsafeSkipSecretScan -> Exit 10.
+        $runK = Invoke-ShareChild -Arguments ($leakArgs + @('-UnsafeSkipSecretScan', '-AcceptSecretFindings', ('a' * 64)))
+        Assert-True ($runK.ExitCode -eq 10) "-AcceptSecretFindings mit -UnsafeSkipSecretScan endet mit Exit 10 (war $($runK.ExitCode))"
     }
     finally {
         # Nur den eigenen, per Event gemeldeten Sitzungsordner unterhalb des Sitzungsbasisordners löschen.
